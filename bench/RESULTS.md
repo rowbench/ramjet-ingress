@@ -1,9 +1,13 @@
 # ramjet-ingress vs nginx: reverse-proxy head-to-head
 
-**nginx forwards about 45% more requests per second than ramjet-ingress on this
-workload, and is ahead at every latency percentile.** That is the result, it is
-reproducible with `./bench/run.sh`, and the rest of this document is about how
-it was measured and what it does and does not mean.
+**The two are now level at c64 and nginx is 9% ahead at c256.** That is the
+result after the optimisation described in [After optimization](#after-optimization-commit-4f58bd7);
+the first measurement, which had nginx 45% ahead, is kept below unchanged. Both
+are reproducible with `./bench/run.sh`, and the rest of this document is about
+how it was measured and what it does and does not mean.
+
+The original reading follows first, because it is what the optimisation work was
+aimed at and the "what this does not test" section applies to both.
 
 ## Method
 
@@ -45,11 +49,19 @@ ramjet:    ramjet-ingressd 0.1.0, cargo build --release
            (thin LTO, codegen-units=1, panic=abort)
 ```
 
+The rerun after the optimisation was the same host and toolchain a few hours
+later; only the two lines that can differ are worth repeating:
+
+```
+date:      2026-08-27T16:21:45Z
+ramjet:    ramjet-ingressd 0.1.0 @ 4f58bd7, cargo build --release
+```
+
 This is a **macOS Docker Desktop VM**. The numbers are valid *relative to each
 other* under identical conditions; they are not Linux bare-metal absolutes and
 should not be quoted as such.
 
-## Results
+## Results (first measurement, commit d1c08c6)
 
 ### Concurrency 64 (median of 3 x 30s runs)
 
@@ -86,7 +98,8 @@ should not be quoted as such.
 
 **Zero.** Across all 12 measured runs — 47,560,185 requests — every response
 was a 200 and oha recorded no transport errors. Error rate 0.000% for every
-contender at both concurrencies. Per-run accounting is in `results/*.json`.
+contender at both concurrencies. Per-run accounting is in
+`results/before/*.json`.
 
 (oha's `-w` flag is used so in-flight requests are awaited at the deadline.
 Without it oha counts exactly `-c` abandoned requests as errors on every run,
@@ -105,7 +118,11 @@ Yes, and this is the check that decides whether the table means anything:
 Both contenders were pinned against their CPU ceiling while nothing else in the
 topology was close to its own. The measurement is of the proxies.
 
-## Reading the numbers
+## Reading the first measurement
+
+Everything in this section describes the commit d1c08c6 numbers above. It is
+kept as written — including the parts the optimisation went on to disprove,
+because a prediction is only worth anything if you can still see what it was.
 
 **nginx wins this benchmark, clearly and at every percentile.** It forwards 45%
 more requests per second at c64 (49% at c256), its median latency is a third
@@ -123,6 +140,11 @@ connection every ~590 requests while nginx opened one every ~28,700, which is
 two endpoints (nginx is configured with `keepalive 64` per worker). But that is
 ~0.17% of requests, worth well under 1% of CPU, so it does **not** explain a 45%
 gap. The rest is diffuse per-request cost in the hyper/tokio forwarding path.
+
+> **This paragraph was half right.** Profiling found the churn was worth even
+> less than estimated, and the "diffuse per-request cost" was not diffuse: it
+> was one thing, the work-stealing runtime moving each request between cores,
+> worth 43% of the CPU per request. See [`PROFILE.md`](PROFILE.md).
 
 **Route matching is not where the time goes.** ARCHITECTURE.md benchmarks
 `match_request` at 25.2 ns, which is 0.08% of ramjet's 32.5 us per-request cost.
@@ -147,9 +169,125 @@ the cost of a deploy does not scale with the traffic you are carrying. Nothing
 here exercises TLS termination, HTTP/2, large or streaming bodies, thousands of
 routes, or configuration churn under live traffic, and the ingress-nginx control
 plane that the reload argument is aimed at was explicitly out of scope. A fair
-summary of this page is: **on raw HTTP/1.1 forwarding throughput, ramjet-ingress
-is currently about two-thirds of nginx, and the speed argument for the project
-has to be made on config-change behaviour rather than on requests per second.**
+summary of *this measurement* is: **on raw HTTP/1.1 forwarding throughput,
+ramjet-ingress is about two-thirds of nginx, and the speed argument for the
+project has to be made on config-change behaviour rather than on requests per
+second.**
+
+> That last sentence is the one the next section overturns. The
+> "what this does not test" paragraph above it still stands unchanged.
+
+## After optimization (commit 4f58bd7)
+
+Same `./bench/run.sh`, same host, same afternoon, same everything the Method
+section describes. What changed is the data plane: the profile behind it is
+[`PROFILE.md`](PROFILE.md), and the short version is that ramjet-ingress now
+runs one `current_thread` tokio runtime per core with nothing shared between
+them, instead of one work-stealing runtime across both, and its upstream idle
+pool is sized for the concurrency it actually sees.
+
+### Concurrency 64 (median of 3 x 30s runs)
+
+| Contender | RPS | p50 | p90 | p99 | p99.9 |
+|---|---:|---:|---:|---:|---:|
+| ramjet-ingress | 85,908 | 666 us | 921 us | 2,528 us | 6,236 us |
+| nginx | 86,670 | 671 us | 873 us | 2,314 us | 5,902 us |
+| baseline (no proxy) | 229,400 | 223 us | 356 us | 1,219 us | 4,421 us |
+
+### Concurrency 256 (single 30s run)
+
+| Contender | RPS | p50 | p90 | p99 | p99.9 |
+|---|---:|---:|---:|---:|---:|
+| ramjet-ingress | 82,524 | 2,975 us | 3,617 us | 6,396 us | 14,185 us |
+| nginx | 89,636 | 2,652 us | 3,559 us | 7,683 us | 17,180 us |
+| baseline (no proxy) | 247,077 | 918 us | 1,233 us | 3,554 us | 9,111 us |
+
+### Run-to-run spread (c64 RPS, every run)
+
+| Contender | run 1 | run 2 | run 3 | spread |
+|---|---:|---:|---:|---:|
+| ramjet-ingress | 86,551 | 85,121 | 85,908 | 1.7% |
+| nginx | 84,124 | 86,670 | 88,048 | 4.5% |
+| baseline (no proxy) | 229,400 | 228,659 | 242,940 | 6.1% |
+
+### Added latency of the proxy hop (c64, vs baseline)
+
+| Contender | added p50 | added p99 | RPS vs baseline |
+|---|---:|---:|---:|
+| ramjet-ingress | +443 us | +1,308 us | 37% |
+| nginx | +448 us | +1,095 us | 38% |
+
+### The delta
+
+| Measure | Before | After | Change |
+|---|---:|---:|---:|
+| c64 throughput | 61,568 | 85,908 | **+39.5%** |
+| c256 throughput | 59,644 | 82,524 | **+38.4%** |
+| c64 p50 | 967 us | 666 us | -31% |
+| c64 p99 | 3,107 us | 2,528 us | -19% |
+| CPU per request | 32.5 us | **23.6 us** | -27% |
+| vs nginx at c64 | 69% of it | **99% of it** | — |
+| vs nginx at c256 | 67% of it | **92% of it** | — |
+| requests per upstream connection | ~590 | **8,179** | 14x |
+| memory under load | 19.2 MiB | 33.1 MiB | +72% |
+
+### Reading the new numbers
+
+**At c64 the two are level.** 85,908 against 86,670 is a 0.9% difference, and
+nginx's own three runs spread 4.5% — the gap is now smaller than the noise in
+the measurement, which means this benchmark can no longer tell them apart at
+this concurrency. It does not mean ramjet-ingress is faster; it means the honest
+statement is "the same". Divide two cores by throughput and both spend 23.6 us
+of CPU per request, which is the same claim made a second way.
+
+**At c256 nginx is still 9% ahead**, 89,636 against 82,524, and that gap is
+outside the noise. nginx's throughput barely moves between c64 and c256 (+3%)
+while ramjet's drops 4%. Latency runs the other way — ramjet's p99 at c256 is
+6,396 us against nginx's 7,683 us — so what this looks like is ramjet trading a
+little throughput for shorter queues under saturation, not falling over.
+
+**The upstream connection churn is fixed but not eliminated.** ramjet now gets
+8,179 requests out of each upstream connection, up from ~590; nginx gets 27,082.
+That remaining 3x is a smaller share of CPU than the measurement can resolve
+(0.01% of requests open a connection), and it is a consequence of a per-runtime
+pool: with two runtimes each holding their own idle connections, a connection
+returned to a full pool on one runtime cannot be reused by the other.
+
+**Memory got worse, and that is a real cost.** 33.1 MiB under load against
+19.2 MiB before, and against nginx's 12.6 MiB. One runtime per core means one
+connection pool, one timer wheel and one set of hyper buffers per core rather
+than per process. On a 2-core replica that is 14 MiB; on a 64-core node with no
+CPU limit it would be considerably more, which is an argument for setting
+`--worker-threads` deliberately rather than letting it follow the host.
+
+**Nothing else moved.** Zero errors across all twelve runs again — 49,114,324
+requests, every one a 200, no transport errors from any contender at either
+concurrency. And the saturation check still holds, which is what decides whether
+the table means anything:
+
+| Component | Utilisation during a c64 run |
+|---|---|
+| proxy under test | 202.5% (ramjet) / 204.3% (nginx) of its 2 cores — **saturated** |
+| upstream 1 / 2 | 58.5% / 56.4% of one core each |
+| load generator | 4 cores; the baseline's 229k rps is 2.7x the fastest contender |
+
+Both contenders were against their CPU ceiling and nothing else in the topology
+was near its own, exactly as in the first measurement.
+
+### What this changes about the project's argument
+
+The previous version of this page ended by saying the speed argument for
+ramjet-ingress "has to be made on config-change behaviour rather than on
+requests per second". That is no longer true at c64 and is a weaker claim at
+c256: on this workload, on these two cores, raw HTTP/1.1 forwarding throughput
+is now a tie at moderate concurrency and a 9% loss at high concurrency, rather
+than a 45% loss.
+
+Everything in **What this does not test** below still applies without
+modification, and it is the more important paragraph on this page. This is one
+route, one host, 128-byte plaintext responses and static configuration. Nothing
+here exercises TLS, HTTP/2, large bodies, thousands of routes, or configuration
+churn under live traffic.
 
 ## Known unfairness and deviations
 
@@ -161,12 +299,15 @@ Things that could not be fully eliminated, stated so a reader can discount them:
   effect. The reported 30s runs absorb this, and the 1.7-5.3% contender spread
   is the evidence; the baseline's 13.3% spread shows the noise is real but did
   not touch the contenders' ordering.
-- **Upstream keepalive pools are not exactly equal.** nginx holds 64 idle
-  upstream connections per worker (128 total); ramjet holds 32 per endpoint (64
-  total) and that is hardcoded with no CLI flag. The edge here is nginx's. It
-  was left alone rather than patched, because changing the product to win its
-  own benchmark is not a measurement — but it is the first thing to try if
-  somebody wants to close the gap, and it is worth exposing as a flag.
+- **Upstream keepalive pools were not exactly equal in the first measurement.**
+  nginx holds 64 idle upstream connections per worker (128 total); ramjet held
+  32 per endpoint (64 total), hardcoded with no CLI flag. The edge there was
+  nginx's, and it was left alone rather than patched, because changing the
+  product to win its own benchmark is not a measurement. It was then changed on
+  purpose, with the measurement rerun from scratch: the value is now
+  `--upstream-pool-idle`, defaulting to 128 per endpoint *per serving runtime*.
+  Both contenders in the second table are therefore configured generously, and
+  neither is starved.
 - **Warmup is 10s, not the 5s originally specified.** A cold ramjet container
   measured 42k rps on its first run against 58k once warm, so 5s risked
   measuring warmup. The longer warmup is applied identically to both.
@@ -192,5 +333,13 @@ python3 bench/report.py                          # re-render tables from committ
 
 `run.sh` is idempotent, namespaces everything it creates as `ramjet-bench-*`,
 and removes only its own containers on exit (including on Ctrl-C) — the docker
-daemon may be shared. Raw oha JSON for every run is committed under
-`results/`, so the tables can be re-derived without re-running anything.
+daemon may be shared. Raw oha JSON for every run is committed, so both sets of
+tables can be re-derived without re-running anything:
+
+- `results/` holds the **after** run (commit 4f58bd7), which is what
+  `report.py` reads.
+- `results/before/` holds the **first measurement** (commit d1c08c6) verbatim,
+  including its own `versions.txt` and `diagnostics.txt`. `report.py` globs one
+  directory deep and does not pick these up; to re-render them, point it at the
+  subdirectory or read `results/before/table.md`, which is the table it
+  produced.

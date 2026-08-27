@@ -197,13 +197,17 @@ verify_topology() {
     threads="$(docker exec "${PREFIX}-ramjet" sh -c 'awk "/^Threads:/{print \$2}" /proc/1/status' || true)"
 
     # nginx's worker count comes from `worker_processes auto` reading the
-    # cpuset; ramjet's tokio thread count comes from available_parallelism()
+    # cpuset; ramjet's serving-runtime count comes from available_parallelism()
     # reading the same cpuset. They are expected to agree, and if they ever
     # stop agreeing the comparison has quietly stopped being fair.
     [ "${workers}" = "${seen_nginx}" ] \
         || warn "nginx started ${workers} workers on ${seen_nginx} CPUs"
 
-    log "  each sees ${seen_ramjet} CPUs; nginx ${workers} workers, ramjet ${threads} threads (main + tokio)"
+    # ramjet's total thread count is higher than its serving-runtime count and
+    # always will be: one accept/admin runtime, one serving runtime per core,
+    # and tokio's blocking pool. The count that has to match nginx's workers is
+    # the CPUs both of them see, which is asserted above.
+    log "  each sees ${seen_ramjet} CPUs; nginx ${workers} workers, ramjet ${threads} threads total"
 }
 
 # ---------------------------------------------------------------------------
