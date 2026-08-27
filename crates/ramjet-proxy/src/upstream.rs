@@ -46,6 +46,25 @@ use hyper_util::rt::TokioExecutor;
 
 use crate::body::ProxyBody;
 
+/// Idle upstream connections kept per endpoint, by default.
+///
+/// This is a **ceiling, not a reservation**: hyper opens a connection only when
+/// a request needs one, so the number here costs nothing until the traffic
+/// exists to fill it. That asymmetry is why it is set generously.
+///
+/// Sizing it below the requests an endpoint has in flight is not a smaller
+/// pool, it is connection churn: every request past the limit returns its
+/// connection to a full pool, the connection is closed, and the next request
+/// pays a TCP handshake on the request path. The first version of this crate
+/// used 32, and `bench/RESULTS.md` measured the consequence — a new upstream
+/// connection every ~590 requests at c64 over two endpoints, against nginx's
+/// one every ~28,700.
+///
+/// 128 is above the in-flight count any single endpoint sees in normal ingress
+/// traffic, and the cost of being wrong in this direction is file descriptors
+/// that are never opened.
+pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 128;
+
 /// Timeouts and pool sizing for upstream connections.
 #[derive(Debug, Clone, Copy)]
 pub struct UpstreamConfig {
@@ -83,7 +102,7 @@ impl Default for UpstreamConfig {
             // upstream has already closed. 90s matches Go's default and sits
             // under Kubernetes' typical conntrack expiry.
             pool_idle_timeout: Duration::from_secs(90),
-            pool_max_idle_per_host: 32,
+            pool_max_idle_per_host: DEFAULT_POOL_MAX_IDLE_PER_HOST,
             tcp_keepalive: Some(Duration::from_secs(60)),
             max_connect_attempts: 3,
         }

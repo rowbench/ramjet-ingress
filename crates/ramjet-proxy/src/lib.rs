@@ -103,4 +103,6 @@ pub use server::{
     DEFAULT_HTTPS_PORT,
 };
 pub use tls::{CertStore, SniResolver};
-pub use upstream::{Upstream, UpstreamConfig, UpstreamError};
+pub use upstream::{
+    Upstream, UpstreamConfig, UpstreamError, DEFAULT_POOL_MAX_IDLE_PER_HOST,
+};
