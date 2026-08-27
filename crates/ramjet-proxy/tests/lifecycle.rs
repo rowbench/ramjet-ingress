@@ -166,3 +166,45 @@ async fn an_open_tunnel_does_not_hold_the_drain_open() {
     );
     driver.abort();
 }
+
+#[tokio::test]
+async fn several_serving_runtimes_all_answer_and_all_drain() {
+    // The data plane runs one runtime per core and hands each accepted
+    // connection to one of them round-robin. Every test above uses a single
+    // runtime so its assertions are about the proxy rather than about which
+    // thread got the connection; this one exists to prove the fan-out itself
+    // works — that a connection landing on any lane is served, and that the
+    // drain waits for all of them rather than for whichever one it asked
+    // first.
+    let app = spawn_echo("app").await;
+    let proxy = TestProxy::start_with(
+        single_route("app.example.com", "/", &[app]),
+        ProxyOptions {
+            workers: Some(4),
+            ..Default::default()
+        },
+    )
+    .await;
+    let addr = proxy.http;
+
+    // More connections than lanes, so every lane gets several.
+    let mut requests = Vec::new();
+    for _ in 0..16 {
+        requests.push(tokio::spawn(async move {
+            get(addr, "app.example.com", "/").await
+        }));
+    }
+    for request in requests {
+        let reply = request.await.expect("the task did not panic");
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.text(), "GET /");
+    }
+
+    assert_eq!(
+        proxy.metrics.responses("2xx"),
+        16,
+        "every lane's responses must land in the one shared counter"
+    );
+
+    proxy.shutdown().await.expect("every lane drained cleanly");
+}

@@ -34,12 +34,42 @@
 //! Tunnels are left running and end with the process, which is what nginx does
 //! with them at worker shutdown too.
 //!
-//! # One task per connection
+//! # One task per connection, one runtime per core
 //!
 //! The accept loop does nothing but accept: the TLS handshake, the HTTP
-//! parsing, and the proxying all happen in a spawned task. A handshake takes
-//! tens of microseconds of arithmetic, and doing it inline would let one client
-//! stall every other connection waiting to be accepted.
+//! parsing, and the proxying all happen elsewhere. A handshake takes tens of
+//! microseconds of arithmetic, and doing it inline would let one client stall
+//! every other connection waiting to be accepted.
+//!
+//! That "elsewhere" is one **`current_thread` runtime per core**, and the
+//! accepted socket is handed to one of them round-robin. A connection stays on
+//! the runtime it landed on for its whole life, and so does everything the
+//! requests on it touch: the upstream connections they dispatch to, the pool
+//! those come out of, and the timers that bound them.
+//!
+//! The alternative — one multi-threaded runtime, which is what this server used
+//! to be — is a connection whose work migrates. A request arrives on worker A,
+//! is dispatched to an upstream connection task that worker B owns, and the
+//! response wakes A again from B. Each of those crossings is an atomic on a
+//! contended cache line and, when the other worker has parked, a wakeup
+//! syscall. Measured on this workload it cost **43% more CPU per request** than
+//! the same code on one thread: 26.7us against 18.7us, with throughput per core
+//! falling from 53.6k rps to 37.4k. `bench/PROFILE.md` has the numbers and the
+//! experiment that produced them.
+//!
+//! Two consequences worth stating, because they are the price:
+//!
+//! - **Each runtime keeps its own upstream pool.** `pool_max_idle_per_host` is
+//!   therefore a per-runtime ceiling, and the process-wide maximum is that
+//!   number times the runtime count. Idle connections are opened on demand, so
+//!   this costs file descriptors only where the traffic exists to need them.
+//! - **A connection is bound to its runtime for life.** A single very busy
+//!   connection cannot be spread across cores. For an ingress that is the right
+//!   trade — the load is many connections, not one — but it is a real
+//!   difference from a work-stealing scheduler.
+//!
+//! The admin listener is deliberately left on the caller's runtime: a scrape
+//! every fifteen seconds has no business taking a slot on a serving core.
 
 use std::convert::Infallible;
 use std::io;
@@ -53,13 +83,13 @@ use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use ramjet_router::SharedRouteTable;
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_rustls::TlsAcceptor;
 
 use crate::admin::{self, AdminState, ReadinessFlag};
 use crate::forward::{self, ConnInfo, ProxyState, Scheme};
 use crate::listener::{Listener, ListenerConfig};
-use crate::metrics::Metrics;
+use crate::metrics::{ConnectionGuard, Metrics};
 use crate::tls::{self, CertStore, SniResolver};
 use crate::upstream::{Upstream, UpstreamConfig};
 
@@ -90,6 +120,12 @@ pub struct ProxyConfig {
     pub upstream: UpstreamConfig,
     /// How long in-flight requests get to finish after a shutdown signal.
     pub shutdown_grace: Duration,
+    /// Serving runtimes to start, one per thread. `None` means one per core.
+    ///
+    /// See the module docs for what a serving runtime owns. `Some(0)` is
+    /// treated as one: a data plane with nowhere to serve is not a
+    /// configuration, it is a hang.
+    pub worker_threads: Option<usize>,
 }
 
 impl Default for ProxyConfig {
@@ -104,14 +140,22 @@ impl Default for ProxyConfig {
             // longer drain would just be interrupted by SIGKILL — the deadline
             // would be a lie told to whoever set it.
             shutdown_grace: Duration::from_secs(30),
+            worker_threads: None,
         }
     }
 }
 
 /// Bound listeners, ready to serve.
+///
+/// The serving runtimes are *not* started here. Binding is the fallible part
+/// and happens on the caller's thread; the runtimes are threads, and starting
+/// threads in a constructor that a caller might then drop is a way to leak
+/// them.
 #[derive(Debug)]
 pub struct Server {
-    state: Arc<ProxyState>,
+    routes: Arc<SharedRouteTable>,
+    upstream: UpstreamConfig,
+    worker_threads: usize,
     admin_state: Arc<AdminState>,
     http: Option<Listener>,
     https: Option<Listener>,
@@ -164,19 +208,16 @@ impl Server {
         };
 
         let metrics = Arc::new(Metrics::new());
-        let state = Arc::new(ProxyState {
-            routes: Arc::clone(&routes),
-            upstream: Upstream::new(&config.upstream),
-            metrics: Arc::clone(&metrics),
-        });
         let admin_state = Arc::new(AdminState {
             metrics: Arc::clone(&metrics),
-            routes,
+            routes: Arc::clone(&routes),
             readiness: readiness.clone(),
         });
 
         Ok(Server {
-            state,
+            routes,
+            upstream: config.upstream,
+            worker_threads: worker_threads(config.worker_threads),
             admin_state,
             http,
             https,
@@ -222,19 +263,32 @@ impl Server {
     /// shutdown quietly stops being one.
     pub async fn run(self, mut shutdown: Shutdown) -> io::Result<()> {
         let Server {
-            state,
+            routes,
+            upstream,
+            worker_threads,
             admin_state,
             http,
             https,
             admin,
             tls,
+            metrics,
             grace,
             ..
         } = self;
 
+        let acceptor = tls.map(TlsAcceptor::from);
+        let mut workers = Workers::start(
+            worker_threads,
+            &routes,
+            &metrics,
+            upstream,
+            acceptor.clone(),
+            grace,
+        )?;
+
+        // Admin lives on the caller's runtime; see the module docs.
         let graceful = GracefulShutdown::new();
         let builder = Arc::new(auto::Builder::new(TokioExecutor::new()));
-        let acceptor = tls.map(TlsAcceptor::from);
 
         loop {
             tokio::select! {
@@ -244,24 +298,19 @@ impl Server {
                 () = shutdown.recv() => break,
 
                 result = accept(http.as_ref()) => match result {
-                    Ok((stream, remote)) => serve_proxy(
-                        Arc::clone(&builder),
-                        graceful.watcher(),
-                        Arc::clone(&state),
+                    Ok((stream, remote)) => workers.dispatch(
                         stream,
+                        metrics.connection_opened(),
                         ConnInfo { remote, scheme: Scheme::Http },
                     ),
                     Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
                 },
 
                 result = accept(https.as_ref()) => match (result, &acceptor) {
-                    (Ok((stream, remote)), Some(acceptor)) => serve_tls(
-                        Arc::clone(&builder),
-                        graceful.watcher(),
-                        Arc::clone(&state),
-                        acceptor.clone(),
+                    (Ok((stream, remote)), Some(_)) => workers.dispatch(
                         stream,
-                        remote,
+                        metrics.connection_opened(),
+                        ConnInfo { remote, scheme: Scheme::Https },
                     ),
                     (Ok(_), None) => {}
                     (Err(_), _) => tokio::time::sleep(ACCEPT_BACKOFF).await,
@@ -285,11 +334,16 @@ impl Server {
         drop(https);
         drop(admin);
 
-        // Step two: let what is already running finish.
-        if tokio::time::timeout(grace, graceful.shutdown())
-            .await
-            .is_err()
-        {
+        // Step two: let what is already running finish. The serving runtimes
+        // drain in parallel with the admin listener rather than after it —
+        // they are the ones holding client requests, and making them wait for
+        // a metrics scrape to finish would be the wrong order.
+        let (drained, admin_drained) = tokio::join!(
+            workers.drain(),
+            tokio::time::timeout(grace, graceful.shutdown()),
+        );
+
+        if !drained || admin_drained.is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "shutdown grace period expired with connections still open",
@@ -297,6 +351,180 @@ impl Server {
         }
         Ok(())
     }
+}
+
+/// How many serving runtimes to start.
+///
+/// `available_parallelism` reads the cgroup CPU limit, so a pod with
+/// `limits.cpu: 2` gets two runtimes rather than one per host core.
+fn worker_threads(configured: Option<usize>) -> usize {
+    configured
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+        .max(1)
+}
+
+/// One accepted connection, on its way to a serving runtime.
+///
+/// The socket crosses as a `std::net::TcpStream` because a `tokio::net`
+/// one is registered with the reactor of the runtime that accepted it;
+/// `into_std` deregisters it so the receiving runtime can register it with its
+/// own. The guard travels with it so the connection gauge counts from accept,
+/// not from whenever the serving runtime got round to it.
+struct Job {
+    stream: std::net::TcpStream,
+    guard: ConnectionGuard,
+    conn: ConnInfo,
+}
+
+/// The serving runtimes and the round-robin over them.
+struct Workers {
+    lanes: Vec<mpsc::UnboundedSender<Job>>,
+    done: Vec<oneshot::Receiver<bool>>,
+    next: usize,
+}
+
+impl Workers {
+    fn start(
+        count: usize,
+        routes: &Arc<SharedRouteTable>,
+        metrics: &Arc<Metrics>,
+        upstream: UpstreamConfig,
+        acceptor: Option<TlsAcceptor>,
+        grace: Duration,
+    ) -> io::Result<Workers> {
+        let mut lanes = Vec::with_capacity(count);
+        let mut done = Vec::with_capacity(count);
+
+        for index in 0..count {
+            let (jobs_tx, jobs_rx) = mpsc::unbounded_channel();
+            let (done_tx, done_rx) = oneshot::channel();
+            let routes = Arc::clone(routes);
+            let metrics = Arc::clone(metrics);
+            let acceptor = acceptor.clone();
+
+            std::thread::Builder::new()
+                .name(format!("ramjet-serve-{index}"))
+                .spawn(move || {
+                    let drained =
+                        serve_lane(routes, metrics, upstream, acceptor, grace, jobs_rx);
+                    // A receiver that has gone away means `run` already
+                    // returned, which is not this thread's problem.
+                    let _ = done_tx.send(drained);
+                })?;
+
+            lanes.push(jobs_tx);
+            done.push(done_rx);
+        }
+
+        Ok(Workers {
+            lanes,
+            done,
+            next: 0,
+        })
+    }
+
+    /// Hands a connection to the next runtime.
+    ///
+    /// Round-robin rather than least-loaded: picking the shortest queue would
+    /// mean reading every lane's depth on the accept path, and connection
+    /// counts even out on their own across anything longer than a burst.
+    fn dispatch(&mut self, stream: TcpStream, guard: ConnectionGuard, conn: ConnInfo) {
+        let Ok(stream) = stream.into_std() else { return };
+        if self.lanes.is_empty() {
+            return;
+        }
+        let index = self.next % self.lanes.len();
+        self.next = self.next.wrapping_add(1);
+        if let Some(lane) = self.lanes.get(index) {
+            // A closed lane means that runtime is gone; dropping the socket
+            // closes it, which is the honest answer to a client whose
+            // connection this process can no longer serve.
+            let _ = lane.send(Job {
+                stream,
+                guard,
+                conn,
+            });
+        }
+    }
+
+    /// Closes every lane and waits for the runtimes to finish draining.
+    ///
+    /// Returns whether every one of them drained inside its grace period.
+    async fn drain(&mut self) -> bool {
+        self.lanes.clear();
+        let mut drained = true;
+        for done in &mut self.done {
+            // A thread that vanished without reporting cannot be said to have
+            // drained cleanly.
+            drained &= done.await.unwrap_or(false);
+        }
+        drained
+    }
+}
+
+/// One serving runtime: accepts handed-off connections until the lane closes,
+/// then drains. Returns whether the drain finished inside `grace`.
+fn serve_lane(
+    routes: Arc<SharedRouteTable>,
+    metrics: Arc<Metrics>,
+    upstream: UpstreamConfig,
+    acceptor: Option<TlsAcceptor>,
+    grace: Duration,
+    mut jobs: mpsc::UnboundedReceiver<Job>,
+) -> bool {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        // Nothing can be served on this lane. Reporting it as "not drained" is
+        // the only signal available from here, and dropping `jobs` makes the
+        // accept side stop choosing it.
+        Err(_) => return false,
+    };
+
+    runtime.block_on(async move {
+        // Built inside the runtime, and one per lane: this is the pool the
+        // module docs are about.
+        let state = Arc::new(ProxyState {
+            routes,
+            upstream: Upstream::new(&upstream),
+            metrics,
+        });
+        let graceful = GracefulShutdown::new();
+        let builder = Arc::new(auto::Builder::new(TokioExecutor::new()));
+
+        while let Some(job) = jobs.recv().await {
+            let Ok(stream) = TcpStream::from_std(job.stream) else {
+                continue;
+            };
+            match (job.conn.scheme, &acceptor) {
+                (Scheme::Https, Some(acceptor)) => serve_tls(
+                    Arc::clone(&builder),
+                    graceful.watcher(),
+                    Arc::clone(&state),
+                    acceptor.clone(),
+                    stream,
+                    job.guard,
+                    job.conn.remote,
+                ),
+                // A TLS connection with no acceptor cannot happen — `bind`
+                // builds one whenever the listener exists — but serving it as
+                // plaintext would be worse than closing it.
+                (Scheme::Https, None) => drop(stream),
+                (Scheme::Http, _) => serve_proxy(
+                    Arc::clone(&builder),
+                    graceful.watcher(),
+                    Arc::clone(&state),
+                    stream,
+                    job.guard,
+                    job.conn,
+                ),
+            }
+        }
+
+        tokio::time::timeout(grace, graceful.shutdown()).await.is_ok()
+    })
 }
 
 /// Binds and runs in one call, for a caller that has no reason to look at the
@@ -333,9 +561,9 @@ fn serve_proxy(
     watcher: Watcher,
     state: Arc<ProxyState>,
     stream: TcpStream,
+    guard: ConnectionGuard,
     conn: ConnInfo,
 ) {
-    let guard = state.metrics.connection_opened();
     tokio::spawn(async move {
         // The guard lives in the task, not the accept loop, so a connection
         // that ends by panic or abort still decrements the gauge.
@@ -357,9 +585,9 @@ fn serve_tls(
     state: Arc<ProxyState>,
     acceptor: TlsAcceptor,
     stream: TcpStream,
+    guard: ConnectionGuard,
     remote: SocketAddr,
 ) {
-    let guard = state.metrics.connection_opened();
     let metrics = Arc::clone(&state.metrics);
     tokio::spawn(async move {
         let _guard = guard;

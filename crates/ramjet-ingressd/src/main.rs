@@ -36,7 +36,16 @@ use tracing_subscriber::EnvFilter;
 
 use crate::args::{ArgError, Args, USAGE};
 
-#[tokio::main]
+/// One worker thread, deliberately.
+///
+/// This runtime does not serve traffic. Requests are served by the data
+/// plane's own per-core runtimes (see [`ramjet_proxy::Server`]); what is left
+/// here is the accept loop, the admin listener, and — in Kubernetes mode — the
+/// controller's watches. Letting tokio start one worker per core for that work
+/// would put `cores` mostly-idle threads on the same cores the serving runtimes
+/// are trying to saturate, and every one of them is a scheduler that can
+/// preempt a request in flight.
+#[tokio::main(worker_threads = 1)]
 async fn main() -> ExitCode {
     match run().await {
         Ok(code) => code,
@@ -181,9 +190,11 @@ fn proxy_config(args: &Args, https: Option<SocketAddr>) -> ProxyConfig {
             connect_timeout: args.connect_timeout,
             response_timeout: args.response_timeout,
             max_connect_attempts: args.max_connect_attempts,
+            pool_max_idle_per_host: args.upstream_pool_idle,
             ..UpstreamConfig::default()
         },
         shutdown_grace: args.shutdown_grace,
+        worker_threads: args.worker_threads,
     }
 }
 

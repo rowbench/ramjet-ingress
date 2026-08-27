@@ -97,6 +97,10 @@ pub struct Args {
     pub shutdown_grace: Duration,
     /// Endpoints tried before giving up on a retryable failure.
     pub max_connect_attempts: usize,
+    /// Idle upstream connections kept per endpoint.
+    pub upstream_pool_idle: usize,
+    /// Serving runtimes to start, or `None` for one per available core.
+    pub worker_threads: Option<usize>,
 }
 
 impl Default for Args {
@@ -121,6 +125,8 @@ impl Default for Args {
             response_timeout: Duration::from_secs(60),
             shutdown_grace: Duration::from_secs(30),
             max_connect_attempts: 3,
+            upstream_pool_idle: ramjet_proxy::DEFAULT_POOL_MAX_IDLE_PER_HOST,
+            worker_threads: None,
         }
     }
 }
@@ -174,6 +180,23 @@ UPSTREAMS:
     --response-timeout <SECS>     Response header bound      [default: 60]
     --max-connect-attempts <N>    Endpoints tried on a connect failure
                                                              [default: 3]
+    --upstream-pool-idle <N>      Idle upstream connections kept per endpoint
+                                                            [default: 128]
+
+    --upstream-pool-idle is a ceiling, not a reservation: nothing is opened
+    until a request needs it. Below the concurrent requests an endpoint
+    receives, the surplus connections are closed as they go idle and reopened
+    on the next request, which is a TCP handshake on the request path. Above
+    it, the only cost is file descriptors.
+
+SERVING:
+    --worker-threads <N>      Serving runtimes, one per thread
+                                              [default: one per available core]
+
+    Each runtime owns its connections, its upstream connection pool, and its
+    timers, and a connection stays on the one it landed on. Setting this above
+    the cores the process can actually use makes them compete; setting it to 1
+    serves everything on one thread.
 
 SHUTDOWN:
     --shutdown-grace <SECS>   In-flight requests get this long after SIGTERM
@@ -187,7 +210,8 @@ Every option has an environment twin (RAMJET_STATIC_ROUTES, RAMJET_INGRESS_CLASS
 RAMJET_WATCH_NAMESPACE, RAMJET_DEFAULT_BACKEND, RAMJET_DEFAULT_TLS_SECRET,
 RAMJET_PUBLISH_ADDRESS, RAMJET_PUBLISH_SERVICE, RAMJET_UPDATE_STATUS,
 RAMJET_HTTP, RAMJET_HTTPS, RAMJET_ADMIN, RAMJET_CONNECT_TIMEOUT,
-RAMJET_RESPONSE_TIMEOUT, RAMJET_MAX_CONNECT_ATTEMPTS, RAMJET_SHUTDOWN_GRACE).
+RAMJET_RESPONSE_TIMEOUT, RAMJET_MAX_CONNECT_ATTEMPTS, RAMJET_UPSTREAM_POOL_IDLE,
+RAMJET_WORKER_THREADS, RAMJET_SHUTDOWN_GRACE).
 A flag always beats the environment. RUST_LOG sets the log filter.
 
 ADMIN ENDPOINTS:
@@ -268,6 +292,12 @@ impl Args {
                 "--max-connect-attempts" => {
                     args.max_connect_attempts = number(&name, &value()?)?.max(1);
                 }
+                "--upstream-pool-idle" => {
+                    args.upstream_pool_idle = number(&name, &value()?)?;
+                }
+                "--worker-threads" => {
+                    args.worker_threads = Some(number(&name, &value()?)?.max(1));
+                }
                 other if other.starts_with('-') => {
                     return Err(ArgError::Unknown(other.to_owned()))
                 }
@@ -328,6 +358,12 @@ impl Args {
         }
         if let Some(value) = env("RAMJET_MAX_CONNECT_ATTEMPTS") {
             args.max_connect_attempts = number("RAMJET_MAX_CONNECT_ATTEMPTS", &value)?.max(1);
+        }
+        if let Some(value) = env("RAMJET_UPSTREAM_POOL_IDLE") {
+            args.upstream_pool_idle = number("RAMJET_UPSTREAM_POOL_IDLE", &value)?;
+        }
+        if let Some(value) = env("RAMJET_WORKER_THREADS") {
+            args.worker_threads = Some(number("RAMJET_WORKER_THREADS", &value)?.max(1));
         }
         Ok(args)
     }
@@ -409,6 +445,44 @@ mod tests {
 
     fn parse(arguments: &[&str]) -> Result<Args, ArgError> {
         Args::parse(arguments.iter().map(|a| (*a).to_owned()), no_env)
+    }
+
+    #[test]
+    fn the_serving_knobs_take_a_flag_and_an_environment_twin() {
+        let args = parse(&["--worker-threads", "3", "--upstream-pool-idle", "512"])
+            .expect("valid");
+        assert_eq!(args.worker_threads, Some(3));
+        assert_eq!(args.upstream_pool_idle, 512);
+
+        let env = |name: &str| match name {
+            "RAMJET_WORKER_THREADS" => Some("2".to_owned()),
+            "RAMJET_UPSTREAM_POOL_IDLE" => Some("64".to_owned()),
+            _ => None,
+        };
+        let args = Args::parse(Vec::<String>::new(), env).expect("valid");
+        assert_eq!(args.worker_threads, Some(2));
+        assert_eq!(args.upstream_pool_idle, 64);
+
+        // A flag beats the environment, so a `kubectl edit` of the args cannot
+        // be silently overridden by a ConfigMap.
+        let args = Args::parse(["--worker-threads=8".to_owned()], env).expect("valid");
+        assert_eq!(args.worker_threads, Some(8));
+    }
+
+    #[test]
+    fn zero_serving_runtimes_is_read_as_one() {
+        // A data plane with nowhere to serve is not a configuration, it is a
+        // hang, and `--worker-threads 0` is a typo rather than an intent.
+        assert_eq!(parse(&["--worker-threads", "0"]).expect("valid").worker_threads, Some(1));
+    }
+
+    #[test]
+    fn the_pool_default_is_the_one_the_proxy_documents() {
+        assert_eq!(
+            parse(&[]).expect("valid").upstream_pool_idle,
+            ramjet_proxy::DEFAULT_POOL_MAX_IDLE_PER_HOST
+        );
+        assert_eq!(parse(&[]).expect("valid").worker_threads, None, "one per core");
     }
 
     #[test]

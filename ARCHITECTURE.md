@@ -471,6 +471,42 @@ than asserted in a comment — `tests/no_alloc.rs` installs a counting global
 allocator and checks every path through the matcher, including the mixed-case
 fold, canary resolution, and SNI lookup.
 
+### The data plane: one runtime per core
+
+Route matching is 25 ns; a forwarded request is tens of microseconds. The
+matcher was never going to be where the time went, and profiling the whole
+request confirmed it — the router and every header rewrite together are about
+2% of a request. `bench/PROFILE.md` is that profile.
+
+What it found instead: two thirds of a request is the four syscalls a proxy hop
+cannot avoid (read the request, write it upstream, read the response, write it
+downstream), and the largest recoverable cost was the runtime moving each
+request's work between cores. The same code measured **43% more CPU per
+request** on two tokio worker threads than on one — 26.7 us against 18.7 us —
+because a request that arrives on one worker, dispatches to an upstream
+connection owned by another, and is woken back by a third pays an atomic on a
+contended cache line at every crossing.
+
+So the data plane is **shared-nothing across cores**: one `current_thread`
+runtime per core, each on its own thread, with the accepted socket handed to one
+of them round-robin. A connection stays on its runtime for life, and so do the
+upstream connections its requests dispatch to, the pool those come from, and the
+timers that bound them. Nothing on the request path is shared between cores
+except a handful of relaxed metrics counters and the `ArcSwap` the route table
+lives in — and a diagnostic build that removed both measured no difference,
+which is how we know the sharing that remains is not costing anything.
+
+The accept loop and the admin listener stay on the process's own runtime, which
+is why `ramjet-ingressd` runs `#[tokio::main(worker_threads = 1)]`: it does not
+serve traffic. `--worker-threads` overrides the runtime count; the default is
+`available_parallelism`, which reads the cgroup CPU limit, so a pod with
+`limits.cpu: 2` gets two.
+
+The price is stated where it is paid, in `server.rs`: `--upstream-pool-idle` is
+a per-runtime ceiling rather than a process-wide one, and a single very busy
+connection cannot be spread across cores. For an ingress carrying many
+connections rather than one, that is the right way round.
+
 ## Deliberate divergences from ingress-nginx
 
 - **Regex anchoring.** ingress-nginx emits `location ~* "^<path>"`, a literal

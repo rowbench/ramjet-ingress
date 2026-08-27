@@ -203,6 +203,11 @@ pub struct ProxyOptions {
     pub certs: Arc<CertStore>,
     pub upstream: UpstreamConfig,
     pub grace: Duration,
+    /// Serving runtimes. One by default: a test asserting on behaviour wants
+    /// the same answer every run, and the suite starts dozens of proxies at
+    /// once, so one-per-core each would be a thread per core per test.
+    /// `lifecycle.rs` covers the multi-runtime path explicitly.
+    pub workers: Option<usize>,
 }
 
 impl Default for ProxyOptions {
@@ -212,6 +217,7 @@ impl Default for ProxyOptions {
             certs: Arc::new(CertStore::new()),
             upstream: UpstreamConfig::default(),
             grace: Duration::from_secs(10),
+            workers: Some(1),
         }
     }
 }
@@ -242,6 +248,7 @@ impl TestProxy {
             admin: Some(ListenerConfig::new(loopback())),
             upstream: options.upstream,
             shutdown_grace: options.grace,
+            worker_threads: options.workers,
         };
 
         let readiness = ReadinessFlag::new();
