@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ramjet-router",
+    "crates/ramjet-proxy",
+    "crates/ramjet-controller",
+    "crates/ramjet-ingressd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sofelia-ai/ramjet-ingress"
+
+[workspace.dependencies]
+ramjet-router = { path = "crates/ramjet-router" }
+ramjet-proxy = { path = "crates/ramjet-proxy" }
+ramjet-controller = { path = "crates/ramjet-controller" }
+
+arc-swap = "1.9"
+regex = "1.13"
+thiserror = "2.0"
+
+criterion = "0.8"
+
+# Whole-program optimization for the deployed binary. `panic = "abort"` is not
+# a size tweak: the data plane has no recovery story for a panicking worker, so
+# unwinding past a half-written connection is worse than dying loudly. Cargo
+# ignores this setting for the test and bench profiles, so `cargo test` and the
+# criterion harness still build normally.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

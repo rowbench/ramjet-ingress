@@ -1,0 +1,4 @@
+target/
+
+# Agent tooling session state, not project content.
+.omc/

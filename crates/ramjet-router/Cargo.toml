@@ -1,0 +1,22 @@
+[package]
+name = "ramjet-router"
+description = "Sans-io Kubernetes Ingress route matching: an immutable route table and a zero-allocation host/path matcher. No runtime, no sockets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The published snapshot pointer. This is the whole concurrency story.
+arc-swap.workspace = true
+# ImplementationSpecific paths only. Exact and Prefix never touch it.
+regex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "match"
+harness = false
