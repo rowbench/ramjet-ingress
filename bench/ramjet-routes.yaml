@@ -1,0 +1,29 @@
+# Contender A's route table, in ramjet-ingress dev mode (`--static-routes`).
+#
+# Deliberately minimal: one host, one prefix rule, one backend, round-robin
+# across the same two upstream containers nginx.conf points at. There is no
+# canary, no TLS, no default backend and no second rule, because every extra
+# rule is work the router does per request that nginx's `location /` would not
+# be doing — and the point is to compare the forwarding engines, not to make
+# one of them carry a bigger table.
+#
+# Endpoints are literal ip:port because that is what ramjet-ingress accepts
+# (in production the controller feeds it pod IPs). The addresses are fixed by
+# run.sh, which creates the docker network with a known subnet and assigns each
+# upstream a static address.
+
+backends:
+  - name: bench
+    # Round-robin to match nginx's default upstream policy. leastConn would be
+    # a different algorithm than the one nginx is running, and the comparison
+    # is supposed to be like-for-like.
+    policy: roundRobin
+    endpoints:
+      - 172.31.99.11:8080
+      - 172.31.99.12:8080
+
+routes:
+  - host: bench.test
+    path: /
+    pathType: Prefix
+    backend: bench

@@ -1,0 +1,14 @@
+# BuildKit reads `<dockerfile>.dockerignore` in preference to a root
+# `.dockerignore`, which is what lets this benchmark keep its build context
+# rules entirely inside bench/ without touching the repository root.
+#
+# `target/` alone is several gigabytes of host-built artifacts; sending it into
+# the build would dominate the build time and, worse, a stale host-built
+# artifact could end up in the image.
+target
+.git
+.omc
+bench
+Dockerfile
+deploy
+*.md

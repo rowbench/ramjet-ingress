@@ -1,0 +1,32 @@
+# Contender A: the ramjet-ingress data plane, built exactly as it would ship.
+#
+# The build uses the workspace's own `[profile.release]` (thin LTO, one codegen
+# unit, panic=abort), because benchmarking a binary built any other way would be
+# benchmarking something nobody deploys.
+#
+# Build context is the repository root; the ignore list lives in
+# Dockerfile.ramjet.dockerignore next to this file, which is what keeps the 6GB
+# `target/` directory out of the context.
+
+FROM rust:1-slim-bookworm AS builder
+
+WORKDIR /src
+
+# `ring` compiles C, so the toolchain image's gcc is a build requirement rather
+# than an accident. Copying the manifests and sources in one layer is fine here:
+# this image is built once per benchmark run, so a dependency cache layer would
+# buy nothing and risk serving a stale binary.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --release -p ramjet-ingressd
+
+FROM debian:bookworm-slim
+
+# Dev mode (`--static-routes`) never opens a Kubernetes connection, so this
+# image needs no CA bundle and no TLS material — just the binary and the routes.
+COPY --from=builder /src/target/release/ramjet-ingressd /usr/local/bin/ramjet-ingressd
+
+EXPOSE 8080 10254
+
+ENTRYPOINT ["/usr/local/bin/ramjet-ingressd"]

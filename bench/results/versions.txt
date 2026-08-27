@@ -1,0 +1,8 @@
+date:      2026-08-27T13:51:27Z
+host:      Darwin 25.5.0 arm64 (Apple Silicon), 12 host CPUs
+docker:    29.7.2 (Docker Desktop, linuxkit VM)
+docker VM: 8 CPUs, kernel 7.0.12-linuxkit
+nginx:     nginx:1-alpine -> nginx version: nginx/1.31.4
+oha:       ghcr.io/hatoo/oha:latest -> oha 1.16.0
+rustc:     rustc 1.98.0 (88d9e12ae 2026-08-18) (in the builder image)
+ramjet:    ramjet-ingressd 0.1.0, cargo build --release (thin LTO, codegen-units=1, panic=abort)
