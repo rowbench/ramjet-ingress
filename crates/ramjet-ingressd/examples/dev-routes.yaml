@@ -1,0 +1,115 @@
+# A ramjet-ingress dev-mode route table.
+#
+# Two throwaway upstreams that say which one they are. `python3 -m http.server`
+# serves the working directory, so give each one an `/api` and a `/healthz` to
+# answer with:
+#
+#     for u in a b; do
+#         mkdir -p /tmp/ramjet-$u/api /tmp/ramjet-$u/healthz
+#         echo "upstream-$u /"        > /tmp/ramjet-$u/index.html
+#         echo "upstream-$u /api"     > /tmp/ramjet-$u/api/index.html
+#         echo "upstream-$u /healthz" > /tmp/ramjet-$u/healthz/index.html
+#     done
+#     (cd /tmp/ramjet-a && python3 -m http.server 9001) &
+#     (cd /tmp/ramjet-b && python3 -m http.server 9002) &
+#
+# Then run the daemon:
+#
+#     cargo run -p ramjet-ingressd -- \
+#         --static-routes crates/ramjet-ingressd/examples/dev-routes.yaml
+#
+# and drive it:
+#
+#     curl -H 'Host: shop.example.com' http://127.0.0.1:8080/          # upstream-a
+#     curl -H 'Host: shop.example.com' http://127.0.0.1:8080/api/      # leastConn
+#     curl -H 'Host: sub.example.com'  http://127.0.0.1:8080/          # wildcard
+#     curl -H 'Host: anything.else'    http://127.0.0.1:8080/          # default backend
+#     curl -H 'Host: shop.example.com' -H 'x-canary: always' \
+#          http://127.0.0.1:8080/api/                                  # always upstream-b
+#     curl http://127.0.0.1:10254/readyz
+#     curl http://127.0.0.1:10254/metrics
+#
+# Ctrl-C (or SIGTERM) drains in-flight requests and exits.
+#
+# The HTTPS listener is skipped unless this file declares a certificate or you
+# pass --https explicitly; see the commented `tls:` block at the bottom.
+
+# Answers any request that matches no rule at all. Without this, those are 404s.
+defaultBackend: fallback
+
+backends:
+  - name: web
+    policy: roundRobin
+    endpoints:
+      - 127.0.0.1:9001
+
+  - name: api
+    # leastConn sends each request to the endpoint with the fewest in flight,
+    # which is the policy that copes best with endpoints of uneven speed.
+    policy: leastConn
+    endpoints:
+      # The short form means weight 1.
+      - 127.0.0.1:9001
+      # The long form is for a bigger pod, or for draining one with `weight: 0`.
+      - address: 127.0.0.1:9002
+        weight: 2
+
+  - name: api-next
+    endpoints:
+      - 127.0.0.1:9002
+
+  - name: fallback
+    endpoints:
+      - 127.0.0.1:9001
+
+routes:
+  # Exact beats prefix, and a longer prefix beats a shorter one, regardless of
+  # the order rules appear in here.
+  - host: shop.example.com
+    path: /healthz
+    pathType: Exact
+    backend: web
+
+  - host: shop.example.com
+    path: /api
+    pathType: Prefix
+    backend: api
+    # 20% of unmatched traffic goes to api-next; `x-canary: always` sends a
+    # request there no matter what the weight says, and `never` keeps it away.
+    canary:
+      backend: api-next
+      weight: 20
+      header: x-canary
+
+  - host: shop.example.com
+    path: /
+    pathType: Prefix
+    backend: web
+
+  # A wildcard replaces exactly one label: `a.example.com` matches,
+  # `a.b.example.com` does not.
+  - host: "*.example.com"
+    path: /
+    pathType: Prefix
+    backend: web
+
+  # A rule with no host serves every name not claimed above.
+  - path: /status
+    pathType: Prefix
+    backend: web
+
+# Certificates, if you want to exercise the TLS listener. Generate a pair with:
+#
+#     openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+#         -keyout /tmp/dev-key.pem -out /tmp/dev-cert.pem \
+#         -subj '/CN=shop.example.com' \
+#         -addext 'subjectAltName=DNS:shop.example.com'
+#
+# then uncomment:
+#
+# tls:
+#   - host: shop.example.com
+#     cert: /tmp/dev-cert.pem
+#     key: /tmp/dev-key.pem
+#   # An entry with no host (or `host: "*"`) becomes the default certificate,
+#   # served when SNI matches nothing.

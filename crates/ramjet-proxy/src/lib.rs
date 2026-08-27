@@ -1,96 +1,106 @@
 //! `ramjet-proxy` is the ramjet-ingress data plane.
 //!
-//! It owns the listeners, terminates TLS (via `rustls`), speaks HTTP/1.1 and
-//! HTTP/2 to downstream clients, pools connections to upstream endpoints, and
-//! forwards requests. It holds the `arc_swap::ArcSwap<ramjet_router::RouteTable>`
-//! published by `ramjet-controller` and performs exactly one `load()` per
-//! request — no locks, no reload, no per-request allocation beyond that.
+//! It owns the listeners, terminates TLS, speaks HTTP/1.1 and HTTP/2 to
+//! downstream clients, pools connections to upstream endpoints, and forwards
+//! requests. It reads the [`SharedRouteTable`](ramjet_router::SharedRouteTable)
+//! that the controller publishes and does exactly one `load_full()` per
+//! request — no locks, no reload, no rebuild pause.
 //!
-//! # Sans-io boundary
+//! # The sans-io boundary
 //!
-//! `ramjet-router` stays pure: it builds and matches route tables with no
-//! knowledge of sockets, TLS, or I/O of any kind. This crate is the other
-//! side of that boundary — it is where sockets, `rustls`, and async I/O
-//! actually appear. A config change never touches this crate directly; the
-//! controller builds a new `RouteTable` and swaps a pointer, and the next
-//! `forward` call on any worker sees it.
+//! `ramjet-router` decides *what* a request matches; this crate decides *how*
+//! the bytes move. The router never opens a socket, never learns what rustls
+//! is, and never sees a `HeaderMap`. Everything it needs is handed to it as
+//! borrowed `&str`s and plain integers: the `Host` value, the path, a canary
+//! header value, a random word. That is the entire contract, and keeping it
+//! narrow is why the matcher can be benchmarked without a network and why this
+//! crate can be rewritten without touching routing semantics.
 //!
-//! # Planned dependencies
+//! Three things cross the boundary in the other direction, and they all live
+//! here because they need I/O types the router refuses to depend on:
 //!
-//! `ramjet-router` (the route table and matcher), `rustls` (TLS termination
-//! and SNI resolution), and the `ramjet` runtime (the sans-io async runtime
-//! shared with the other ramjet projects). None of it is wired up yet — this
-//! crate is a stub.
+//! - [`CertStore`] resolves the router's opaque
+//!   [`CertifiedKeyHandle`](ramjet_router::CertifiedKeyHandle) ids into real
+//!   `rustls::sign::CertifiedKey`s.
+//! - [`rng`] supplies the random words the router's load balancer and canary
+//!   splitter take as arguments.
+//! - [`Upstream`] turns a selected [`Endpoint`](ramjet_router::Endpoint) into
+//!   an actual TCP connection.
+//!
+//! # One snapshot per request
+//!
+//! [`SharedRouteTable::load_full`](ramjet_router::SharedRouteTable::load_full)
+//! is called once at the top of [`forward::handle`] and the resulting `Arc` is
+//! held until the response is on the wire. Everything downstream of that —
+//! host matching, path matching, canary evaluation, endpoint selection, and
+//! the in-flight counter guard — reads through that one snapshot, so a request
+//! can never observe a half-applied configuration change.
+//!
+//! The snapshot is deliberately *not* taken once per connection, even though an
+//! HTTP/1.1 keep-alive connection would then pay for a single load instead of
+//! one per request. A keep-alive connection from a busy client can live for
+//! hours; pinning it to the generation it was accepted under would mean a route
+//! deleted at 09:00 keeps serving traffic at 17:00, which is a correctness bug
+//! wearing a performance costume. Per-request is one uncontended atomic
+//! increment against a cache line that every worker is already reading — a few
+//! nanoseconds — and it buys the property that a published table is *actually*
+//! in force the moment it is published. HTTP/2 makes the argument moot anyway:
+//! one connection carries many concurrent streams, so "per connection" would
+//! not even be well defined.
+//!
+//! # What is deliberately not here
+//!
+//! The proxy runs on tokio and hyper. An earlier sketch of this crate proposed
+//! building it on the experimental `ramjet` reactor runtime shared with the
+//! other ramjet projects; that is a later phase and an explicitly separate
+//! experiment. Replacing a mature HTTP/1.1 and HTTP/2 implementation is not a
+//! prerequisite for an ingress controller, and doing it before the data plane
+//! is correct would make every bug a two-suspect problem.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use ramjet_proxy::{CertStore, ProxyConfig, Server, Shutdown};
+//! use ramjet_router::{Endpoint, LbPolicy, PathType, RouteTableBuilder, SharedRouteTable};
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut builder = RouteTableBuilder::new();
+//! builder.backend("api", LbPolicy::RoundRobin, vec![Endpoint::new("10.0.0.1:8080".parse()?)])?;
+//! builder.route(Some("example.com"), "/", PathType::Prefix, "api")?;
+//!
+//! let routes = Arc::new(SharedRouteTable::new(builder.build()?));
+//! let certs = Arc::new(CertStore::new());
+//!
+//! let server = Server::bind(ProxyConfig::default(), routes, certs)?;
+//! server.readiness().set_ready(true);
+//! server.run(Shutdown::on_signal()).await?;
+//! # Ok(())
+//! # }
+//! ```
 
-// Stub crate: no implementations yet, only the planned module skeleton and
-// doc comments describing the intended API surface. Remove once real types
-// land and start triggering genuine dead-code warnings.
-#![allow(dead_code)]
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
-pub mod listener {
-    //! Accept loop, socket options, and PROXY protocol v2 decoding.
-    //!
-    //! Planned: a `Listener` type that binds a socket address and configures
-    //! it (`SO_REUSEADDR`, `TCP_NODELAY`, and friends), then exposes an
-    //! `accept` step that yields raw accepted connections — optionally
-    //! unwrapping a leading PROXY protocol v2 header to recover the real
-    //! client address when running behind an L4 load balancer.
-    //!
-    //! Shape: `Listener::bind(addr) -> Listener`, `Listener::accept(&self)
-    //! -> Connection`. Socket options and PROXY protocol v2 decoding live
-    //! here, upstream of TLS and HTTP.
-}
+pub mod admin;
+pub mod body;
+pub mod forward;
+pub mod headers;
+pub mod listener;
+pub mod metrics;
+pub mod rng;
+pub mod server;
+pub mod tls;
+pub mod upstream;
 
-pub mod tls {
-    //! TLS termination: `rustls::ServerConfig`, SNI certificate resolution,
-    //! and ALPN negotiation.
-    //!
-    //! Planned: a `rustls::server::ResolvesServerCert` implementation
-    //! backed by the router's `SniMap`, so certificate selection is a
-    //! lookup into the same immutable snapshot the data plane already
-    //! reads for routing. ALPN offers `h2` and `http/1.1`; the negotiated
-    //! protocol picks between the [`http1`](crate::http1) and
-    //! [`http2`](crate::http2) modules downstream.
-    //!
-    //! The router's `CertifiedKeyHandle` is a placeholder type on the
-    //! sans-io side; it resolves to a real `rustls::sign::CertifiedKey`
-    //! here, where `rustls` is actually a dependency.
-}
-
-pub mod http1 {
-    //! HTTP/1.1 request/response pipeline.
-    //!
-    //! Planned: request parsing, keep-alive connection reuse, and chunked
-    //! transfer encoding for both directions of the pipeline.
-}
-
-pub mod http2 {
-    //! HTTP/2 server: stream multiplexing, HPACK, and flow control.
-    //!
-    //! Planned: an HTTP/2 server implementation handling multiple
-    //! concurrent streams per connection, header compression via HPACK,
-    //! and connection- and stream-level flow control windows.
-}
-
-pub mod upstream {
-    //! Upstream connection pooling: per-endpoint pools, dialing, health,
-    //! and retries/failover.
-    //!
-    //! Planned: a connection pool keyed per backend endpoint, with
-    //! dialing, health tracking, and retry/failover behavior. In-flight
-    //! request counts hook into the router's `BackendStats` so
-    //! load-balancing strategies like LeastConn stay accurate as the
-    //! route table is swapped out from under them — a stat belongs to the
-    //! backend, not to any one table snapshot.
-}
-
-pub mod forward {
-    //! The per-request forwarding path.
-    //!
-    //! Planned: load the current `RouteTable` from the `ArcSwap`, match
-    //! the request, select a backend endpoint, and splice bytes in both
-    //! directions between the client and upstream connections. This is
-    //! the function the sub-200ns matcher budget in `ramjet-router` was
-    //! set for — everything else in the request path has to fit around
-    //! that number, not the other way around.
-}
+pub use admin::{AdminState, ReadinessFlag};
+pub use body::ProxyBody;
+pub use forward::{ConnInfo, ProxyState, Scheme};
+pub use listener::{Listener, ListenerConfig};
+pub use metrics::Metrics;
+pub use server::{
+    serve, ProxyConfig, Server, Shutdown, ShutdownHandle, DEFAULT_ADMIN_PORT, DEFAULT_HTTP_PORT,
+    DEFAULT_HTTPS_PORT,
+};
+pub use tls::{CertStore, SniResolver};
+pub use upstream::{Upstream, UpstreamConfig, UpstreamError};
