@@ -173,7 +173,7 @@ fn serve(mut stream: TcpStream, behaviour: Behaviour, seen: Arc<Seen>, stop: Arc
         let chunked = header_of(&head, "transfer-encoding")
             .is_some_and(|v| v.eq_ignore_ascii_case("chunked"));
 
-        let mut body;
+        let body;
         if chunked {
             // Read until the terminating zero-length chunk.
             let mut consumed = head_end;
@@ -192,7 +192,6 @@ fn serve(mut stream: TcpStream, behaviour: Behaviour, seen: Arc<Seen>, stop: Arc
             }
             buf.drain(..consumed);
         } else {
-            body = Vec::new();
             while buf.len() < head_end + body_len {
                 match stream.read(&mut chunk) {
                     Ok(0) | Err(_) => return,

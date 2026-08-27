@@ -34,7 +34,7 @@ use ramjet_proxy::{
 use ramjet_router::SharedRouteTable;
 use tracing_subscriber::EnvFilter;
 
-use crate::args::{ArgError, Args, USAGE};
+use crate::args::{ArgError, Args, Engine, USAGE};
 
 /// One worker thread, deliberately.
 ///
@@ -86,9 +86,22 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     init_logging();
 
-    match args.static_routes.clone() {
-        Some(path) => dev_mode(&args, &path).await,
-        None => kubernetes::run(&args).await,
+    match (args.static_routes.clone(), args.engine) {
+        (Some(path), Engine::Hyper) => dev_mode(&args, &path).await,
+        (Some(path), Engine::Uring) => uring_mode(&args, &path).await,
+        (None, Engine::Hyper) => kubernetes::run(&args).await,
+        // Not a missing branch but a refused combination. The uring engine
+        // reads a route table it is handed and has no way to accept a new one
+        // mid-flight, which is the entire job in Kubernetes mode. Serving
+        // Kubernetes traffic from a table frozen at startup would look like it
+        // worked right up until the first deployment.
+        (None, Engine::Uring) => {
+            eprintln!(
+                "ramjet-ingressd: --engine uring serves static routes only; \
+                 pass --static-routes <FILE>, or use --engine hyper for Kubernetes mode"
+            );
+            Ok(ExitCode::FAILURE)
+        }
     }
 }
 
@@ -174,6 +187,111 @@ async fn dev_mode(
     readiness.set_ready(true);
 
     finish(server.run(Shutdown::on_signal()).await)
+}
+
+/// Serves a route table read from a file on the experimental uring engine.
+///
+/// Kept separate from [`dev_mode`] rather than folded into it with branches:
+/// the two engines share their configuration and their route table and nothing
+/// else, and pretending otherwise would put `if engine ==` through the middle
+/// of a path that is already correct.
+async fn uring_mode(
+    args: &Args,
+    path: &std::path::Path,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let loaded = config::load(path)?;
+    let summary = loaded.summary;
+
+    // Refused rather than ignored. A TLS listener that this engine cannot
+    // terminate would accept connections and fail every handshake, which looks
+    // from outside exactly like a broken certificate.
+    if !loaded.certs.is_empty() {
+        return Err(format!(
+            "{} declares {} certificate(s), and --engine uring does not terminate TLS; \
+             use --engine hyper",
+            path.display(),
+            summary.certificates
+        )
+        .into());
+    }
+    if args.https_explicit && args.https.is_some() {
+        return Err(
+            "--https was given, and --engine uring does not terminate TLS; use --engine hyper"
+                .into(),
+        );
+    }
+    let Some(http) = args.http else {
+        return Err("--engine uring needs a plaintext listener; --no-http leaves it nothing to serve".into());
+    };
+
+    let routes = Arc::new(SharedRouteTable::new(loaded.table));
+    let readiness = Arc::new(AtomicBool::new(false));
+    let config = ramjet_engine::engine::Config {
+        http,
+        admin: args.admin,
+        workers: args.worker_threads,
+        connect_timeout: args.connect_timeout,
+        response_timeout: args.response_timeout,
+        max_connect_attempts: args.max_connect_attempts,
+        pool_max_idle_per_host: args.upstream_pool_idle,
+        ..ramjet_engine::engine::Config::default()
+    };
+
+    let engine = ramjet_engine::engine::Engine::bind(
+        config,
+        Arc::clone(&routes),
+        Arc::clone(&readiness),
+    )?;
+
+    println!(
+        "ramjet-ingressd {} — engine {}, {} backend(s), {} endpoint(s), {} route(s){}",
+        env!("CARGO_PKG_VERSION"),
+        args.engine.as_str(),
+        summary.backends,
+        summary.endpoints,
+        summary.routes,
+        if summary.default_backend {
+            ", default backend set"
+        } else {
+            ""
+        }
+    );
+    println!("  config   {}", path.display());
+    println!("  http     {}", engine.http_addr());
+    match engine.admin_addr() {
+        Some(addr) => {
+            println!("  admin    {addr}");
+            println!("  probes   http://{addr}/healthz  http://{addr}/readyz  http://{addr}/metrics");
+        }
+        None => println!("  admin    disabled"),
+    }
+    println!("  cores    {}", engine.cores());
+    // Printed at startup, not buried in a doc comment: an operator who chose
+    // this engine should see what they gave up before their first request
+    // fails rather than after.
+    for line in ramjet_engine::limits::V1_LIMITS.lines() {
+        println!("  {line}");
+    }
+
+    // The table is read before the listeners bind, so the replica is ready the
+    // moment it can accept.
+    readiness.store(true, Ordering::Release);
+
+    let stop = engine.shutdown();
+    let mut signal = Shutdown::on_signal();
+    tokio::spawn(async move {
+        signal.recv().await;
+        stop.stop();
+    });
+
+    // The reactor is a blocking loop and is `!Send` per core, so it runs off
+    // the async runtime entirely; this thread only waits for it.
+    let outcome = tokio::task::spawn_blocking(move || engine.run())
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e)) })?;
+    finish(outcome)
 }
 
 /// The listener and upstream configuration both modes share.

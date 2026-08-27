@@ -507,6 +507,52 @@ a per-runtime ceiling rather than a process-wide one, and a single very busy
 connection cannot be spread across cores. For an ingress carrying many
 connections rather than one, that is the right way round.
 
+### The floor, and the second engine
+
+Thread-per-core took the hyper data plane to 99% of nginx's throughput at c64
+and the same 23.6 us of CPU per request. What is left is not a tuning problem.
+After the change the profile reads: 31.2% `writev`, 28.2% `read`, 9.1% `kevent`,
+and about 1% for everything this project wrote. **59.4% of a request is the four
+unavoidable syscalls and another 9.1% is finding out a socket is ready** — a
+floor set by the I/O model rather than by hyper, tokio, or any function.
+
+Fewer syscalls per request is the only thing under it, and on Linux that means
+`io_uring`: submissions batch into a ring and the kernel is entered once for
+many of them rather than once per operation, with no readiness poll at all.
+That is a different data plane, not a patch to this one, so it is
+`crates/ramjet-engine`, selected with `--engine uring`, and the default stays
+`hyper`.
+
+The two share the route table, the matcher, the load balancer, the canary
+arithmetic and the metrics format, and differ only in how bytes move. Three
+things about it are worth recording here because they are properties of the
+model rather than of the code:
+
+- **A pooled upstream connection is validated without a syscall.** An idle one
+  sits with a read submitted; if the origin closes, that read completes and the
+  connection is discarded before anyone can be handed it. When a request does
+  take it, the read that was watching for the close becomes the read that
+  collects the response — the hot path submits one operation *fewer* than a cold
+  one, where a readiness-based pool would have to add a probe.
+- **The reactor has no connect and no timer.** A proxy dials outward and has to
+  bound how long it waits, and neither operation exists. One shared helper
+  thread therefore polls the sockets that are still connecting, with its poll
+  timeout doubling as the clock, and tells a core over a pipe the core has an
+  ordinary read parked on. The contract that keeps that free of use-after-free
+  is that the helper *borrows* a connecting descriptor until it sends exactly
+  one note about it, including for a connect that never finishes.
+- **Every submission carries a generation.** Closing a descriptor cancels the
+  operations on it, but their completions arrive later, by which time the kernel
+  may have handed the same number to a new connection. Without the generation
+  in the completion tag, a cancelled read from a connection that ended would be
+  delivered as input to whoever inherited its number.
+
+What it does not do is as important: no TLS, no HTTP/2, no protocol upgrades,
+no Kubernetes mode. Each is refused with a status code and an explanation
+naming the other engine, and the same list prints at startup, because a gap
+that behaves like a bug in whatever is on the other end is worse than a missing
+feature. `bench/engine/RESULTS.md` has the measurement.
+
 ## Deliberate divergences from ingress-nginx
 
 - **Regex anchoring.** ingress-nginx emits `location ~* "^<path>"`, a literal

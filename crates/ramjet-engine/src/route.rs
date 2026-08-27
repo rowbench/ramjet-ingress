@@ -79,7 +79,7 @@ pub fn first_endpoint<'t>(table: &'t RouteTable, backend: &'t Backend) -> Option
 }
 
 /// The endpoint for attempt number `attempt`, counting from the first choice.
-pub fn endpoint_at<'t>(backend: &'t Backend, first: usize, attempt: usize) -> Option<&'t Endpoint> {
+pub fn endpoint_at(backend: &Backend, first: usize, attempt: usize) -> Option<&Endpoint> {
     let endpoints = backend.endpoints();
     if endpoints.is_empty() {
         return None;

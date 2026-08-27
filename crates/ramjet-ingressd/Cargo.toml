@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 ramjet-controller.workspace = true
+ramjet-engine.workspace = true
 ramjet-proxy.workspace = true
 ramjet-router.workspace = true
 

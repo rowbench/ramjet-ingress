@@ -7,7 +7,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{dead_addr, echo, get, spawn, table_for, Behaviour, Client, Proxy};
+use common::{dead_addr, echo, get, spawn, Behaviour, Client, Proxy};
 use ramjet_router::{Endpoint, LbPolicy, PathType, RouteTableBuilder};
 
 fn table_of(endpoints: &[std::net::SocketAddr]) -> ramjet_router::RouteTable {

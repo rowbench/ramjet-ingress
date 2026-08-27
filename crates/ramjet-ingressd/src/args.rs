@@ -47,6 +47,35 @@ pub enum ArgError {
     },
 }
 
+/// Which data plane serves traffic.
+///
+/// Two engines share every line of the routing and configuration path and
+/// differ only in how they move bytes. The default is the one that has been
+/// measured against nginx and carries TLS, HTTP/2 and upgrades; the other is an
+/// experiment in whether a completion-based reactor gets under the syscall
+/// floor `bench/PROFILE.md` identified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Engine {
+    /// hyper on tokio. Everything works.
+    #[default]
+    Hyper,
+    /// The `ramjet` reactor: io_uring on Linux, kqueue elsewhere.
+    ///
+    /// HTTP/1.1 plaintext only, static routes only. See `ramjet_engine` for the
+    /// full list of what it refuses.
+    Uring,
+}
+
+impl Engine {
+    /// The name this engine is selected by.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Engine::Hyper => "hyper",
+            Engine::Uring => "uring",
+        }
+    }
+}
+
 /// Everything the daemon was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
@@ -101,6 +130,8 @@ pub struct Args {
     pub upstream_pool_idle: usize,
     /// Serving runtimes to start, or `None` for one per available core.
     pub worker_threads: Option<usize>,
+    /// Which data plane serves traffic.
+    pub engine: Engine,
 }
 
 impl Default for Args {
@@ -127,6 +158,7 @@ impl Default for Args {
             max_connect_attempts: 3,
             upstream_pool_idle: ramjet_proxy::DEFAULT_POOL_MAX_IDLE_PER_HOST,
             worker_threads: None,
+            engine: Engine::Hyper,
         }
     }
 }
@@ -190,8 +222,17 @@ UPSTREAMS:
     it, the only cost is file descriptors.
 
 SERVING:
+    --engine <NAME>           Data plane: hyper or uring     [default: hyper]
     --worker-threads <N>      Serving runtimes, one per thread
                                               [default: one per available core]
+
+    `uring` is experimental. It serves HTTP/1.1 plaintext on the ramjet reactor
+    — io_uring on Linux, kqueue elsewhere — to find out whether batched
+    submission gets under the syscall floor the hyper engine measured. It has no
+    TLS, no HTTP/2, no protocol upgrades and no Kubernetes mode, and refuses
+    each of those with a status and an explanation rather than silently doing
+    something else. Everything about routing, load balancing, canaries, headers
+    and /metrics is the same on both.
 
     Each runtime owns its connections, its upstream connection pool, and its
     timers, and a connection stays on the one it landed on. Setting this above
@@ -211,7 +252,7 @@ RAMJET_WATCH_NAMESPACE, RAMJET_DEFAULT_BACKEND, RAMJET_DEFAULT_TLS_SECRET,
 RAMJET_PUBLISH_ADDRESS, RAMJET_PUBLISH_SERVICE, RAMJET_UPDATE_STATUS,
 RAMJET_HTTP, RAMJET_HTTPS, RAMJET_ADMIN, RAMJET_CONNECT_TIMEOUT,
 RAMJET_RESPONSE_TIMEOUT, RAMJET_MAX_CONNECT_ATTEMPTS, RAMJET_UPSTREAM_POOL_IDLE,
-RAMJET_WORKER_THREADS, RAMJET_SHUTDOWN_GRACE).
+RAMJET_WORKER_THREADS, RAMJET_SHUTDOWN_GRACE, RAMJET_ENGINE).
 A flag always beats the environment. RUST_LOG sets the log filter.
 
 ADMIN ENDPOINTS:
@@ -298,6 +339,7 @@ impl Args {
                 "--worker-threads" => {
                     args.worker_threads = Some(number(&name, &value()?)?.max(1));
                 }
+                "--engine" => args.engine = engine(&name, &value()?)?,
                 other if other.starts_with('-') => {
                     return Err(ArgError::Unknown(other.to_owned()))
                 }
@@ -362,6 +404,9 @@ impl Args {
         if let Some(value) = env("RAMJET_UPSTREAM_POOL_IDLE") {
             args.upstream_pool_idle = number("RAMJET_UPSTREAM_POOL_IDLE", &value)?;
         }
+        if let Some(value) = env("RAMJET_ENGINE") {
+            args.engine = engine("RAMJET_ENGINE", &value)?;
+        }
         if let Some(value) = env("RAMJET_WORKER_THREADS") {
             args.worker_threads = Some(number("RAMJET_WORKER_THREADS", &value)?.max(1));
         }
@@ -425,6 +470,23 @@ fn seconds(option: &str, value: &str) -> Result<Duration, ArgError> {
             value: value.to_owned(),
             kind: "number of seconds",
         })
+}
+
+/// The engine named by a flag or an environment variable.
+///
+/// An unrecognised name is an error rather than a fallback to the default: an
+/// operator who typed `--engine iouring` asked for something specific, and
+/// silently serving on the other engine is the worst possible answer.
+fn engine(option: &str, value: &str) -> Result<Engine, ArgError> {
+    match value {
+        "hyper" => Ok(Engine::Hyper),
+        "uring" => Ok(Engine::Uring),
+        _ => Err(ArgError::BadValue {
+            option: option.to_owned(),
+            value: value.to_owned(),
+            kind: "engine (hyper or uring)",
+        }),
+    }
 }
 
 fn number(option: &str, value: &str) -> Result<usize, ArgError> {
@@ -538,6 +600,40 @@ mod tests {
             args.https_explicit,
             "an explicit --no-https must suppress the certificate-based default"
         );
+    }
+
+    #[test]
+    fn the_engine_defaults_to_hyper() {
+        // The engine that has been measured against nginx and carries TLS,
+        // HTTP/2 and upgrades is the one you get without asking.
+        assert_eq!(parse(&[]).expect("valid").engine, Engine::Hyper);
+    }
+
+    #[test]
+    fn the_engine_can_be_selected_either_way() {
+        assert_eq!(
+            parse(&["--engine", "uring"]).expect("valid").engine,
+            Engine::Uring
+        );
+        let env = |name: &str| match name {
+            "RAMJET_ENGINE" => Some("uring".to_owned()),
+            _ => None,
+        };
+        let args = Args::parse(std::iter::empty::<OsString>(), env).expect("valid");
+        assert_eq!(args.engine, Engine::Uring);
+    }
+
+    #[test]
+    fn an_unknown_engine_is_an_error_not_a_fallback() {
+        // Somebody who typed `--engine io_uring` asked for something specific.
+        // Quietly serving on the other engine is the worst possible answer,
+        // because it looks like it worked.
+        let error = parse(&["--engine", "io_uring"]).expect_err("refused");
+        assert!(
+            matches!(&error, ArgError::BadValue { option, .. } if option == "--engine"),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("hyper or uring"), "{error}");
     }
 
     #[test]
@@ -695,6 +791,7 @@ mod tests {
             "--response-timeout",
             "--shutdown-grace",
             "--max-connect-attempts",
+            "--engine",
         ] {
             assert!(USAGE.contains(option), "{option} is undocumented");
         }

@@ -12,7 +12,8 @@ file is about running it.
 | `ramjet-router` | Route table, host/path matcher, load balancing, canary |
 | `ramjet-proxy` | Listeners, TLS termination, HTTP/1.1 and HTTP/2, upstreams |
 | `ramjet-controller` | Kubernetes watches, translation, status writeback |
-| `ramjet-ingressd` | The daemon that wires the three together |
+| `ramjet-engine` | An experimental second data plane on a completion-based reactor |
+| `ramjet-ingressd` | The daemon that wires them together |
 
 ## Build and test
 
@@ -20,6 +21,48 @@ file is about running it.
 cargo build --release
 cargo test --workspace
 ```
+
+`ramjet-engine` depends on the `ramjet` runtime from a **sibling repository**
+by path, so the workspace expects that checkout beside this one:
+
+```
+.../
+  ramjet-ingress/     <- this repository
+  enhance-socket/     <- the ramjet runtime and ramjet-http
+```
+
+Without it, `cargo` refuses to load the workspace at all rather than skipping
+the crate. It is also why the container builds take the parent directory as
+their build context.
+
+## Two engines
+
+The data plane is selected with `--engine`, and everything above it — routing,
+load balancing, canaries, header rewriting, `/metrics` — is the same code
+either way.
+
+| | `--engine hyper` (default) | `--engine uring` |
+|---|---|---|
+| Runtime | hyper on tokio | the `ramjet` reactor: io_uring on Linux, kqueue elsewhere |
+| HTTP/1.1 plaintext | yes | yes |
+| TLS termination | yes | no (502) |
+| HTTP/2, gRPC upstreams | h2 downstream | no (502) |
+| WebSocket and upgrades | yes | no (502) |
+| Kubernetes mode | yes | no; static routes only |
+| Status | measured against nginx | experimental |
+
+`uring` exists to answer one question. `bench/PROFILE.md` measured where a
+request goes and found no hot function to fix: 59.4% of a request is the four
+syscalls a proxy hop cannot avoid, another 9.1% is finding out a socket is
+ready, and everything this project wrote is about 1%. Getting under that floor
+is not a tuning exercise, it is an I/O model change — so there is now a second
+data plane that submits those four operations into a ring and enters the kernel
+once for a batch of them. The result is in
+[bench/engine/RESULTS.md](bench/engine/RESULTS.md).
+
+Everything it refuses, it refuses with a status code and an explanation naming
+the other engine, and it prints the same list at startup. A gap that behaves
+like a bug in whatever is on the other end is worse than a missing feature.
 
 ## Running it without a cluster
 
