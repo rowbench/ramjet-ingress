@@ -402,11 +402,21 @@ impl Workers {
             let metrics = Arc::clone(metrics);
             let acceptor = acceptor.clone();
 
+            // Built here rather than on the new thread, and moved into it. A
+            // runtime that cannot be created is a startup failure the caller
+            // can report; discovering it on the thread instead would leave a
+            // lane that accepts its share of the round-robin and serves none
+            // of it, which is a fifth of the traffic disappearing into a
+            // socket nobody is reading.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+
             std::thread::Builder::new()
                 .name(format!("ramjet-serve-{index}"))
                 .spawn(move || {
                     let drained =
-                        serve_lane(routes, metrics, upstream, acceptor, grace, jobs_rx);
+                        serve_lane(runtime, routes, metrics, upstream, acceptor, grace, jobs_rx);
                     // A receiver that has gone away means `run` already
                     // returned, which is not this thread's problem.
                     let _ = done_tx.send(drained);
@@ -465,6 +475,7 @@ impl Workers {
 /// One serving runtime: accepts handed-off connections until the lane closes,
 /// then drains. Returns whether the drain finished inside `grace`.
 fn serve_lane(
+    runtime: tokio::runtime::Runtime,
     routes: Arc<SharedRouteTable>,
     metrics: Arc<Metrics>,
     upstream: UpstreamConfig,
@@ -472,17 +483,6 @@ fn serve_lane(
     grace: Duration,
     mut jobs: mpsc::UnboundedReceiver<Job>,
 ) -> bool {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        // Nothing can be served on this lane. Reporting it as "not drained" is
-        // the only signal available from here, and dropping `jobs` makes the
-        // accept side stop choosing it.
-        Err(_) => return false,
-    };
-
     runtime.block_on(async move {
         // Built inside the runtime, and one per lane: this is the pool the
         // module docs are about.
