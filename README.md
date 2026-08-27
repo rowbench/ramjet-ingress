@@ -109,9 +109,19 @@ Every `kubectl` and `helm` call in that script carries an explicit
 not look local. A developer kubeconfig usually holds production clusters, and a
 mistyped current-context is exactly how a test script deletes one.
 
-One local-cluster detail the script documents in place: Docker Desktop's
+One local-cluster detail the script handles in place: Docker Desktop's
 Kubernetes runs a kind-style node whose containerd is a separate image store
-from the docker daemon's, bridged by a registry mirror. A locally built image is
-reachable, but only by *pulling* it — `imagePullPolicy: Never` fails with
-`ErrImageNeverPull` even though the image is right there, so the override uses
-`IfNotPresent`.
+from the docker daemon's, so a freshly built image is invisible to the kubelet
+and a pod referencing it fails with `ErrImageNeverPull`. The script loads it
+explicitly, which is what `kind load docker-image` does under the hood:
+
+```sh
+docker save ramjet-ingress:e2e | docker exec -i desktop-control-plane ctr -n k8s.io images import -
+```
+
+The node is addressable as `desktop-control-plane` even though `docker ps` does
+not list it — Docker Desktop hides the container from the listing while still
+allowing `exec`, so an empty `docker ps` is not evidence that there is no node
+to load into. Importing rather than pulling is what lets `imagePullPolicy` stay
+`Never`: the assertions then prove the image *this script built* is the one that
+ran, with no path by which the kubelet could quietly substitute a registry copy.

@@ -123,12 +123,32 @@ SIZE="$(docker image inspect "$IMAGE" --format '{{.Size}}' | awk '{printf "%.1f 
 note "image size: $SIZE"
 
 # Docker Desktop's Kubernetes runs a kind-style node whose containerd is a
-# *separate* image store from the docker daemon's. It is bridged by a registry
-# mirror, which means a locally built image is reachable — but only by pulling
-# it. `imagePullPolicy: Never` fails with ErrImageNeverPull even though the
-# image is right there; IfNotPresent resolves it through the mirror in
-# milliseconds. That is why the override below is IfNotPresent and not Never.
-PULL_POLICY=IfNotPresent
+# *separate* image store from the docker daemon's: a freshly built image is not
+# visible to the kubelet, and a pod referencing it fails with
+# ErrImageNeverPull. So load it explicitly, which is what `kind load
+# docker-image` does under the hood.
+#
+# The node is addressable as a container named desktop-control-plane even
+# though `docker ps` does not list it — Docker Desktop hides it from the
+# container listing while still allowing exec. Do not conclude from an empty
+# `docker ps` that there is no node to load into.
+#
+# Importing rather than relying on a pull is what lets imagePullPolicy stay
+# Never: the assertions then prove the image built by *this* script ran, with
+# no path by which the kubelet could quietly substitute one from a registry.
+NODE="${NODE:-desktop-control-plane}"
+
+step "Loading $IMAGE into the cluster node"
+if ! docker exec -i "$NODE" true 2>/dev/null; then
+  echo "cannot exec into node container '$NODE'." >&2
+  echo "  This script loads the image with 'docker save | docker exec $NODE ctr -n k8s.io images import -'," >&2
+  echo "  which needs the kind-style node Docker Desktop runs. Override with NODE=<name> if yours differs." >&2
+  exit 1
+fi
+docker save "$IMAGE" | docker exec -i "$NODE" ctr -n k8s.io images import -
+note "imported into the node's containerd (namespace k8s.io)"
+
+PULL_POLICY=Never
 
 # ----------------------------------------------------------------- install ---
 
