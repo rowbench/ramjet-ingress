@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/ramjet-engine",
     "crates/ramjet-router",
     "crates/ramjet-proxy",
     "crates/ramjet-controller",
@@ -20,9 +21,17 @@ repository = "https://github.com/sofelia-ai/ramjet-ingress"
 # copies in the binary, and for rustls it is two crypto providers where the one
 # that signs a handshake is decided by which crate built the `ServerConfig`.
 [workspace.dependencies]
+ramjet-engine = { path = "crates/ramjet-engine" }
 ramjet-router = { path = "crates/ramjet-router" }
 ramjet-proxy = { path = "crates/ramjet-proxy" }
 ramjet-controller = { path = "crates/ramjet-controller" }
+
+# The ramjet runtime and its sans-io HTTP codec live in a sibling repository
+# (`../enhance-socket`) rather than on crates.io at a version this workspace can
+# pin. `ramjet-engine` is the only crate that uses them, and it is the reason a
+# checkout of ramjet-ingress alone does not build: the sibling has to be there.
+ramjet = { path = "../enhance-socket" }
+ramjet-http = { path = "../enhance-socket/ramjet-http" }
 
 arc-swap = "1.9"
 regex = "1.13"

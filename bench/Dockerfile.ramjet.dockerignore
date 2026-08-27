@@ -1,14 +1,23 @@
-# BuildKit reads `<dockerfile>.dockerignore` in preference to a root
-# `.dockerignore`, which is what lets this benchmark keep its build context
-# rules entirely inside bench/ without touching the repository root.
-#
-# `target/` alone is several gigabytes of host-built artifacts; sending it into
-# the build would dominate the build time and, worse, a stale host-built
-# artifact could end up in the image.
-target
-.git
-.omc
-bench
-Dockerfile
-deploy
-*.md
+# Context is the parent of the repository (see Dockerfile.ramjet), so every
+# pattern here is relative to that directory and has to survive two sibling
+# checkouts rather than one.
+**/target
+**/.git
+**/.omc
+**/.omx
+**/*.md
+
+# Sibling projects that are no part of this build.
+ramjet-ws-js
+
+# Repository directories the binary does not need.
+ramjet-ingress/bench
+ramjet-ingress/deploy
+ramjet-ingress/Dockerfile
+
+# The runtime's own test rigs and fixtures; `src/`, `ramjet-http/` and the
+# manifests are what cargo actually reads.
+enhance-socket/bench
+enhance-socket/autobahn
+enhance-socket/certs
+enhance-socket/scripts

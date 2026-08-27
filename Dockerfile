@@ -5,6 +5,15 @@
 # manager, and no root user, which is worth stating plainly — a process that
 # terminates untrusted connections from the whole internet should not be one
 # `sh -c` away from a working toolchain.
+#
+# Build context is the **parent** of the repository:
+#
+#     docker build -f ramjet-ingress/Dockerfile -t ramjet-ingressd .
+#
+# `crates/ramjet-engine` depends on the `ramjet` runtime by path
+# (`../enhance-socket`), and cargo will not load a workspace whose member has a
+# dependency it cannot find, so the sibling checkout has to be inside the
+# context. Ignore rules live in Dockerfile.dockerignore beside this file.
 
 FROM rust:1-bookworm AS builder
 
@@ -18,12 +27,15 @@ WORKDIR /src
 # Dockerfile. Cache mounts get the same incremental rebuild with a single COPY
 # and no fiction. The cost is that the caches live in the builder, not in the
 # image, so `cp` below has to lift the binary out before the mount goes away.
-COPY . .
+COPY ramjet-ingress ./ramjet-ingress
+COPY enhance-socket ./enhance-socket
+
+WORKDIR /src/ramjet-ingress
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/src/target,sharing=locked \
+    --mount=type=cache,target=/src/ramjet-ingress/target,sharing=locked \
     cargo build --release --locked -p ramjet-ingressd \
-    && cp /src/target/release/ramjet-ingressd /ramjet-ingressd
+    && cp /src/ramjet-ingress/target/release/ramjet-ingressd /ramjet-ingressd
 
 # `cc` rather than `static-debian12`: the binary links glibc. It does not link
 # OpenSSL, because TLS is rustls over ring — which is the reason this image

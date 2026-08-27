@@ -104,7 +104,10 @@ build_images() {
     docker pull -q "${CURL_IMAGE}"  >/dev/null
 
     log "building ${IMAGE} (cargo build --release -p ramjet-ingressd)"
-    docker build -q -f "${BENCH_DIR}/Dockerfile.ramjet" -t "${IMAGE}" "${REPO_DIR}" >/dev/null
+    # The context is the parent of the repository: `crates/ramjet-engine`
+    # depends on the sibling `ramjet` runtime checkout by path, and cargo will
+    # not load a workspace whose member has a dependency outside the context.
+    docker build -q -f "${BENCH_DIR}/Dockerfile.ramjet" -t "${IMAGE}" "${REPO_DIR}/.." >/dev/null
 }
 
 start_topology() {

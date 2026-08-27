@@ -4,9 +4,13 @@
 # unit, panic=abort), because benchmarking a binary built any other way would be
 # benchmarking something nobody deploys.
 #
-# Build context is the repository root; the ignore list lives in
-# Dockerfile.ramjet.dockerignore next to this file, which is what keeps the 6GB
-# `target/` directory out of the context.
+# Build context is the **parent** of the repository, not the repository root.
+# That is not a preference: `crates/ramjet-engine` depends on the `ramjet`
+# runtime by path (`../enhance-socket`), and cargo refuses to load a workspace
+# whose member has a dependency it cannot find — so a context that stops at the
+# repository root fails before rustc is ever reached. The ignore list lives in
+# Dockerfile.ramjet.dockerignore next to this file, which is what keeps both
+# repositories' `target/` directories out of the context.
 
 FROM rust:1-slim-bookworm AS builder
 
@@ -16,8 +20,15 @@ WORKDIR /src
 # than an accident. Copying the manifests and sources in one layer is fine here:
 # this image is built once per benchmark run, so a dependency cache layer would
 # buy nothing and risk serving a stale binary.
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
+#
+# The two repositories keep their real names and their real relative positions,
+# which is the whole trick: `../enhance-socket` resolves inside the image for
+# exactly the same reason it resolves on a laptop.
+COPY ramjet-ingress/Cargo.toml ramjet-ingress/Cargo.lock ./ramjet-ingress/
+COPY ramjet-ingress/crates ./ramjet-ingress/crates
+COPY enhance-socket ./enhance-socket
+
+WORKDIR /src/ramjet-ingress
 
 RUN cargo build --release -p ramjet-ingressd
 
@@ -25,7 +36,7 @@ FROM debian:bookworm-slim
 
 # Dev mode (`--static-routes`) never opens a Kubernetes connection, so this
 # image needs no CA bundle and no TLS material — just the binary and the routes.
-COPY --from=builder /src/target/release/ramjet-ingressd /usr/local/bin/ramjet-ingressd
+COPY --from=builder /src/ramjet-ingress/target/release/ramjet-ingressd /usr/local/bin/ramjet-ingressd
 
 EXPOSE 8080 10254
 

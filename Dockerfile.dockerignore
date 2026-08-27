@@ -1,0 +1,29 @@
+# Context is the parent of the repository (see Dockerfile), so every pattern
+# here is relative to that directory and has to survive two sibling checkouts
+# rather than one. `target/` in particular is gigabytes of host-architecture
+# artefacts that the builder stage would have to ship across the daemon socket
+# and then ignore.
+**/target
+**/.git
+
+# Agent tooling state and editor droppings: never inputs to a build.
+**/.omc
+**/.omx
+**/.DS_Store
+
+# Sibling projects that are no part of this build.
+ramjet-ws-js
+
+# Not source, and changing one should not invalidate the build cache.
+ramjet-ingress/Dockerfile
+ramjet-ingress/.dockerignore
+ramjet-ingress/deploy
+ramjet-ingress/bench
+**/*.md
+
+# The runtime's own test rigs and fixtures; `src/`, `ramjet-http/` and the
+# manifests are what cargo actually reads.
+enhance-socket/bench
+enhance-socket/autobahn
+enhance-socket/certs
+enhance-socket/scripts

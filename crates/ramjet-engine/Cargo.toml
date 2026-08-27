@@ -1,0 +1,21 @@
+[package]
+name = "ramjet-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Experimental completion-based HTTP/1.1 data plane for ramjet-ingress"
+
+[dependencies]
+# The reactor. `ramjet` is the sibling runtime repository, not a published
+# release, so this is a path dependency and the workspace does not build
+# without it checked out beside ramjet-ingress. See the crate docs.
+ramjet = { workspace = true }
+ramjet-http = { workspace = true }
+ramjet-router = { workspace = true }
+arc-swap = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+ramjet-proxy = { workspace = true }
