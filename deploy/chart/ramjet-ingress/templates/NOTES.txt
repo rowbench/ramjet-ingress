@@ -1,0 +1,42 @@
+ramjet-ingress {{ .Chart.AppVersion }} is installed as {{ include "ramjet-ingress.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+Point an Ingress at it with:
+
+    spec:
+      ingressClassName: {{ include "ramjet-ingress.ingressClassName" . }}
+
+{{ if .Values.ingressClass.isDefaultClass -}}
+This release owns the cluster's default IngressClass, so an Ingress naming no
+class at all also lands here.
+{{ end }}
+Watch:      {{ if .Values.controller.watchNamespace }}namespace {{ .Values.controller.watchNamespace }}{{ else }}every namespace{{ end }}
+{{ if .Values.controller.updateStatus -}}
+Status:     published from {{ include "ramjet-ingress.publishService" . }}
+{{- else -}}
+Status:     writeback disabled
+{{- end }}
+
+Readiness is not "the process started" — /readyz stays 503 until a route table
+has been compiled from the API server, so the first Ready is the moment this
+replica can actually serve. Follow it with:
+
+    kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "ramjet-ingress.fullname" . }}
+
+{{ if .Values.adminService.enabled -}}
+Metrics and probes are on a separate ClusterIP Service, never on the
+internet-facing one:
+
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ramjet-ingress.fullname" . }}-admin {{ .Values.adminService.port }}
+    curl localhost:{{ .Values.adminService.port }}/metrics
+{{ end }}
+{{- if eq (toString .Values.service.type) "LoadBalancer" }}
+The traffic Service is a LoadBalancer. Until it has an address, Ingress status
+{{ if .Values.controller.publishAddress -}}
+falls back to the configured {{ .Values.controller.publishAddress }}.
+{{- else -}}
+stays empty — set controller.publishAddress if this cluster has no load
+balancer controller.
+{{- end }}
+
+    kubectl -n {{ .Release.Namespace }} get svc {{ include "ramjet-ingress.fullname" . }}
+{{- end }}

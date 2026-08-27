@@ -1,0 +1,41 @@
+{{- if .Values.adminService.enabled -}}
+{{/*
+/metrics, /healthz and /readyz, on a ClusterIP Service that is never a
+LoadBalancer regardless of service.type. Keeping the admin port off the
+internet-facing object makes the separation structural: there is no value that
+can accidentally publish it, because it is a different object with a different
+type.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ramjet-ingress.fullname" . }}-admin
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ramjet-ingress.labels" . | nindent 4 }}
+    {{- with .Values.adminService.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- if .Values.metrics.scrapeAnnotations }}
+    prometheus.io/scrape: "true"
+    prometheus.io/port: {{ .Values.adminService.port | quote }}
+    prometheus.io/path: /metrics
+    {{- end }}
+    {{- with .Values.adminService.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  type: ClusterIP
+  # A replica that is not ready is exactly the one whose metrics and /readyz
+  # someone wants to look at. Endpoint readiness gating is right for the
+  # traffic Service and wrong for this one.
+  publishNotReadyAddresses: true
+  ports:
+    - name: admin
+      port: {{ .Values.adminService.port }}
+      targetPort: admin
+      protocol: TCP
+  selector:
+    {{- include "ramjet-ingress.selectorLabels" . | nindent 4 }}
+{{- end }}

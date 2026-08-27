@@ -1,0 +1,20 @@
+{{- if .Values.ingressClass.create -}}
+{{/*
+The controller name is not a value: `ramjet.dev/ingress` is compiled into the
+controller (ramjet_controller::config::CONTROLLER_NAME) and the class filter
+compares against that constant. A configurable string here could only ever
+produce an IngressClass this controller silently ignores.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: {{ include "ramjet-ingress.ingressClassName" . }}
+  labels:
+    {{- include "ramjet-ingress.labels" . | nindent 4 }}
+  {{- if .Values.ingressClass.isDefaultClass }}
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+spec:
+  controller: ramjet.dev/ingress
+{{- end }}

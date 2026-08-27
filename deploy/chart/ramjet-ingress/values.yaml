@@ -1,0 +1,186 @@
+# Default configuration for ramjet-ingress.
+
+image:
+  repository: ramjet-ingress
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Not a value, and that is the point.
+#
+# There is no leader election yet. Ingress status writeback is a read of a
+# Service's address followed by a server-side-apply patch of every managed
+# Ingress, and every replica would do it — with the same field manager, against
+# the same objects, on its own debounce schedule. Two replicas do not corrupt
+# the status, but they do write it in a loop, and the resulting patch traffic
+# scales with replica count times Ingress count against the API server.
+#
+# The template hard-codes `replicas: 1`. Raising it is a code change (leader
+# election in the controller), not a values change, and leaving the knob here
+# for someone to find at 3am would be an invitation to a bad night.
+
+nameOverride: ""
+fullnameOverride: ""
+
+controller:
+  # IngressClass this replica answers to. An Ingress naming any other class is
+  # invisible to it, which is what makes running alongside ingress-nginx during
+  # a migration safe.
+  ingressClass: ramjet
+
+  # A single namespace to watch, or "" for the whole cluster. Narrowing this
+  # does not narrow the RBAC below — see rbac.create.
+  watchNamespace: ""
+
+  # Write .status.loadBalancer on managed Ingresses.
+  updateStatus: true
+
+  # Where that status points. `publishService` names a Service whose own
+  # .status.loadBalancer supplies the address, and defaults to this chart's own
+  # LoadBalancer Service — which is the whole mechanism by which an Ingress in
+  # some other namespace learns the address traffic actually arrives on.
+  # `publishAddress` is the literal fallback used when that Service has no
+  # address yet (or is not a LoadBalancer at all).
+  publishService: ""     # defaults to "<release-namespace>/<fullname>"
+  publishAddress: ""
+
+  # Backend for requests matching no rule, as namespace/name:port. Empty means
+  # unmatched requests get a 404 from the proxy itself.
+  defaultBackend: ""
+
+  # Secret (namespace/name) answering a handshake whose SNI matches nothing.
+  defaultTlsSecret: ""
+
+  # Upstream behaviour. Seconds.
+  connectTimeout: 5
+  responseTimeout: 60
+  maxConnectAttempts: 3
+
+  # How long in-flight requests get after SIGTERM. Kept below
+  # terminationGracePeriodSeconds so the drain finishes before the kill.
+  shutdownGrace: 30
+
+  # Anything not covered above. Appended verbatim after the generated flags,
+  # and a flag always beats its environment twin.
+  extraArgs: []
+
+  # RUST_LOG. `info` for the controller's own events, `warn` for the noisier
+  # kube-rs internals.
+  logLevel: "info,kube=warn"
+
+  extraEnv: []
+
+ports:
+  http: 8080
+  https: 8443
+  admin: 10254
+
+service:
+  # LoadBalancer is the default because publishService above needs an address
+  # to publish. On a cluster with no load balancer controller the Service stays
+  # pending, the status falls back to publishAddress, and routing is unaffected.
+  type: LoadBalancer
+  annotations: {}
+  labels: {}
+  loadBalancerIP: ""
+  loadBalancerSourceRanges: []
+  externalTrafficPolicy: ""
+  http:
+    port: 80
+    nodePort: ""
+  https:
+    port: 443
+    nodePort: ""
+
+# The admin port lives on its own ClusterIP Service, never on the LoadBalancer.
+# /metrics and the probes are not things to expose to the internet by accident,
+# and putting them on a separate object means the split is structural rather
+# than a matter of remembering to omit a port.
+adminService:
+  enabled: true
+  port: 10254
+  annotations: {}
+  labels: {}
+
+ingressClass:
+  # The IngressClass object naming this controller. Cluster-scoped: disable it
+  # when a second release would collide on the same name.
+  create: true
+  name: ""           # defaults to controller.ingressClass
+  # Make this the class for Ingresses that name none. At most one IngressClass
+  # in a cluster may say true.
+  isDefaultClass: false
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: true
+
+rbac:
+  # The exact permissions the controller's five watches and its status writer
+  # need — no more. Cluster-scoped even when controller.watchNamespace is set,
+  # because IngressClass is a cluster-scoped resource and the class filter can
+  # not be evaluated without reading it.
+  create: true
+
+# Kubernetes-mode readiness is not "the process started": it is "a route table
+# has been compiled and published". Until the first generation lands, /readyz
+# is 503 and this replica stays out of the Service, because an empty table
+# would 404 every request it received.
+livenessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+readinessProbe:
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    # No CPU limit on purpose: throttling a proxy's event loop shows up as
+    # latency on every request through it, and the request above is what the
+    # scheduler actually uses. Memory is limited because the failure mode of a
+    # leak is taking the node down with it.
+    memory: 256Mi
+
+# Longer than controller.shutdownGrace, so the drain is what ends the process.
+terminationGracePeriodSeconds: 45
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+hostNetwork: false
+dnsPolicy: ""
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# A ServiceMonitor is deliberately absent: it would make the chart depend on
+# the Prometheus operator's CRDs being installed. The admin Service carries the
+# scrape annotations instead, which the annotation-based discovery every
+# Prometheus ships with already understands.
+metrics:
+  scrapeAnnotations: true

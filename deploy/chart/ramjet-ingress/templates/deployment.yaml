@@ -1,0 +1,143 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ramjet-ingress.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ramjet-ingress.labels" . | nindent 4 }}
+spec:
+  # Hard-coded, not a value. There is no leader election yet: every replica
+  # would run its own status writer, patching the same Ingresses with the same
+  # field manager on its own schedule. See the note in values.yaml.
+  replicas: 1
+  strategy:
+    # One replica and a status writer means Recreate rather than RollingUpdate:
+    # a surge pod would put two writers on the same objects for the length of
+    # the rollout, which is the state the replica count exists to prevent.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "ramjet-ingress.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ramjet-ingress.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "ramjet-ingress.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      {{- end }}
+      {{- with .Values.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
+      # Longer than controller.shutdownGrace, so the process ends by finishing
+      # its drain rather than by being killed part-way through one.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --http=:{{ .Values.ports.http }}
+            - --https=:{{ .Values.ports.https }}
+            - --admin=:{{ .Values.ports.admin }}
+            - --ingress-class={{ .Values.controller.ingressClass }}
+            {{- with .Values.controller.watchNamespace }}
+            - --watch-namespace={{ . }}
+            {{- end }}
+            {{- if .Values.controller.updateStatus }}
+            - --publish-service={{ include "ramjet-ingress.publishService" . }}
+            {{- with .Values.controller.publishAddress }}
+            - --publish-address={{ . }}
+            {{- end }}
+            {{- else }}
+            - --no-status-update
+            {{- end }}
+            {{- with .Values.controller.defaultBackend }}
+            - --default-backend={{ . }}
+            {{- end }}
+            {{- with .Values.controller.defaultTlsSecret }}
+            - --default-tls-secret={{ . }}
+            {{- end }}
+            - --connect-timeout={{ .Values.controller.connectTimeout }}
+            - --response-timeout={{ .Values.controller.responseTimeout }}
+            - --max-connect-attempts={{ .Values.controller.maxConnectAttempts }}
+            - --shutdown-grace={{ .Values.controller.shutdownGrace }}
+            {{- with .Values.controller.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.controller.logLevel | quote }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- with .Values.controller.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ports.http }}
+              protocol: TCP
+            - name: https
+              containerPort: {{ .Values.ports.https }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ .Values.ports.admin }}
+              protocol: TCP
+          # /healthz answers whenever the process is answering; /readyz waits
+          # for a compiled route table. Restarting on the former and gating
+          # traffic on the latter is the whole distinction: a replica that has
+          # not finished its first list should be kept out of the Service, not
+          # killed and made to start over.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,17 @@
+# The build context is the whole workspace, so what matters here is keeping the
+# two directories that dwarf the source out of it. `target/` in particular is
+# gigabytes of host-architecture artefacts that the builder stage would have to
+# ship across the daemon socket and then ignore.
+target/
+.git/
+
+# Agent tooling state and editor droppings: never inputs to a build.
+.omc/
+.DS_Store
+
+# Not source, and changing one should not invalidate the build cache.
+Dockerfile
+.dockerignore
+deploy/
+bench/
+*.md

@@ -1,0 +1,90 @@
+{{- if .Values.rbac.create -}}
+{{/*
+The controller's permissions, and nothing beyond them. Each rule below exists
+because a specific piece of the controller cannot run without it:
+
+  ingresses            the primary watch — the objects being translated
+  ingressclasses       the class filter; cluster-scoped, which is why this is a
+                       ClusterRole even when watching a single namespace
+  services             backend port resolution, and reading the publish
+                       Service's own .status.loadBalancer
+  secrets              TLS material, filtered server-side to type=kubernetes.io/tls
+  endpointslices       the actual pod addresses behind each backend
+  ingresses/status     status writeback, as a server-side-apply patch
+
+Notably absent: pods (endpoints come from EndpointSlice, not from listing
+pods), events (the controller logs rather than emitting events), nodes,
+configmaps, and any write verb on anything except the status subresource. The
+controller creates nothing and deletes nothing.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "ramjet-ingress.fullname" . }}
+  labels:
+    {{- include "ramjet-ingress.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingressclasses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingresses/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - discovery.k8s.io
+    resources:
+      - endpointslices
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "ramjet-ingress.fullname" . }}
+  labels:
+    {{- include "ramjet-ingress.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "ramjet-ingress.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ramjet-ingress.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

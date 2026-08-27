@@ -1,0 +1,47 @@
+{{/*
+The traffic Service: plaintext and TLS only. The admin port is deliberately not
+here — see admin-service.yaml.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ramjet-ingress.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ramjet-ingress.labels" . | nindent 4 }}
+    {{- with .Values.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- with .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  ports:
+    - name: http
+      port: {{ .Values.service.http.port }}
+      targetPort: http
+      protocol: TCP
+      {{- if and .Values.service.http.nodePort (ne (toString .Values.service.type) "ClusterIP") }}
+      nodePort: {{ .Values.service.http.nodePort }}
+      {{- end }}
+    - name: https
+      port: {{ .Values.service.https.port }}
+      targetPort: https
+      protocol: TCP
+      {{- if and .Values.service.https.nodePort (ne (toString .Values.service.type) "ClusterIP") }}
+      nodePort: {{ .Values.service.https.nodePort }}
+      {{- end }}
+  selector:
+    {{- include "ramjet-ingress.selectorLabels" . | nindent 4 }}
