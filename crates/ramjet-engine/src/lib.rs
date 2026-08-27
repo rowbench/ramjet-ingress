@@ -74,6 +74,7 @@
 #![warn(missing_docs)]
 
 pub mod codec;
+pub mod engine;
 pub mod headers;
 pub mod helper;
 pub mod limits;
