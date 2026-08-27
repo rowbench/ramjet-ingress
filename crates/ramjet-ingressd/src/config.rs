@@ -241,31 +241,25 @@ fn resolve(base: &Path, path: &Path) -> PathBuf {
 }
 
 fn read_chain(path: &Path, host: &str) -> Result<Vec<CertificateDer<'static>>, ConfigError> {
-    let fail = |reason: String| ConfigError::Certificate {
-        host: host.to_owned(),
-        path: path.to_owned(),
-        reason,
-    };
+    let fail = failure(path, host);
     let file = File::open(path).map_err(|error| fail(error.to_string()))?;
-    let chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(file))
-        .collect::<Result<_, _>>()
-        .map_err(|error| fail(error.to_string()))?;
-    if chain.is_empty() {
-        return Err(fail("no CERTIFICATE blocks in the file".to_owned()));
-    }
-    Ok(chain)
+    crate::certs::chain(&mut BufReader::new(file)).map_err(|error| fail(error.to_string()))
 }
 
 fn read_key(path: &Path, host: &str) -> Result<PrivateKeyDer<'static>, ConfigError> {
-    let fail = |reason: String| ConfigError::Certificate {
-        host: host.to_owned(),
-        path: path.to_owned(),
-        reason,
-    };
+    let fail = failure(path, host);
     let file = File::open(path).map_err(|error| fail(error.to_string()))?;
-    rustls_pemfile::private_key(&mut BufReader::new(file))
-        .map_err(|error| fail(error.to_string()))?
-        .ok_or_else(|| fail("no PRIVATE KEY block in the file".to_owned()))
+    crate::certs::private_key(&mut BufReader::new(file)).map_err(|error| fail(error.to_string()))
+}
+
+fn failure(path: &Path, host: &str) -> impl Fn(String) -> ConfigError {
+    let path = path.to_owned();
+    let host = host.to_owned();
+    move |reason| ConfigError::Certificate {
+        host: host.clone(),
+        path: path.clone(),
+        reason,
+    }
 }
 
 // ---------------------------------------------------------------------------

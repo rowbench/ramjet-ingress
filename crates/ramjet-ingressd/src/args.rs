@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use ramjet_controller::ServiceRef;
 use ramjet_proxy::{DEFAULT_ADMIN_PORT, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT};
 
 /// Why the command line could not be understood.
@@ -54,7 +55,28 @@ pub struct Args {
     /// Print the version and exit.
     pub version: bool,
     /// Dev mode: serve the routes in this file instead of watching Kubernetes.
+    ///
+    /// Its presence is what selects the mode, because the two are mutually
+    /// exclusive by nature: a file and an API server are two writers for one
+    /// route table, and letting both write would make the winner a race.
     pub static_routes: Option<PathBuf>,
+    /// `IngressClass` we answer to. Ingresses naming any other class are
+    /// invisible to this replica, which is what makes running alongside
+    /// ingress-nginx during a migration safe.
+    pub ingress_class: String,
+    /// Single namespace to watch, or `None` for the whole cluster.
+    pub watch_namespace: Option<String>,
+    /// Address written into managed Ingresses' `.status.loadBalancer`.
+    pub publish_address: Option<String>,
+    /// `namespace/name` of a Service whose own status supplies that address.
+    pub publish_service: Option<String>,
+    /// Backend for requests matching no rule, as `namespace/name:port`.
+    pub default_backend: Option<ServiceRef>,
+    /// `namespace/name` of the Secret answering a handshake whose SNI matches
+    /// nothing.
+    pub default_tls_secret: Option<String>,
+    /// Whether to write Ingress status at all.
+    pub update_status: bool,
     /// Plaintext listener, or `None` if disabled.
     pub http: Option<SocketAddr>,
     /// TLS listener, or `None` if disabled.
@@ -84,6 +106,13 @@ impl Default for Args {
             help: false,
             version: false,
             static_routes: None,
+            ingress_class: "ramjet".to_owned(),
+            watch_namespace: None,
+            publish_address: None,
+            publish_service: None,
+            default_backend: None,
+            default_tls_secret: None,
+            update_status: true,
             http: Some(all(DEFAULT_HTTP_PORT)),
             https: Some(all(DEFAULT_HTTPS_PORT)),
             admin: Some(all(DEFAULT_ADMIN_PORT)),
@@ -103,10 +132,30 @@ ramjet-ingressd — the ramjet-ingress data plane
 USAGE:
     ramjet-ingressd [OPTIONS]
 
+    With no --static-routes, the daemon watches the Kubernetes API and serves
+    what the controller compiles. With one, it serves that file and never talks
+    to Kubernetes at all.
+
+KUBERNETES:
+    --ingress-class <NAME>    IngressClass to answer to      [default: ramjet]
+    --watch-namespace <NS>    Watch one namespace       [default: all of them]
+    --default-backend <REF>   Backend for requests matching no rule, as
+                              namespace/name:port
+    --default-tls-secret <REF>
+                              Secret (namespace/name) serving a handshake whose
+                              SNI matches nothing
+    --publish-address <ADDR>  Written into managed Ingresses' status
+    --publish-service <REF>   Service (namespace/name) whose own status supplies
+                              that address. Beats --publish-address.
+    --no-status-update        Never write Ingress status.
+
+    The client is configured the way every Kubernetes tool configures one: the
+    in-cluster ServiceAccount if there is one, otherwise the current context of
+    $KUBECONFIG or ~/.kube/config.
+
 DEV MODE:
     --static-routes <FILE>    Serve the hosts, paths, backends, and certificates
                               described in FILE and never talk to Kubernetes.
-                              Required until the controller phase lands.
 
 LISTENERS:
     --http <ADDR>             Plaintext listener        [default: 0.0.0.0:8080]
@@ -115,9 +164,10 @@ LISTENERS:
     --no-http, --no-https, --no-admin
                               Disable a listener.
 
-    An address may be `host:port`, `:port`, or a bare port. Without an explicit
-    --https or --no-https, the TLS listener is skipped when the configuration
-    declares no certificates.
+    An address may be `host:port`, `:port`, or a bare port. In dev mode, without
+    an explicit --https or --no-https, the TLS listener is skipped when the
+    configuration declares no certificates. In Kubernetes mode it always binds:
+    the certificates arrive over a watch, after the socket.
 
 UPSTREAMS:
     --connect-timeout <SECS>      TCP connect bound          [default: 5]
@@ -133,15 +183,19 @@ OTHER:
     -h, --help                Print this help
     -V, --version             Print the version
 
-Every option has an environment twin (RAMJET_STATIC_ROUTES, RAMJET_HTTP,
-RAMJET_HTTPS, RAMJET_ADMIN, RAMJET_CONNECT_TIMEOUT, RAMJET_RESPONSE_TIMEOUT,
-RAMJET_MAX_CONNECT_ATTEMPTS, RAMJET_SHUTDOWN_GRACE). A flag always beats the
-environment.
+Every option has an environment twin (RAMJET_STATIC_ROUTES, RAMJET_INGRESS_CLASS,
+RAMJET_WATCH_NAMESPACE, RAMJET_DEFAULT_BACKEND, RAMJET_DEFAULT_TLS_SECRET,
+RAMJET_PUBLISH_ADDRESS, RAMJET_PUBLISH_SERVICE, RAMJET_UPDATE_STATUS,
+RAMJET_HTTP, RAMJET_HTTPS, RAMJET_ADMIN, RAMJET_CONNECT_TIMEOUT,
+RAMJET_RESPONSE_TIMEOUT, RAMJET_MAX_CONNECT_ATTEMPTS, RAMJET_SHUTDOWN_GRACE).
+A flag always beats the environment. RUST_LOG sets the log filter.
 
 ADMIN ENDPOINTS:
     /metrics    Prometheus text exposition
     /healthz    Liveness: 200 whenever the process is answering
-    /readyz     Readiness: 200 once a route table has been published
+    /readyz     Readiness: 200 once a route table has been published. In
+                Kubernetes mode that means a compiled generation, not the
+                controller's empty seed.
 ";
 
 impl Args {
@@ -187,6 +241,15 @@ impl Args {
                 "-h" | "--help" => args.help = true,
                 "-V" | "--version" => args.version = true,
                 "--static-routes" => args.static_routes = Some(PathBuf::from(value()?)),
+                "--ingress-class" => args.ingress_class = value()?,
+                "--watch-namespace" => args.watch_namespace = Some(value()?),
+                "--publish-address" => args.publish_address = Some(value()?),
+                "--publish-service" => args.publish_service = Some(value()?),
+                "--default-backend" => {
+                    args.default_backend = Some(service_ref(&name, &value()?)?);
+                }
+                "--default-tls-secret" => args.default_tls_secret = Some(value()?),
+                "--no-status-update" => args.update_status = false,
                 "--http" => args.http = Some(address(&name, &value()?)?),
                 "--https" => {
                     args.https = Some(address(&name, &value()?)?);
@@ -222,6 +285,27 @@ impl Args {
         let mut args = Args::default();
         if let Some(path) = env("RAMJET_STATIC_ROUTES") {
             args.static_routes = Some(PathBuf::from(path));
+        }
+        if let Some(value) = env("RAMJET_INGRESS_CLASS") {
+            args.ingress_class = value;
+        }
+        if let Some(value) = env("RAMJET_WATCH_NAMESPACE") {
+            args.watch_namespace = Some(value);
+        }
+        if let Some(value) = env("RAMJET_PUBLISH_ADDRESS") {
+            args.publish_address = Some(value);
+        }
+        if let Some(value) = env("RAMJET_PUBLISH_SERVICE") {
+            args.publish_service = Some(value);
+        }
+        if let Some(value) = env("RAMJET_DEFAULT_BACKEND") {
+            args.default_backend = Some(service_ref("RAMJET_DEFAULT_BACKEND", &value)?);
+        }
+        if let Some(value) = env("RAMJET_DEFAULT_TLS_SECRET") {
+            args.default_tls_secret = Some(value);
+        }
+        if let Some(value) = env("RAMJET_UPDATE_STATUS") {
+            args.update_status = boolean("RAMJET_UPDATE_STATUS", &value)?;
         }
         if let Some(value) = env("RAMJET_HTTP") {
             args.http = Some(address("RAMJET_HTTP", &value)?);
@@ -269,6 +353,31 @@ fn address(option: &str, value: &str) -> Result<SocketAddr, ArgError> {
         return Ok(SocketAddr::from(([0, 0, 0, 0], port)));
     }
     value.parse().map_err(|_| bad())
+}
+
+/// Parses `namespace/name:port`, the way an Ingress names a backend.
+fn service_ref(option: &str, value: &str) -> Result<ServiceRef, ArgError> {
+    value.parse().map_err(|_| ArgError::BadValue {
+        option: option.to_owned(),
+        value: value.to_owned(),
+        kind: "service reference of the form namespace/name:port",
+    })
+}
+
+/// Parses a boolean environment value.
+///
+/// Only exists for the environment twins: on the command line a boolean is a
+/// flag, and `--no-status-update true` would be a worse way to say it.
+fn boolean(option: &str, value: &str) -> Result<bool, ArgError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(ArgError::BadValue {
+            option: option.to_owned(),
+            value: value.to_owned(),
+            kind: "boolean",
+        }),
+    }
 }
 
 fn seconds(option: &str, value: &str) -> Result<Duration, ArgError> {
@@ -422,9 +531,86 @@ mod tests {
     }
 
     #[test]
+    fn kubernetes_mode_is_the_default_and_has_the_documented_defaults() {
+        let args = parse(&[]).expect("no arguments is valid");
+        assert_eq!(args.static_routes, None, "no file means watch Kubernetes");
+        assert_eq!(args.ingress_class, "ramjet");
+        assert_eq!(args.watch_namespace, None, "None is every namespace");
+        assert!(args.update_status, "status writeback is on by default");
+    }
+
+    #[test]
+    fn the_kubernetes_flags_are_read() {
+        let args = parse(&[
+            "--ingress-class",
+            "public",
+            "--watch-namespace",
+            "prod",
+            "--publish-address",
+            "203.0.113.10",
+            "--publish-service",
+            "ingress/ramjet-lb",
+            "--default-backend",
+            "kube-system/notfound:8080",
+            "--default-tls-secret",
+            "ingress/wildcard",
+            "--no-status-update",
+        ])
+        .expect("valid");
+
+        assert_eq!(args.ingress_class, "public");
+        assert_eq!(args.watch_namespace.as_deref(), Some("prod"));
+        assert_eq!(args.publish_address.as_deref(), Some("203.0.113.10"));
+        assert_eq!(args.publish_service.as_deref(), Some("ingress/ramjet-lb"));
+        assert_eq!(args.default_tls_secret.as_deref(), Some("ingress/wildcard"));
+        assert!(!args.update_status);
+
+        let backend = args.default_backend.expect("a parsed reference");
+        assert_eq!(backend.backend_name(), "kube-system/notfound:8080");
+    }
+
+    #[test]
+    fn a_malformed_default_backend_is_rejected_at_startup() {
+        // Not at the first unmatched request, which is the other place a typo
+        // here could plausibly show up.
+        assert!(matches!(
+            parse(&["--default-backend", "notfound"]),
+            Err(ArgError::BadValue { ref option, .. }) if option == "--default-backend"
+        ));
+    }
+
+    #[test]
+    fn status_writeback_can_be_switched_off_from_the_environment() {
+        let env = |name: &str| match name {
+            "RAMJET_UPDATE_STATUS" => Some("false".to_owned()),
+            "RAMJET_INGRESS_CLASS" => Some("public".to_owned()),
+            _ => None,
+        };
+        let args = Args::parse(Vec::<String>::new(), env).expect("valid");
+        assert!(!args.update_status);
+        assert_eq!(args.ingress_class, "public");
+
+        let bad = |name: &str| match name {
+            "RAMJET_UPDATE_STATUS" => Some("sometimes".to_owned()),
+            _ => None,
+        };
+        assert!(matches!(
+            Args::parse(Vec::<String>::new(), bad),
+            Err(ArgError::BadValue { kind: "boolean", .. })
+        ));
+    }
+
+    #[test]
     fn the_usage_text_mentions_every_option_it_accepts() {
         for option in [
             "--static-routes",
+            "--ingress-class",
+            "--watch-namespace",
+            "--publish-address",
+            "--publish-service",
+            "--default-backend",
+            "--default-tls-secret",
+            "--no-status-update",
             "--http",
             "--https",
             "--admin",

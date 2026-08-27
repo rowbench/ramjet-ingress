@@ -350,6 +350,18 @@ impl SharedRouteTable {
         self.inner.swap(Arc::new(table))
     }
 
+    /// Publishes a table that is already behind an `Arc`. Returns the one it
+    /// replaced.
+    ///
+    /// The control plane hands its compiled configuration to the data plane
+    /// inside an `Arc` that a `watch` channel also holds, so the table cannot be
+    /// moved out of it. Without this the daemon would have to clone a whole
+    /// table — thousands of routes — on every publish, to build an allocation
+    /// identical to the one it is already holding a pointer to.
+    pub fn store_shared(&self, table: Arc<RouteTable>) -> Arc<RouteTable> {
+        self.inner.swap(table)
+    }
+
     /// The generation currently published.
     pub fn generation(&self) -> u64 {
         self.inner.load().generation()

@@ -18,16 +18,16 @@ thiserror.workspace = true
 # which is the TLS stack used to talk to the API server -- not to terminate
 # traffic. This crate still holds no rustls types in its public API; see the
 # module docs on the layering split.
-kube = { version = "4.2", features = ["runtime"] }
+kube = { workspace = true, features = ["runtime"] }
 k8s-openapi = { version = "0.28", features = ["v1_36"] }
 
-tokio = { version = "1.48", features = ["macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 futures = "0.3"
-tracing = "0.1"
+tracing.workspace = true
 # `DeserializeOwned` appears in the watcher's trait bounds, and the status
 # patch is built as a `serde_json::Value`.
-serde = "1.0"
+serde.workspace = true
 serde_json = "1.0"
 
 [dev-dependencies]
-tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

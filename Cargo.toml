@@ -14,6 +14,11 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sofelia-ai/ramjet-ingress"
 
+# Anything two or more crates depend on is pinned here, so a version can only
+# be raised for the whole workspace at once. Two crates on two versions of
+# rustls or tokio is not a dependency conflict cargo will report — it is two
+# copies in the binary, and for rustls it is two crypto providers where the one
+# that signs a handshake is decided by which crate built the `ServerConfig`.
 [workspace.dependencies]
 ramjet-router = { path = "crates/ramjet-router" }
 ramjet-proxy = { path = "crates/ramjet-proxy" }
@@ -22,8 +27,28 @@ ramjet-controller = { path = "crates/ramjet-controller" }
 arc-swap = "1.9"
 regex = "1.13"
 thiserror = "2.0"
+tracing = "0.1"
+serde = "1.0"
+
+# Features are per-crate: the router needs none of tokio, the proxy needs the
+# net stack, the controller needs timers.
+tokio = { version = "1.48", default-features = false }
+
+# `ring` rather than `aws-lc-rs`: every crate in this family builds with a plain
+# Rust toolchain, and aws-lc-rs wants a C compiler and cmake.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+rustls-pki-types = "1.11"
+rustls-pemfile = "2.2"
+
+kube = "4.2"
 
 criterion = "0.8"
+rcgen = "0.14"
 
 # Whole-program optimization for the deployed binary. `panic = "abort"` is not
 # a size tweak: the data plane has no recovery story for a panicking worker, so

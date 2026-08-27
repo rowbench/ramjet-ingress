@@ -6,15 +6,19 @@ design.
 
 ## Status
 
-Phase 1. Only `ramjet-router` is implemented. The other three crates are
-compiling skeletons that document their intended API and nothing more.
+All four crates are built. `ramjet-ingressd` watches the Kubernetes API and
+serves what it compiles; `--static-routes` swaps the API server for a file and
+changes nothing else about the serving path.
 
 | Crate | State |
 |---|---|
 | `ramjet-router` — route table, matcher, load balancing | working, tested, benchmarked |
-| `ramjet-proxy` — listeners, TLS, HTTP/1.1, HTTP/2, upstreams | stub |
-| `ramjet-controller` — Kubernetes watch, translate, status | stub |
-| `ramjet-ingressd` — daemon binary | prints its version |
+| `ramjet-proxy` — listeners, TLS, HTTP/1.1, HTTP/2, upstreams | working, tested against real sockets |
+| `ramjet-controller` — Kubernetes watch, translate, status | working, tested against in-memory objects |
+| `ramjet-ingressd` — the daemon | Kubernetes mode and dev mode |
+
+What is deliberately absent is in [Limitations](#limitations). The line that
+matters operationally: there is no leader election yet, so run **one replica**.
 
 ## The thesis: swap a pointer, do not reload
 
@@ -66,6 +70,167 @@ clock. Certificates are opaque handles, randomness is passed in as a `u64`, and
 canary decisions take borrowed header values rather than a header collection.
 That is what makes the matcher testable against string literals and
 benchmarkable without a network.
+
+`ramjet-controller` holds no rustls types either, for the mirror-image reason:
+parsing a certificate means a crypto provider, and a crypto provider in the
+control plane would mean the translation layer could no longer be unit-tested
+against objects built in memory. The daemon is the only crate that depends on
+both sides.
+
+## From the API server to the socket
+
+```
+Ingress, IngressClass, Service, EndpointSlice, Secret
+        │
+        │  five watches, one debounced rebuild task
+        ▼
+ reflector stores ──► ClusterSnapshot ──► translate()   no I/O, no clock
+                                               │
+                                        CompiledConfig
+                                               │  watch channel
+                                               ▼
+                                    ramjet-ingressd applies it:
+                          1. CertStore::publish          handle_id → key
+                          2. SharedRouteTable::store_shared    the table
+                                               │
+                           TLS handshake ◄─────┴─────► match_request
+```
+
+Five reflectors mirror the objects that can change a route. Every event they see
+pokes a one-slot channel; one rebuild task drains it, waits out a 200 ms
+debounce, and then compiles the **current state of the stores** — not the event
+that woke it. A fifty-pod rollout produces fifty EndpointSlice events and at
+most one rebuild, and each rebuild is built from everything known at that
+instant, so a burst of churn costs what a single change costs.
+
+`translate` is a pure function: `ClusterSnapshot` in, `CompiledConfig` out, no
+I/O and no clock. That is why class filtering, path precedence, endpoint
+resolution, canary merging, and conflict arbitration all have unit tests that
+construct API objects in memory and assert on the compiled table.
+
+Rebuilds are **total**. One malformed Ingress, one dangling Secret, or one
+unresolvable Service degrades that route and nothing else, and comes back as a
+structured warning. The alternative — refusing to build a table containing one
+broken object — hands every namespace owner a cluster-wide kill switch.
+
+A publish is suppressed when the compiled digest matches what is already out
+there. This matters more than it sounds: the API server re-sends every object on
+each watch restart and periodic resync, and without the check each of those
+would bump the generation and hand the data plane a table it already has.
+
+### The handoff
+
+`CompiledConfig` is the whole contract between the two halves:
+
+```rust
+CompiledConfig {
+    table: Arc<RouteTable>,
+    certs: Vec<CertMaterial { handle_id: u64, cert_chain_pem, key_pem }>,
+}
+```
+
+Table and certificates travel in one value so they can never be observed out of
+step: an `SniMap` entry always has its material in the same message. The table
+is behind an `Arc` because publishing it is a pointer store — the daemon moves
+that exact allocation into `SharedRouteTable`, and copying a ten-thousand-route
+table per generation to achieve the same thing would be silly.
+
+The daemon applies a generation in **two stores, in this order**:
+
+1. `CertStore::publish` — the whole `handle_id → CertifiedKey` map at once.
+2. `SharedRouteTable::store_shared` — the table that references those ids.
+
+Those are two independent `ArcSwap`s, so a handshake can observe a new table
+against an older store. Publishing certificates first makes the only possible
+skew a store holding a key nothing points at yet, which is invisible. The other
+order leaves an `SniMap` entry whose id is missing from the store, and
+`SniResolver` answers a missing id with `None` — which rustls turns into a
+failed handshake. Every rotation would drop connections for the width of that
+gap.
+
+### Certificates are content-addressed
+
+`handle_id` is derived from the Secret's namespace, name, and *contents*, so it
+changes if and only if the material changes. The daemon keeps its parsed
+`CertifiedKey`s in a map keyed by that id and carries forward every id that
+survives a rebuild, parsing only what actually rotated. A cluster with 500
+certificates does no X.509 work at all when an unrelated Ingress is edited.
+
+The same property is what makes eviction safe: a key that no longer appears in
+the new generation is simply not carried over, and dropping it cannot orphan a
+name, because a name that still resolves still names its id.
+
+A certificate that will not parse is logged and skipped, never fatal. TLS for
+the names it covers fails until the Secret is fixed; every other host, and all
+plaintext traffic, is untouched. Refusing the whole generation would let one
+malformed Secret in one namespace take the cluster's routing offline.
+
+### Readiness
+
+`/readyz` is gated on the first **compiled** generation, not on the process
+being up. The controller seeds its channel with an empty table at generation 0,
+meaning "nothing has been compiled yet", and the daemon flips the readiness flag
+only once it has published a generation greater than zero. Without that gate a
+rolling update would route traffic to a replica whose table is empty, and every
+request in that window is a 404.
+
+The flag is one-way. A later generation never takes a replica back out of
+rotation: a table one debounce window stale is far better than 404ing everything
+while Kubernetes reroutes.
+
+The two probes answer different questions and are wired accordingly. `/healthz`
+is unconditional — a liveness probe that fails restarts the pod, so anything
+conditional in it turns a transient dependency problem into a crash loop.
+
+### Observability
+
+The admin listener sits on its own port (`:10254`, the ingress-nginx
+convention), not on a reserved path of the data plane. A path on the data plane
+is a path an Ingress can claim, so `/metrics` would either shadow somebody's
+application route or be shadowed by it — and it would be reachable from the
+internet, which is a way to tell an attacker your request rate.
+
+`/metrics` exposes `ramjet_requests_total`, `ramjet_route_misses_total`,
+`ramjet_active_connections`, `ramjet_upstream_latency_seconds`,
+`ramjet_upstream_{connect_failures,timeouts,retries}_total`,
+`ramjet_tls_handshakes_total`, `ramjet_tls_handshake_failures_total`, and
+`ramjet_route_table_generation` — the last of which is how you tell whether a
+replica is actually serving the configuration you think it is.
+
+Logs go through `tracing` to stderr, `info` by default, filtered with
+`RUST_LOG`. The lines worth alerting on are the per-generation publish record
+and the warnings from translation: a rejected Ingress, an unresolvable Service,
+a Secret that will not parse.
+
+### Shutdown
+
+`SIGTERM` stops the accept loop, closes the listeners so the load balancer looks
+elsewhere immediately, and then gives in-flight requests up to 30 seconds to
+finish. Afterwards the controller task is aborted, which stops all five watches
+at once — they live inside that one task precisely so there is a single place to
+cancel.
+
+The reverse direction is wired too: if the control plane stops on its own, the
+daemon drains and exits non-zero rather than continuing to serve a table that
+can never change again. A replica that has quietly stopped being an ingress
+controller should show up in `kubectl get pods`, not in a support ticket.
+
+### Dev mode
+
+`--static-routes <FILE>` reads hosts, paths, backends, canaries, and
+certificates from YAML, publishes them once, and never contacts an API server.
+It exists because an ingress data plane that can only be exercised inside a
+cluster is an ingress data plane nobody exercises — this one can be run, curled,
+profiled, and debugged on a laptop.
+
+It is not a production configuration format, and nothing else in the tree parses
+YAML. The Kubernetes path builds tables from API objects directly; it does not
+render configuration and read it back, which is exactly the round trip that
+makes ingress-nginx's behaviour hard to predict from its inputs.
+
+The two modes are mutually exclusive by nature — a file and an API server are
+two writers for one route table, and letting both write would make the winner a
+race.
 
 ## Route table
 
@@ -274,25 +439,37 @@ The handle is deliberately opaque. Real `rustls::sign::CertifiedKey` values live
 in `ramjet-proxy`, indexed by the handle's id. Keeping rustls out of the router
 is what lets the matcher be tested without a key, a socket, or a clock.
 
-## Measurements
+## Performance
 
-Table of **1,000 hosts and 10,001 routes** (ten per host: two exact, seven
-prefix at varying depth, one regex). Apple M2 Pro, `cargo bench`, criterion,
-100 samples. Reproduce with `cargo bench -p ramjet-router`.
+Match latency against a table of **1,000 hosts and 10,001 routes** (ten per
+host: two exact, seven prefix at varying depth, one regex). Apple M2 Pro
+(`arm64`, 12 cores), criterion, 100 samples, median of the confidence interval.
+Reproduce with `cargo bench -p ramjet-router`.
 
 | Case | Time | What it costs |
 |---|---|---|
-| `deep_prefix_hit` | **22.2 ns** | exact host, four-segment prefix — the normal request |
-| `exact_hit` | 20.8 ns | exact rules sort first, so this is the cheapest hit |
-| `host_miss_default_backend` | 19.1 ns | two failed hashes, then the default backend |
-| `uppercase_host_fold` | 28.0 ns | the only path that copies, into a stack buffer |
-| `wildcard_hit` | 28.9 ns | a failed exact hash plus a parent-domain hash |
-| `regex_hit` | 40.9 ns | full scan past every prefix, then a regex |
-| `root_prefix_hit` | 44.6 ns | worst case: scans every prefix rule before matching `/` |
+| `deep_prefix_hit` | **25.2 ns** | exact host, four-segment prefix — the normal request |
+| `exact_hit` | 22.5 ns | exact rules sort first, so this is the cheapest hit |
+| `host_miss_default_backend` | 20.6 ns | two failed hashes, then the default backend |
+| `wildcard_hit` | 29.7 ns | a failed exact hash plus a parent-domain hash |
+| `uppercase_host_fold` | 31.8 ns | the only path that copies, into a stack buffer |
+| `regex_hit` | 42.8 ns | full scan past every prefix, then a regex |
+| `root_prefix_hit` | 47.3 ns | worst case: scans every prefix rule before matching `/` |
 
-The headline number is 22.2 ns, against a 200 ns budget. Even the worst case is
-4x under it. For scale, a single uncached main-memory reference is roughly 80 ns
-— matching a route costs less than one cache miss.
+The headline is **25.2 ns for a normal request**, against a 200 ns budget; even
+the worst case is 4x under it. For scale, a single uncached main-memory
+reference is roughly 80 ns — matching a route costs less than one cache miss.
+
+These are laptop numbers taken on a machine that was not otherwise idle, so
+treat them as an order of magnitude rather than a regression baseline; runs on a
+quiet machine have come in 5–15% faster across the board. What the benchmark is
+really for is the *shape*: matching does not get slower with table size, because
+host selection is a hash and a host carries a handful of rules.
+
+`match_request` performs **no heap allocation**, and that is enforced rather
+than asserted in a comment — `tests/no_alloc.rs` installs a counting global
+allocator and checks every path through the matcher, including the mixed-case
+fold, canary resolution, and SNI lookup.
 
 ## Deliberate divergences from ingress-nginx
 
@@ -305,10 +482,51 @@ The headline number is 22.2 ns, against a 200 ns budget. Even the worst case is
 - **Host validation is strict.** A `host` containing a port, a path, or a
   misplaced `*` is rejected at build time rather than normalized into a guess.
 
-## Not built yet
+## Limitations
 
-Everything the proxy and controller stubs describe: listeners, PROXY protocol,
-TLS termination, HTTP/1.1 and HTTP/2, upstream pooling and retries, Kubernetes
-informers, annotation translation, EndpointSlice handling, status writeback, and
-leader election. `RouteTable` also has no rewrite, header-mutation, rate-limit,
-or auth rules yet — those attach to `PathRule` when the proxy can act on them.
+Known gaps, each with the reason it is a gap rather than a bug.
+
+**No leader election — run `replicas: 1`.** Every replica watches the API server
+independently and writes Ingress status independently. Routing is unaffected by
+that (each replica compiles the same table from the same objects), but the
+status writes race: several controllers server-side-applying the same subtree
+under the same field manager will fight over `.status.loadBalancer` if their
+`--publish-address` values differ. The fix is a coordination.k8s.io `Lease` and
+gating the status writer on holding it — the writer is already isolated behind
+one `Option<StatusWriter>`, so it is a contained change. Until then, scale by
+making the one replica bigger, and use `--no-status-update` if you must run
+more.
+
+**gRPC upstreams answer 502.** gRPC is defined in terms of HTTP/2 streams and
+trailers and has no HTTP/1.1 form. Downstream already speaks h2, but the
+upstream pool dials HTTP/1.1, so a gRPC request would be silently downgraded
+into something the backend cannot parse. Requests with an `application/grpc`
+content type are rejected explicitly instead, naming the limitation. Lifting it
+means an h2 upstream mode selected per backend from `backend-protocol: GRPC`.
+
+**Upstream is HTTP/1.1 only**, which is the same default ingress-nginx ships and
+is transparent for everything except the case above.
+
+**`ExternalName` Services serve 503.** Following a DNS name from the data plane
+needs a resolver with TTL handling and re-resolution; pointing at whatever the
+name resolved to at compile time would be a stale-address bug waiting for the
+first failover.
+
+**The annotation vocabulary is canary and class only.** `RouteTable` has no
+rewrite, header-mutation, rate-limit, session-affinity, or auth rules, so the
+corresponding `nginx.ingress.kubernetes.io` annotations are not read. Those
+attach to `PathRule` when the proxy can act on them; parsing an annotation the
+data plane ignores is worse than not parsing it, because it looks configured.
+
+**No PROXY protocol** on the listeners, so a replica behind a TCP load balancer
+that does not preserve the client IP will attribute every request to the load
+balancer in `X-Forwarded-For`.
+
+**An `IngressTLS` entry with no `hosts` is skipped.** The controller cannot read
+a certificate's SANs to work out which names it covers — that would mean parsing
+X.509 in the control plane, which is exactly the dependency the layering split
+exists to avoid. `--default-tls-secret` is the supported way to serve a fallback
+certificate.
+
+**No Gateway API.** The target is parity with `kubernetes/ingress-nginx` on the
+`networking.k8s.io/v1` Ingress resource.

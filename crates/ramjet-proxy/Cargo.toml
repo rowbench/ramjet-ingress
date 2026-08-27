@@ -27,7 +27,7 @@ hyper-util = { version = "0.1", features = [
 ] }
 pin-project-lite = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
-tokio = { version = "1.44", features = [
+tokio = { workspace = true, features = [
     "rt",
     "net",
     "io-util",
@@ -37,15 +37,8 @@ tokio = { version = "1.44", features = [
     "macros",
 ] }
 
-# `ring` rather than `aws-lc-rs`: every crate in this family builds with a
-# plain Rust toolchain, and aws-lc-rs wants a C compiler and cmake.
-rustls = { version = "0.23", default-features = false, features = [
-    "ring",
-    "std",
-    "tls12",
-    "logging",
-] }
-rustls-pki-types = "1.11"
+rustls.workspace = true
+rustls-pki-types.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
     "tls12",
@@ -53,6 +46,6 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "test-util"] }
-rcgen = "0.14"
-rustls-pemfile = "2.2"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+rcgen.workspace = true
+rustls-pemfile.workspace = true

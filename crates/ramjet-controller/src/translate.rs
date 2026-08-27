@@ -291,7 +291,7 @@ pub fn translate(
 
     Ok(Translation {
         config: CompiledConfig {
-            table: builder.build()?,
+            table: Arc::new(builder.build()?),
             certs,
         },
         digest: digest.finish(),

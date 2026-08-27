@@ -1,6 +1,7 @@
 //! The compiled artifact and the knobs that shape it.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ramjet_router::{LbPolicy, RouteTable};
@@ -56,7 +57,15 @@ impl fmt::Debug for CertMaterial {
 #[derive(Debug)]
 pub struct CompiledConfig {
     /// The routing snapshot.
-    pub table: RouteTable,
+    ///
+    /// Behind an `Arc` because publishing it is the point: the consumer moves
+    /// this pointer straight into the data plane's
+    /// [`SharedRouteTable`](ramjet_router::SharedRouteTable) with
+    /// [`store_shared`](ramjet_router::SharedRouteTable::store_shared). A bare
+    /// `RouteTable` could not be moved out of the `watch` channel that also
+    /// holds this value, so every publish would have to deep-copy a table it
+    /// already had a pointer to.
+    pub table: Arc<RouteTable>,
     /// Certificate material referenced by `table.tls()`, deduplicated by
     /// [`handle_id`](CertMaterial::handle_id).
     pub certs: Vec<CertMaterial>,

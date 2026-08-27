@@ -63,7 +63,7 @@ pub fn spawn(
     opts: ControllerOpts,
 ) -> Result<(watch_channel::Receiver<Arc<CompiledConfig>>, JoinHandle<()>), BuildError> {
     let seed = Arc::new(CompiledConfig {
-        table: RouteTableBuilder::new().build()?,
+        table: Arc::new(RouteTableBuilder::new().build()?),
         certs: Vec::new(),
     });
     let (tx, rx) = watch_channel::channel(seed);
@@ -320,7 +320,7 @@ async fn rebuild(
     let snapshot = stores.snapshot();
     let counts = snapshot.counts();
 
-    let translation = translate(&snapshot, opts, current.as_ref().map(|c| &c.table));
+    let translation = translate(&snapshot, opts, current.as_ref().map(|c| c.table.as_ref()));
     let translation = match translation {
         Ok(translation) => translation,
         Err(err) => {

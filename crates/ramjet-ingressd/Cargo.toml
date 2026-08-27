@@ -1,5 +1,6 @@
 [package]
 name = "ramjet-ingressd"
+description = "The ramjet-ingress daemon: watches Kubernetes and serves the compiled route table, or serves a route table from a file."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,21 +12,28 @@ name = "ramjet-ingressd"
 path = "src/main.rs"
 
 [dependencies]
+ramjet-controller.workspace = true
 ramjet-proxy.workspace = true
 ramjet-router.workspace = true
 
-rustls = { version = "0.23", default-features = false, features = [
-    "ring",
-    "std",
-    "tls12",
-    "logging",
-] }
-rustls-pemfile = "2.2"
-rustls-pki-types = "1.11"
-serde = { version = "1.0", features = ["derive"] }
+# Only for `Client::try_default`. Every other Kubernetes type stays behind
+# `ramjet-controller`; this binary never handles an API object.
+kube.workspace = true
+
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+serde = { workspace = true, features = ["derive"] }
 # Frozen upstream, but the API is stable and this is the only YAML in the tree:
 # it parses the dev-mode `--static-routes` file and nothing else. The
 # Kubernetes path builds route tables from API objects, not from YAML on disk.
 serde_yaml = "0.9"
-thiserror = "2.0"
-tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "signal"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tracing.workspace = true
+# The controller logs through `tracing`, and without a subscriber a daemon whose
+# job is reacting to a cluster it does not control would react silently.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+rcgen.workspace = true

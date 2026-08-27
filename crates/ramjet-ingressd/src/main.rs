@@ -1,44 +1,30 @@
-//! `ramjet-ingressd` is the daemon that runs the ramjet-ingress data plane.
+//! `ramjet-ingressd` is the daemon that runs ramjet-ingress.
 //!
-//! # What it does today
+//! # Two writers, one data plane
 //!
-//! It runs the proxy against a route table read from a file. That is dev mode,
-//! selected with `--static-routes`, and it exists so the data plane can be run,
-//! curled, profiled, and debugged without an API server anywhere near it.
+//! The proxy reads a [`SharedRouteTable`] and a [`CertStore`]. It has no
+//! opinion about where either came from, which is what lets this binary have
+//! two modes that share every line of the serving path:
 //!
-//! # What the Kubernetes phase changes
+//! - **Kubernetes mode**, the default. [`ramjet_controller::spawn`] watches the
+//!   API server and publishes a compiled configuration per generation;
+//!   [`kubernetes::Publisher`] applies each one. `/readyz` stays 503 until the
+//!   first real generation lands.
+//! - **Dev mode**, selected with `--static-routes`. The table is read from a
+//!   file once, before the listeners bind, so the data plane can be run,
+//!   curled, profiled, and debugged on a laptop with no API server anywhere.
 //!
-//! Almost nothing here. The controller phase owns a
-//! [`SharedRouteTable`](ramjet_router::SharedRouteTable) and a
-//! [`CertStore`](ramjet_proxy::CertStore), publishes into them as informers
-//! fire, and flips the [`ReadinessFlag`](ramjet_proxy::ReadinessFlag) once the
-//! first table has landed. Then it calls exactly the same entry point this file
-//! calls:
-//!
-//! ```no_run
-//! # use std::sync::Arc;
-//! # use ramjet_proxy::{CertStore, ProxyConfig, ReadinessFlag, Shutdown};
-//! # use ramjet_router::SharedRouteTable;
-//! # async fn wire(routes: Arc<SharedRouteTable>, certs: Arc<CertStore>) -> std::io::Result<()> {
-//! let readiness = ReadinessFlag::new();
-//! ramjet_proxy::serve(
-//!     ProxyConfig::default(),
-//!     routes,
-//!     certs,
-//!     readiness,
-//!     Shutdown::on_signal(),
-//! )
-//! .await
-//! # }
-//! ```
-//!
-//! The data plane never learns where its table came from, which is the whole
-//! point of publishing one through a pointer: dev mode and Kubernetes are the
-//! same program with a different writer.
+//! They are mutually exclusive because two writers for one route table would
+//! make the winner a race, and the flag is the only difference between them.
 
 mod args;
+mod certs;
 mod config;
+mod kubernetes;
+#[cfg(test)]
+mod testing;
 
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -46,6 +32,7 @@ use ramjet_proxy::{
     CertStore, ListenerConfig, ProxyConfig, ReadinessFlag, Server, Shutdown, UpstreamConfig,
 };
 use ramjet_router::SharedRouteTable;
+use tracing_subscriber::EnvFilter;
 
 use crate::args::{ArgError, Args, USAGE};
 
@@ -88,19 +75,37 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let Some(path) = args.static_routes.clone() else {
-        eprintln!(
-            "ramjet-ingressd: nothing to serve.\n\
-             \n\
-             The Kubernetes controller has not landed yet, so a route table has to come\n\
-             from a file. Pass --static-routes <FILE> (see --help), for example:\n\
-             \n\
-             \x20   ramjet-ingressd --static-routes examples/dev-routes.yaml"
-        );
-        return Ok(ExitCode::FAILURE);
-    };
+    init_logging();
 
-    let loaded = config::load(&path)?;
+    match args.static_routes.clone() {
+        Some(path) => dev_mode(&args, &path).await,
+        None => kubernetes::run(&args).await,
+    }
+}
+
+/// Sends `tracing` output to stderr, filtered by `RUST_LOG`.
+///
+/// Without a subscriber the controller's logs — every watch error, every
+/// rejected Ingress, every publish — go nowhere, which is not a defensible
+/// state for a daemon whose whole job is reacting to a cluster it does not
+/// control. `info` is the default because the interesting lines (a published
+/// generation, a warning about a broken object) are all at that level and the
+/// per-object detail is at `debug`.
+fn init_logging() {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+/// Serves a route table read from a file, with no Kubernetes anywhere.
+async fn dev_mode(
+    args: &Args,
+    path: &std::path::Path,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let loaded = config::load(path)?;
     let summary = loaded.summary;
     let has_certificates = !loaded.certs.is_empty();
 
@@ -110,27 +115,21 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Without an explicit --https or --no-https, a TLS listener over an empty
     // certificate store would fail every handshake. Binding it anyway would
     // look like a working HTTPS endpoint to anyone reading the startup output.
+    // Kubernetes mode does not make this trade, because there the store fills
+    // in after the socket binds.
     let https = if args.https_explicit || has_certificates {
         args.https
     } else {
         None
     };
 
-    let config = ProxyConfig {
-        http: args.http.map(ListenerConfig::new),
-        https: https.map(ListenerConfig::new),
-        admin: args.admin.map(ListenerConfig::new),
-        upstream: UpstreamConfig {
-            connect_timeout: args.connect_timeout,
-            response_timeout: args.response_timeout,
-            max_connect_attempts: args.max_connect_attempts,
-            ..UpstreamConfig::default()
-        },
-        shutdown_grace: args.shutdown_grace,
-    };
-
     let readiness = ReadinessFlag::new();
-    let server = Server::bind_with(config, routes, Arc::clone(&certs), readiness.clone())?;
+    let server = Server::bind_with(
+        proxy_config(args, https),
+        routes,
+        certs,
+        readiness.clone(),
+    )?;
 
     println!(
         "ramjet-ingressd {} — {} backend(s), {} endpoint(s), {} route(s), {} certificate(s){}",
@@ -162,18 +161,45 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     // Dev mode reads the whole table before binding, so the replica is ready
     // the moment it can accept. The Kubernetes path flips this only once the
-    // first informer sync has produced a table.
+    // first compiled generation has landed.
     readiness.set_ready(true);
 
-    match server.run(Shutdown::on_signal()).await {
+    finish(server.run(Shutdown::on_signal()).await)
+}
+
+/// The listener and upstream configuration both modes share.
+///
+/// `https` is passed separately because it is the one setting the two modes
+/// disagree about; everything else here is the same question with the same
+/// answer regardless of where the route table comes from.
+fn proxy_config(args: &Args, https: Option<SocketAddr>) -> ProxyConfig {
+    ProxyConfig {
+        http: args.http.map(ListenerConfig::new),
+        https: https.map(ListenerConfig::new),
+        admin: args.admin.map(ListenerConfig::new),
+        upstream: UpstreamConfig {
+            connect_timeout: args.connect_timeout,
+            response_timeout: args.response_timeout,
+            max_connect_attempts: args.max_connect_attempts,
+            ..UpstreamConfig::default()
+        },
+        shutdown_grace: args.shutdown_grace,
+    }
+}
+
+/// Turns the server's outcome into an exit code.
+///
+/// A drain that ran out of time is reported and then exits zero: the shutdown
+/// was requested and did everything it was allowed to, and a non-zero exit
+/// would make a normal rolling update look like a crash.
+fn finish(result: std::io::Result<()>) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    match result {
         Ok(()) => {
-            println!("ramjet-ingressd: drained cleanly");
+            tracing::info!("drained cleanly");
             Ok(ExitCode::SUCCESS)
         }
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-            // The shutdown was requested and did as much as it was allowed to.
-            // That is a fact worth printing, not a failure to exit with.
-            eprintln!("ramjet-ingressd: {error}");
+            tracing::warn!(%error, "shutdown grace period expired");
             Ok(ExitCode::SUCCESS)
         }
         Err(error) => Err(Box::new(error)),
