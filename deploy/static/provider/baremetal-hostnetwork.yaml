@@ -257,12 +257,13 @@ spec:
           type: RuntimeDefault
       containers:
         - name: controller
-          image: "ramjet-ingress:0.1.0"
+          image: "sofelia/ramjet-ingress:0.1.0"
           imagePullPolicy: IfNotPresent
           args:
             - --http=:80
             - --https=:443
             - --admin=:10254
+            - --engine=hyper
             - --ingress-class=ramjet
             - --publish-service=ramjet-ingress/ramjet-ramjet-ingress
             - --connect-timeout=5
