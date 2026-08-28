@@ -439,6 +439,56 @@ The handle is deliberately opaque. Real `rustls::sign::CertifiedKey` values live
 in `ramjet-proxy`, indexed by the handle's id. Keeping rustls out of the router
 is what lets the matcher be tested without a key, a socket, or a clock.
 
+## Behind an L4 load balancer: the PROXY protocol
+
+A cloud L4 load balancer — AWS NLB, DigitalOcean, Scaleway, GCP passthrough —
+forwards TCP without touching the payload, so the connection this process
+accepts comes from the balancer and not the client. There is no
+`X-Forwarded-For` to read, because at that layer there are no headers at all:
+TLS has not been terminated, and on a plaintext listener the balancer never
+parsed the request.
+
+`--proxy-protocol` makes the `--http` and `--https` listeners require HAProxy's
+PROXY header — **v1** (a text line) or **v2** (binary, TLVs skipped), chosen by
+the sender and told apart by the first byte. The address it names replaces
+`ConnInfo.remote`, so `X-Forwarded-For`, `X-Real-IP`, and anything that logs a
+peer describe the client. `--proxy-protocol-timeout` (default 5s) bounds how
+long a sender gets to finish the header.
+
+Three properties are worth stating because they are the ones that are easy to
+get wrong:
+
+- **The header is read before the TLS handshake.** That is the order the wire
+  has: the balancer speaks the protocol itself and *then* relays the client's
+  bytes, so on the HTTPS listener the header arrives ahead of the ClientHello.
+  Parsing after the handshake would feed the header to rustls and fail every
+  connection.
+- **Nothing read past the header is thrown away.** The parser is sans-io and
+  reports how many bytes the header occupied; a single read very often returns
+  the header *and* the start of a request or a ClientHello, and those bytes are
+  replayed to the HTTP or TLS layer intact.
+- **A header that names nobody is still consumed.** A v2 `LOCAL` command (a
+  balancer health-checking the listener), a v1 `UNKNOWN`, and a v2 `AF_UNSPEC`
+  are valid headers carrying no address, and the socket's own peer stands.
+
+**It is required, not optional.** A connection whose first bytes are not a valid
+header is dropped, which is what nginx's `proxy_protocol` listener parameter and
+HAProxy's `accept-proxy` both do. A permissive fallback would let an attacker
+choose per connection whether to be spoofed, which is strictly worse than either
+fixed answer — because **the header is the client identity**. Anything that can
+reach the listener can claim any address, and every application decision made
+from `X-Forwarded-For` follows. So the flag belongs on a listener nothing but
+the load balancer can reach, and never on one exposed to the internet.
+
+The failure is deliberately loud once and quiet after: a balancer that is not
+sending the header fails *every* connection, so the first rejection on each
+serving runtime is a `warn` naming the likely cause and the rest are `debug`. A
+line per occurrence would bury the outage under its own logs.
+
+The admin listener never reads a header — Prometheus and the kubelet reach the
+pod directly and speak no PROXY protocol, and requiring it there would take
+`/metrics` and both probes offline the moment the flag was set.
+
 ## Performance
 
 Match latency against a table of **1,000 hosts and 10,001 routes** (ten per
@@ -600,9 +650,13 @@ corresponding `nginx.ingress.kubernetes.io` annotations are not read. Those
 attach to `PathRule` when the proxy can act on them; parsing an annotation the
 data plane ignores is worse than not parsing it, because it looks configured.
 
-**No PROXY protocol** on the listeners, so a replica behind a TCP load balancer
-that does not preserve the client IP will attribute every request to the load
-balancer in `X-Forwarded-For`.
+**The PROXY protocol is hyper-engine only.** `--engine uring` has no
+implementation of it and refuses `--proxy-protocol` at startup rather than
+ignoring it, because silently attributing every request to the load balancer is
+the one outcome an operator who set the flag would never detect. TODO: the read
+belongs in the reactor's accept path, before the connection is handed to the
+HTTP/1.1 state machine; the parser in `ramjet_proxy::proxy_protocol` is sans-io
+precisely so it can be reused there unchanged.
 
 **An `IngressTLS` entry with no `hosts` is skipped.** The controller cannot read
 a certificate's SANs to work out which names it covers — that would mean parsing

@@ -48,6 +48,7 @@ either way.
 | TLS termination | yes | no (502) |
 | HTTP/2, gRPC upstreams | h2 downstream | no (502) |
 | WebSocket and upgrades | yes | no (502) |
+| PROXY protocol (`--proxy-protocol`) | v1 and v2 | no; refused at startup |
 | Kubernetes mode | yes | no; static routes only |
 | Status | measured against nginx | experimental |
 
@@ -110,6 +111,23 @@ LoadBalancer Service for traffic, a separate ClusterIP Service for the admin
 port, and an `IngressClass` named `ramjet` whose controller is
 `ramjet.dev/ingress`. Point workloads at it with `ingressClassName: ramjet`, or
 set `ingressClass.isDefaultClass=true` to catch Ingresses that name no class.
+
+**[deploy/README.md](deploy/README.md) is the deployment guide** — a values
+preset and a rendered, Helm-free manifest for each of AWS (three shapes), GCP,
+Azure, DigitalOcean, Scaleway, Oracle, Exoscale, and two bare-metal shapes:
+
+```sh
+helm install ramjet deploy/chart/ramjet-ingress \
+  --namespace ramjet-ingress --create-namespace \
+  -f deploy/provider/aws/values.yaml
+
+kubectl apply -f deploy/static/provider/aws.yaml      # the same thing, no Helm
+```
+
+It also answers the question that decides most of that configuration: where the
+client's IP address comes from on each provider, and what it costs to keep it.
+Getting that wrong is quiet — `X-Forwarded-For` still gets written, it just
+contains the load balancer's address.
 
 Two things in the chart are deliberately not configurable:
 
