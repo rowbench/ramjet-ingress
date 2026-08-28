@@ -644,13 +644,26 @@ syscall is dearer than a native one, and taking the VM away refunds most of that
 to the engine making the most calls. The reactor, which was already avoiding
 those calls, had little to be refunded.
 
-Per busy CPU the gap is smaller still, roughly **+2.4%**. The whole-box `us`/`sy`
-split behind it is uring 35/47 against hyper 41/44 — the reactor spending more of
-the machine in the kernel and less in userspace, which is the same shape as the
-`io_uring_enter` share above and means the same thing: for this engine the kernel
-time *is* the work. Read that split as describing the machine rather than the
-proxy — the load generator and the upstreams were on the same box — which is
-also why the +2.4% is not a division of those two numbers.
+Per busy CPU the gap is smaller still, roughly **+2.4%**, where busy is
+`100 − idle`:
+
+| | busy | RPS | RPS per busy point |
+|---|---:|---:|---:|
+| ramjet (hyper) | 91 | 10,610 | 116.6 |
+| **ramjet (uring)** | **94** | **11,221** | **119.4** |
+
+The `us`/`sy` split underneath is uring 35/47 against hyper 41/44 — the reactor
+spending more of the machine in the kernel and less in userspace, which is the
+same shape as the `io_uring_enter` share above and means the same thing: for
+this engine the kernel time *is* the work. Those two do not sum to busy; the
+remainder is `wa`, `st` and rounding, which is why the busy column is taken from
+idle rather than by adding them up.
+
+**Every figure in that table counts the load generator and the upstreams as well
+as the proxy**, because all three were on the one box. So +2.4% is a
+whole-machine efficiency number rather than the engine's own. Getting the
+engine's own needs proxy-only CPU seconds, which this run did not capture — the
+same reason the run is not the one to quote from at all:
 
 > **The caveat that matters more than any of the numbers: this run was
 > CPU-contended, and the contention structurally compresses the gap between the
