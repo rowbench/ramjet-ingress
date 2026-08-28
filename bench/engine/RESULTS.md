@@ -76,6 +76,12 @@ percentage point**. That is the evidence that this run's ordering and margins
 mean something even though its absolute numbers were taken on a host that was
 not at its best.
 
+**Every absolute RPS figure on this page is therefore a floor, not an estimate.**
+A quieter host would move all four rows up together, uring included. Anyone
+revisiting these numbers should expect them to rise rather than fall, and should
+not "correct" them downward on the grounds that the machine was busy — the
+busyness is already in them, and it cost uring the same 7% it cost nginx.
+
 The same check settles a question about the other engine. `bench/RESULTS.md` has
 the hyper engine level with nginx (0.9% apart). Here it is **0.13% apart**
 — 80,682 against 80,790, both at 35.1% of baseline. So the hyper row is not
