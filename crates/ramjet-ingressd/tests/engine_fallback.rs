@@ -112,9 +112,15 @@ fn run_until_serving(engine: &str, unavailable: bool) -> (bool, String) {
     // ephemeral sockets constantly, and anything that took the number in that
     // window made the daemon exit with "address already in use" — which this
     // test reported as "the daemon should be serving", pointing at the daemon
-    // rather than at the guess. Two `free_port()` calls could also collide with
-    // each other and hand the same number to `--http` and `--admin`. Letting
-    // the kernel assign both closes the window rather than narrowing it.
+    // rather than at the guess.
+    //
+    // The worse half is that a stolen port does not always fail. Under the same
+    // stress `uring_strict_refuses_to_start_instead` failed the other way: its
+    // daemon refused to start, exactly as it should, and the connect *still*
+    // succeeded — against whichever concurrent daemon had taken the number. The
+    // test then reported that uring-strict had served, having never spoken to
+    // the process it started. A port read back from this child's own banner
+    // cannot reach another one.
     let mut command = Command::new(env!("CARGO_BIN_EXE_ramjet-ingressd"));
     command
         .arg(format!("--static-routes={}", routes.display()))
