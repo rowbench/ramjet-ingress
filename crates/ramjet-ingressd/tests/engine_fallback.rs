@@ -70,7 +70,10 @@ fn banner_http_port(output: &str) -> Option<u16> {
 ///
 /// `from_utf8_lossy` per chunk can only split a multi-byte character, and
 /// everything the daemon writes here is ASCII.
-fn drain(mut pipe: impl Read + Send + 'static, into: Arc<Mutex<String>>) -> std::thread::JoinHandle<()> {
+fn drain(
+    mut pipe: impl Read + Send + 'static,
+    into: Arc<Mutex<String>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
         loop {
@@ -85,10 +88,12 @@ fn drain(mut pipe: impl Read + Send + 'static, into: Arc<Mutex<String>>) -> std:
     })
 }
 
-/// Run the daemon until it says something, then stop it.
+/// Run the daemon until it is serving, then stop it.
 ///
-/// Returns everything it wrote to stderr. The startup banner goes to stdout and
-/// the engine decision goes to the log, so both are collected.
+/// Returns whether it got that far, and everything it wrote. The startup banner
+/// goes to stdout and the engine decision goes to the log on stderr, so both are
+/// collected into one string — every assertion here is a `contains`, and which
+/// stream a line arrived on has never been the question.
 fn run_until_serving(engine: &str, unavailable: bool) -> (bool, String) {
     let dir = std::env::temp_dir().join(format!(
         "ramjet-engine-fallback-{}-{}-{}",
