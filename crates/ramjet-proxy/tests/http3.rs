@@ -165,6 +165,19 @@ impl H3Reply {
     }
 }
 
+/// Waits, briefly and boundedly, for `ready` to hold.
+///
+/// Only ever used for counters that another thread has already written by the
+/// time the caller reaches it — what is being waited for is the store becoming
+/// visible, not the work happening — so the assertion that follows a call to
+/// this stays exact rather than becoming a range.
+async fn settle(ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn collect(
     stream: &mut h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
 ) -> H3Reply {
@@ -610,10 +623,7 @@ async fn a_name_with_no_certificate_fails_the_quic_handshake_and_is_counted() {
 
     // The failure is counted rather than logged per occurrence, exactly as a
     // failed TLS handshake on the TCP listener is.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while proxy.metrics.h3_handshake_failures() == before && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    settle(|| proxy.metrics.h3_handshake_failures() > before).await;
     assert!(proxy.metrics.h3_handshake_failures() > before);
 }
 
@@ -630,6 +640,16 @@ async fn the_h3_counters_move_with_the_traffic() {
             StatusCode::OK
         );
     }
+
+    // Waited for rather than read straight away. The counters are relaxed
+    // atomics written on the HTTP/3 runtime's own thread and read here on the
+    // test's, so what is being given time is the store becoming visible, not
+    // the request finishing — that already has, or `get` would not have
+    // returned. The assertions below are still exact.
+    settle(|| {
+        proxy.metrics.h3_requests() == 3 && proxy.metrics.responses("2xx") == 3
+    })
+    .await;
 
     assert_eq!(proxy.metrics.h3_connections(), 1, "one QUIC connection");
     assert_eq!(proxy.metrics.h3_requests(), 3, "three requests on it");
