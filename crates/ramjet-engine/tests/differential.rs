@@ -778,3 +778,96 @@ fn a_drain_that_runs_out_of_time_is_reported_the_same_way_on_both() {
         "the two engines report an expired grace period differently"
     );
 }
+
+/// A table with a fast route and a slow one, so a test can hold one connection
+/// idle and another in flight at the same instant.
+fn two_speeds(fast: SocketAddr, slow: SocketAddr) -> RouteTable {
+    let mut builder = builder_with(&[("fast", &[fast]), ("slow", &[slow])]);
+    builder
+        .route(Some("app.example.com"), "/fast", PathType::Prefix, "fast")
+        .expect("a valid route");
+    builder
+        .route(Some("app.example.com"), "/slow", PathType::Prefix, "slow")
+        .expect("a valid route");
+    builder.build().expect("a valid table")
+}
+
+/// One idle keep-alive connection and one request in flight, against `addr`.
+fn idle_and_in_flight(
+    addr: SocketAddr,
+) -> (Client, std::thread::JoinHandle<Response>) {
+    let mut idle = Client::connect(addr);
+    let first = idle.send(b"GET /fast HTTP/1.1\r\nHost: app.example.com\r\n\r\n");
+    assert_eq!(first.status, 200);
+    assert!(!first.closing, "this connection is meant to be reusable");
+    let in_flight = std::thread::spawn(move || get(addr, "/slow", "app.example.com"));
+    // Long enough for the slow request to reach its upstream.
+    std::thread::sleep(Duration::from_millis(100));
+    (idle, in_flight)
+}
+
+/// How long after `signalled` this connection was closed, asserting it was.
+fn eof_delay(client: &mut Client, signalled: std::time::Instant, engine: &str) -> Duration {
+    client
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("a read timeout");
+    let mut byte = [0u8; 1];
+    let read = std::io::Read::read(&mut client.stream, &mut byte)
+        .unwrap_or_else(|error| panic!("{engine}: the idle connection was never closed: {error}"));
+    assert_eq!(read, 0, "{engine}: an idle connection was fed rather than closed");
+    signalled.elapsed()
+}
+
+#[test]
+fn an_idle_connection_is_dropped_at_drain_start_on_both() {
+    // The two halves of a drain, and both engines have to get both right: a
+    // connection holding nothing goes immediately, and one carrying a request
+    // stays. Asserting them together is what makes this about the *start* of
+    // the drain — with only the idle connection open, an engine that waited
+    // until the very end would be indistinguishable from one that did not.
+    let slow = Behaviour::Slow {
+        delay: Duration::from_millis(1500),
+        body: b"slow".to_vec(),
+    };
+    let hyper_fast = echo();
+    let hyper_slow = spawn(slow.clone());
+    let uring_fast = echo();
+    let uring_slow = spawn(slow);
+    let mut hyper = HyperProxy::start_with(
+        two_speeds(hyper_fast.addr, hyper_slow.addr),
+        Duration::from_secs(30),
+    );
+    let mut uring = Proxy::with_config(
+        two_speeds(uring_fast.addr, uring_slow.addr),
+        |config| {
+            config.workers = Some(1);
+            config.shutdown_grace = Duration::from_secs(30);
+        },
+    );
+
+    let (mut hyper_idle, hyper_flight) = idle_and_in_flight(hyper.addr);
+    let (mut uring_idle, uring_flight) = idle_and_in_flight(uring.addr);
+
+    let signalled = std::time::Instant::now();
+    hyper.signal_shutdown();
+    uring.signal_shutdown();
+
+    let hyper_waited = eof_delay(&mut hyper_idle, signalled, "hyper");
+    let uring_waited = eof_delay(&mut uring_idle, signalled, "uring");
+    for (engine, waited) in [("hyper", hyper_waited), ("uring", uring_waited)] {
+        assert!(
+            waited < Duration::from_millis(750),
+            "{engine}: the idle connection waited {waited:?} to be closed, which \
+             is the in-flight request's grace period rather than its own"
+        );
+    }
+
+    assert_eq!(
+        hyper_flight.join().expect("the hyper request thread").status,
+        uring_flight.join().expect("the uring request thread").status,
+        "the engines disagree about the request that was in flight"
+    );
+    assert!(hyper.wait().is_ok());
+    assert!(uring.wait().is_ok());
+}
