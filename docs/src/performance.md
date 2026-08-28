@@ -610,6 +610,69 @@ is io_uring's, so the platform without io_uring measures none of it.
 - The correctness gate compares the two engines' response headers field by
   field, so **neither can be fast by doing less.**
 
+### On real Linux
+
+The caveat above says to treat the margin as an upper bound and the direction,
+not the size, as what transfers. This is the check on that, and **it comes out
+exactly as the caveat predicted.** A `t3.xlarge` EC2 instance running k0s — real
+Linux, no VM in the path — with the same two engines and the same flag
+difference:
+
+| | ramjet (hyper) | ramjet (uring) | uring vs hyper |
+|---|---:|---:|---:|
+| RPS, median | 10,610 | **11,221** | **+5.8%** |
+| spread across runs | 4.1% | **2.1%** | |
+| % of baseline | 47.4% | **50.2%** | |
+| p50 | 4.59 ms | **3.76 ms** | **−18.1%** |
+
+Baseline with no proxy in the path was 22,363 rps.
+
+**+5.8%, against +44.9% in the VM.** The direction transferred and the size did
+not, which is the whole of what the caveat asked to be believed.
+
+The share-of-baseline column is where the mechanism shows:
+
+| % of baseline | Docker Desktop VM | t3.xlarge, k0s |
+|---|---:|---:|
+| ramjet (uring) | 50.9% | 50.2% |
+| ramjet (hyper) | 35.1% | 47.4% |
+
+**uring held its share almost exactly; hyper gained twelve points.** So the VM
+was not flattering the reactor so much as it was punishing the other engine. The
+hyper engine pays four syscalls per request plus a `kevent`, a virtualised
+syscall is dearer than a native one, and taking the VM away refunds most of that
+to the engine making the most calls. The reactor, which was already avoiding
+those calls, had little to be refunded.
+
+Per busy CPU the gap is smaller still, roughly **+2.4%**. The whole-box `us`/`sy`
+split behind it is uring 35/47 against hyper 41/44 — the reactor spending more of
+the machine in the kernel and less in userspace, which is the same shape as the
+`io_uring_enter` share above and means the same thing: for this engine the kernel
+time *is* the work. Read that split as describing the machine rather than the
+proxy — the load generator and the upstreams were on the same box — which is
+also why the +2.4% is not a division of those two numbers.
+
+> **The caveat that matters more than any of the numbers: this run was
+> CPU-contended, and the contention structurally compresses the gap between the
+> engines.** Four shared vCPUs, with the load generator on the same instance as
+> the proxy and the upstreams. The proxy was therefore never the sole
+> bottleneck, and a benchmark where the thing under test is not the limiting
+> factor understates every difference between two versions of it. **A rerun on
+> pinned, isolated cores with the load off-box is the number worth quoting, and
+> this is not that run.** Treat +5.8% as a floor under contention rather than
+> the engine's ceiling.
+
+### The p99 inversion, unexplained
+
+On the same real-Linux run the reactor **wins throughput and the median and
+loses the tail**: p99 is about **6.8% worse** than the hyper engine's, and it
+was worse at both c64 and c256. Consistent enough not to be noise, and not
+currently explained.
+
+It is not the shape the VM measurements had, where uring led at every percentile
+including p99.9. Until someone can say why, **no tail-latency claim is made for
+the reactor** — see [Limitations](./limitations.md#the-uring-engines-p99-is-an-open-question).
+
 ### What is not claimed
 
 - Not that io_uring beats epoll in general. This is one proxy workload, one

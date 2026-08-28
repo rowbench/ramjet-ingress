@@ -181,12 +181,24 @@ http3:
 #   uring-strict  the same, and a refusal to start rather than a fallback.
 #
 # `uring` falls back to `hyper` where the reactor will not start, logging the
-# reason. That is not hypothetical: Docker's default seccomp profile blocks
-# io_uring_setup, and whether a given cluster's runtime allows it depends on the
-# node image, the container runtime, and the pod's own seccomp profile. Read the
-# replica's first log line to see which engine it actually chose, rather than
-# assuming it got what it asked for — /metrics deliberately does not say, so
-# that a dashboard built against one engine is correct about the other.
+# reason. That is not hypothetical, and it is not only Docker: both Docker's and
+# containerd's default seccomp profiles block io_uring_setup, so a stock k0s
+# cluster on real hardware falls back too, with a kernel that would have run the
+# reactor. Whether a given cluster allows it depends on the node image, the
+# container runtime, and the pod's own seccomp profile.
+#
+# The pod's profile is the one knob here: podSecurityContext.seccompProfile
+# below asks for RuntimeDefault, and setting it to Unconfined is what let the
+# reactor start on such a cluster. That removes the pod's syscall filter
+# entirely rather than unblocking three calls — a real security tradeoff on the
+# process most exposed to unauthenticated traffic. Read
+# docs/src/operations/engines.md before making it.
+#
+# Whichever engine ends up serving, it names itself in the startup log:
+# `engine="uring"` or `engine="hyper"` on the "starting in kubernetes mode"
+# line. Read that rather than assuming the replica got what it asked for —
+# /metrics deliberately does not say, so that a dashboard built against one
+# engine is correct about the other.
 #
 # `uring-strict` is for a deployment that would rather crash-loop visibly than
 # serve on an engine it did not pick.
@@ -344,6 +356,11 @@ hostNetwork: false
 # outage rather than an obvious one.
 dnsPolicy: ""
 
+# seccompProfile.type is also the io_uring switch. RuntimeDefault blocks
+# io_uring_setup on both Docker and containerd, so `engine: uring` falls back to
+# hyper under it; Unconfined is what makes the reactor start, at the price of
+# the pod having no syscall filter at all. Pod level is enough — the container
+# securityContext below needs no change. See engine: above.
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532

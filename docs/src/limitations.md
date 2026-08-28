@@ -120,6 +120,24 @@ A cluster serving gRPC wants `--engine hyper`.
 [Engines](./operations/engines.md) has the full parity matrix, and the
 differential test that keeps it honest.
 
+## The `uring` engine's p99 is an open question
+
+On real Linux the reactor **wins throughput and the median and loses the tail.**
+On a `t3.xlarge` k0s cluster it served 5.8% more requests per second at an 18.1%
+lower p50, and its p99 came out about **6.8% worse** than the hyper engine's — at
+c64 and at c256 both, consistently enough not to read as noise.
+
+Nobody has explained it. It is also not a known property of the design being
+rediscovered: the earlier Docker measurements had the reactor ahead at every
+percentile out to p99.9, so something about this environment or this engine
+changed and the cause is not identified.
+
+Until it is, **no tail-latency claim is made for the reactor.** A deployment
+whose SLO is written against p99 rather than throughput should stay on
+`--engine hyper`, or measure its own traffic before switching. The numbers, and
+the CPU-contention caveat that has to be read with them, are in
+[Performance](./performance.md#on-real-linux).
+
 ## HTTP/3 is experimental and off by default
 
 One QUIC endpoint on one runtime rather than one per core, no 0-RTT, no QUIC

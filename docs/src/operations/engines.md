@@ -144,9 +144,10 @@ trailers and bidirectional streaming intact.
 
 ## Falling back
 
-`io_uring_setup` is blocked by Docker's default seccomp profile. Whether a given
-cluster allows it depends on the node image, the container runtime, and the
-pod's own seccomp profile, which is not something a chart value can know.
+`io_uring_setup` is blocked by Docker's default seccomp profile, and by
+containerd's. Whether a given cluster allows it depends on the node image, the
+container runtime, and the pod's own seccomp profile. The last of those is a
+chart value; the first two are not something a chart value can know.
 
 So `--engine uring` asks the host before anything binds — one ring's setup and
 teardown — and serves on `hyper` if the answer is no:
@@ -174,17 +175,37 @@ dashboard engine-specific in exchange. The startup log says it once instead.
 
 ### Checking which engine a replica chose
 
-```console
-$ kubectl logs -l app.kubernetes.io/name=ramjet-ingress --tail=20 | head
-ramjet-ingressd 0.1.0 — engine uring, 3 backend(s), 6 endpoint(s), 4 route(s)
+**Both engines name themselves, in the same field, on the line the process
+writes first.** Which engine is serving is never something to infer from a
+field being *absent* — absence is also what a truncated line, a log shipper
+dropping a key, and an older build all look like.
+
+In Kubernetes mode that field is on the startup `INFO`:
+
+```text
+INFO ramjet_ingressd::kubernetes: starting in kubernetes mode version="0.1.0"
+     engine="uring" ingress_class=ramjet namespace="<all>" … cores=4
 ```
 
-A replica that fell back says so on the line above that one.
+```console
+$ kubectl logs -l app.kubernetes.io/name=ramjet-ingress \
+    | grep 'starting in kubernetes mode'
+```
 
-### One cluster where it does fall back
+With `--static-routes` it is the startup banner, saying the same thing in prose:
 
-Docker Desktop's Kubernetes, measured rather than assumed. `deploy/e2e.sh` was
-run against it with `ENGINE=uring`, and the pod reported:
+```text
+ramjet-ingressd 0.1.0 — engine hyper, 3 backend(s), 6 endpoint(s), 4 route(s), 0 certificate(s)
+```
+
+A replica that fell back reads `hyper` here — and says why on the line above.
+
+### Two clusters where it does fall back
+
+Both measured rather than assumed.
+
+**Docker Desktop's Kubernetes.** `deploy/e2e.sh` was run against it with
+`ENGINE=uring`, and the pod reported:
 
 ```text
 WARN the ramjet reactor will not start on this host; falling back to the hyper
@@ -198,11 +219,61 @@ per-route stats, mirroring, auto-promotion — which is the outcome the fallback
 exists to produce: a replica that serves rather than one that crash-loops
 because of a syscall policy nobody set deliberately.
 
+**k0s on EC2, with containerd 2.3.3.** A single-node k0s cluster on a
+`t3.xlarge`, Ubuntu, kernel 7.0 — and the same `EPERM`. This one is worth
+spelling out because every part of it *except* the pod's seccomp profile was
+willing: the kernel is far newer than the 5.6 the reactor needs, and the host
+had `kernel.io_uring_disabled=0`, so io_uring was not switched off anywhere on
+the machine. containerd's default seccomp profile — which the chart asks for, as
+`seccompProfile.type: RuntimeDefault` — is the whole of what blocked it.
+
+So this is not a Docker Desktop quirk, and not a VM quirk. **A stock
+containerd cluster on real hardware falls back too**, and it does so with a
+kernel that would have run the reactor happily.
+
 The same syscall is permitted in the *plain Docker* daemon on the same machine
 once the seccomp profile allows it, which is how
 [`bench/engine/`](https://github.com/rowbench/ramjet-ingress/blob/main/bench/engine/RESULTS.md)
 measures the reactor at all. The difference is the pod's seccomp profile, not
 the kernel — so on a cluster where you control that profile, `uring` will run.
+
+### Turning it on, and what it costs
+
+On the k0s cluster above, one pod-level value was enough:
+
+```yaml
+podSecurityContext:
+  seccompProfile:
+    type: Unconfined
+```
+
+or `--set podSecurityContext.seccompProfile.type=Unconfined`, which Helm merges
+over the chart's default and leaves the rest of the pod's security context
+(`runAsNonRoot`, the uid, `fsGroup`) intact. For the pre-rendered manifests in
+`deploy/static/provider/`, it is the pod spec's `securityContext.seccompProfile`
+block. **Pod level is sufficient** — the container-level `securityContext` needs
+no change, and the reactor started with only this.
+
+**Be clear about what that value does: it does not unblock `io_uring_setup`, it
+removes the syscall filter.** `RuntimeDefault` denies several dozen syscalls, of
+which the three io_uring ones are a small part; `Unconfined` denies none of
+them. Everything else the chart sets still applies — non-root uid, no
+capabilities, read-only root filesystem — but the kernel-level filter that
+contains a compromise of this process is gone, and it is the ingress controller,
+which is to say the process with the most exposure to unauthenticated traffic in
+the cluster. That is a genuine security tradeoff for the throughput in
+[Performance](../performance.md#on-real-linux), and on most clusters it is not
+worth making.
+
+**The narrower fix keeps the filter.** A `Localhost` profile — the runtime's
+default deny list plus `io_uring_setup`, `io_uring_enter` and
+`io_uring_register` — gives the reactor exactly what it needs and nothing else,
+and is what `bench/engine/` runs under. The chart does not ship one because a
+`Localhost` profile is a file that has to exist on every node before the pod
+referencing it will schedule, which is a node-provisioning job rather than a
+chart value. On a cluster with an opinion about syscall filters, that is the
+option to reach for; `Unconfined` is the one that gets you an answer in an
+afternoon.
 
 ## Mirroring and the request body
 
