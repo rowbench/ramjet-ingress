@@ -31,14 +31,19 @@ spec:
   ports:
     - name: http
       port: {{ .Values.service.http.port }}
-      targetPort: http
+      targetPort: {{ .Values.service.http.targetPort }}
       protocol: TCP
       {{- if and .Values.service.http.nodePort (ne (toString .Values.service.type) "ClusterIP") }}
       nodePort: {{ .Values.service.http.nodePort }}
       {{- end }}
     - name: https
       port: {{ .Values.service.https.port }}
-      targetPort: https
+      # Usually the TLS listener, but not always: where the load balancer
+      # terminates TLS this points at `http`, and the port named https here
+      # carries plaintext that was HTTPS one hop ago. The name is the Service
+      # port's, and Service port names are what provider annotations like
+      # aws-load-balancer-ssl-ports select on, so it stays `https` either way.
+      targetPort: {{ .Values.service.https.targetPort }}
       protocol: TCP
       {{- if and .Values.service.https.nodePort (ne (toString .Values.service.type) "ClusterIP") }}
       nodePort: {{ .Values.service.https.nodePort }}

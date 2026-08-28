@@ -1,11 +1,22 @@
+{{- include "ramjet-ingress.validate" . -}}
 apiVersion: apps/v1
-kind: Deployment
+kind: {{ .Values.kind }}
 metadata:
   name: {{ include "ramjet-ingress.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "ramjet-ingress.labels" . | nindent 4 }}
 spec:
+  {{- if eq .Values.kind "DaemonSet" }}
+  # A DaemonSet has no replica count to hard-code: the node set is the replica
+  # count, and one status writer per node is the price of being on every node.
+  # RollingUpdate one at a time because on hostNetwork the old pod must release
+  # the node's :80 before the new one can take it.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  {{- else }}
   # Hard-coded, not a value. There is no leader election yet: every replica
   # would run its own status writer, patching the same Ingresses with the same
   # field manager on its own schedule. See the note in values.yaml.
@@ -15,6 +26,7 @@ spec:
     # a surge pod would put two writers on the same objects for the length of
     # the rollout, which is the state the replica count exists to prevent.
     type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "ramjet-ingress.selectorLabels" . | nindent 6 }}
@@ -41,9 +53,12 @@ spec:
       {{- if .Values.hostNetwork }}
       hostNetwork: true
       {{- end }}
-      {{- with .Values.dnsPolicy }}
-      dnsPolicy: {{ . }}
-      {{- end }}
+      # An explicit dnsPolicy wins; otherwise hostNetwork decides it. A
+      # host-network pod under plain ClusterFirst inherits the *node's*
+      # resolv.conf and cannot resolve a cluster Service, so leaving this to
+      # chance would make the controller's API access depend on how the node
+      # happens to be configured.
+      dnsPolicy: {{ .Values.dnsPolicy | default (ternary "ClusterFirstWithHostNet" "ClusterFirst" .Values.hostNetwork) }}
       # Longer than controller.shutdownGrace, so the process ends by finishing
       # its drain rather than by being killed part-way through one.
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
@@ -55,8 +70,19 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --http=:{{ .Values.ports.http }}
+            {{- if .Values.ports.https }}
             - --https=:{{ .Values.ports.https }}
+            {{- else }}
+            # ports.https is 0: something in front is terminating TLS. Refusing
+            # to open the listener at all is better than opening one with no
+            # certificate to offer, which fails at handshake time on a port the
+            # load balancer believes is healthy.
+            - --no-https
+            {{- end }}
             - --admin=:{{ .Values.ports.admin }}
+            {{- if .Values.proxyProtocol.enabled }}
+            - --proxy-protocol
+            {{- end }}
             - --ingress-class={{ .Values.controller.ingressClass }}
             {{- with .Values.controller.watchNamespace }}
             - --watch-namespace={{ . }}
@@ -96,13 +122,19 @@ spec:
             {{- with .Values.controller.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          # No hostPort even under hostNetwork: the API server defaults hostPort
+          # to containerPort for a host-network pod, and the scheduler's port
+          # conflict check reads it from there. Writing it out again would only
+          # be a second place to keep in sync.
           ports:
             - name: http
               containerPort: {{ .Values.ports.http }}
               protocol: TCP
+            {{- if .Values.ports.https }}
             - name: https
               containerPort: {{ .Values.ports.https }}
               protocol: TCP
+            {{- end }}
             - name: admin
               containerPort: {{ .Values.ports.admin }}
               protocol: TCP

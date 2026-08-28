@@ -1,4 +1,4 @@
-ramjet-ingress {{ .Chart.AppVersion }} is installed as {{ include "ramjet-ingress.fullname" . }} in namespace {{ .Release.Namespace }}.
+ramjet-ingress {{ .Chart.AppVersion }} is installed as {{ .Values.kind | lower }}/{{ include "ramjet-ingress.fullname" . }} in namespace {{ .Release.Namespace }}.
 
 Point an Ingress at it with:
 
@@ -20,7 +20,25 @@ Readiness is not "the process started" — /readyz stays 503 until a route table
 has been compiled from the API server, so the first Ready is the moment this
 replica can actually serve. Follow it with:
 
-    kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "ramjet-ingress.fullname" . }}
+    kubectl -n {{ .Release.Namespace }} rollout status {{ .Values.kind | lower }}/{{ include "ramjet-ingress.fullname" . }}
+{{ if and (eq .Values.kind "DaemonSet") .Values.controller.updateStatus }}
+Note — this is a DaemonSet with status writeback on, so every node runs its own
+status writer. They agree (same address, same field manager), but they each
+patch every managed Ingress on their own debounce, so the API traffic is nodes
+times Ingresses. Set controller.updateStatus=false if that is the wrong trade.
+{{ end }}
+{{- if .Values.proxyProtocol.enabled }}
+PROXY protocol is on for :{{ .Values.ports.http }}{{ if .Values.ports.https }} and :{{ .Values.ports.https }}{{ end }}. Those ports now *require* the header —
+a connection that reaches them without going through the load balancer is
+rejected, which includes anything inside the cluster dialing the Service or the
+pod directly. The admin port is unaffected, which is why the probes still work.
+{{ end }}
+{{- if not .Values.ports.https }}
+There is no TLS listener: ports.https is 0 and the daemon was given --no-https.
+Whatever terminates TLS in front of this forwards plaintext to :{{ .Values.ports.http }}, so the
+backend sees scheme http and X-Forwarded-Proto says http — the hop that knew
+otherwise did not tell us.
+{{ end }}
 
 {{ if .Values.adminService.enabled -}}
 Metrics and probes are on a separate ClusterIP Service, never on the
@@ -39,4 +57,15 @@ balancer controller.
 {{- end }}
 
     kubectl -n {{ .Release.Namespace }} get svc {{ include "ramjet-ingress.fullname" . }}
+{{- end }}
+{{- if eq (toString .Values.service.type) "NodePort" }}
+The traffic Service is a NodePort: reach it at any node's address on
+:{{ .Values.service.http.nodePort | default "<allocated>" }} (http){{ if .Values.ports.https }} and :{{ .Values.service.https.nodePort | default "<allocated>" }} (https){{ end }}. NodePort Services get no
+.status.loadBalancer, so Ingress status comes from controller.publishAddress or
+stays empty.
+{{- end }}
+{{- if and .Values.hostNetwork (ne .Values.kind "DaemonSet") }}
+Warning: hostNetwork is on but this is a {{ .Values.kind }}. The listeners bind
+the node's ports directly, so a second pod scheduled onto the same node cannot
+start. Use kind=DaemonSet, which gives exactly one per node.
 {{- end }}

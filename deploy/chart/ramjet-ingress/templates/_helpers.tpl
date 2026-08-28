@@ -70,3 +70,30 @@ really arrives on rather than nothing at all.
 {{- printf "%s/%s" .Release.Namespace (include "ramjet-ingress.fullname" .) -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Combinations of values that render valid YAML the API server will happily
+accept and that are nonetheless wrong. Each of these was reachable by editing
+one value in isolation, and each fails at runtime rather than at install time —
+as a pod that will not start, or as a Service port wired to nothing. Failing
+the render is the cheaper place to find out.
+*/}}
+{{- define "ramjet-ingress.validate" -}}
+{{- if not (has .Values.kind (list "Deployment" "DaemonSet")) -}}
+{{- fail (printf "kind must be Deployment or DaemonSet, got %q" (toString .Values.kind)) -}}
+{{- end -}}
+{{- if not .Values.ports.https -}}
+{{- range $name, $port := dict "http" .Values.service.http "https" .Values.service.https -}}
+{{- if eq (toString $port.targetPort) "https" -}}
+{{- fail (printf "service.%s.targetPort is \"https\" but ports.https is 0, so no such container port exists — point it at \"http\" (the load balancer is terminating TLS) or give ports.https a port back" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{/*
+Deliberately not validated here: proxyProtocol.enabled without a matching
+provider annotation. It looks like the same class of mistake, but an external
+HAProxy or MetalLB-fronted edge is a perfectly good reason to expect the header
+with no Service annotation anywhere — and a guard that refuses a working
+configuration is worse than the documentation that explains the pairing.
+*/}}
+{{- end -}}
