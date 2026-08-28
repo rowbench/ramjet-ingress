@@ -245,9 +245,11 @@ BEHIND A LOAD BALANCER:
     listener can claim to be any address, and X-Forwarded-For, X-Real-IP and
     every application decision made from them follow. Enable it only on a
     listener nothing but the load balancer can reach. The header is required,
-    not optional: a connection without a valid one is dropped and counted in
-    ramjet_proxy_protocol_errors_total. The --admin listener never reads one,
-    because Prometheus and the kubelet do not send one.
+    not optional: a connection without a valid one is dropped, and the first
+    such drop on each serving runtime is logged at warn — so a balancer that
+    is not sending the header says so rather than looking like a network
+    fault. The --admin listener never reads one, because Prometheus and the
+    kubelet do not send one.
 
 UPSTREAMS:
     --connect-timeout <SECS>      TCP connect bound          [default: 5]
