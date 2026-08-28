@@ -14,8 +14,27 @@ description = "Experimental completion-based HTTP/1.1 data plane for ramjet-ingr
 ramjet = { workspace = true }
 ramjet-http = { workspace = true }
 ramjet-router = { workspace = true }
+# The certificate store, the SNI resolver, the PROXY protocol parser and the
+# mirror queue, all shared with the hyper engine rather than reimplemented.
+# Sharing the *types* is the point: `ramjet-ingressd` hands one `Arc<CertStore>`
+# to both engines, so a Secret rotation reaches whichever one is serving, and a
+# route table published for one is published for the other. It does mean this
+# crate's dependency graph now contains hyper, which it does not use; the
+# alternative was a second copy of the certificate plumbing that could drift
+# from the first.
+ramjet-proxy = { workspace = true }
 arc-swap = { workspace = true }
 libc = "0.2"
+rustls = { workspace = true }
+http = "1.3"
+bytes = "1.10"
+# Two events, both on connection-drop paths: a refused PROXY header and a
+# failed TLS handshake. Neither is on the request path, and a filtered-out event
+# is an atomic load.
+tracing = { workspace = true }
 
 [dev-dependencies]
-ramjet-proxy = { workspace = true }
+rcgen = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

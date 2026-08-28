@@ -35,6 +35,13 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 /// ALPN protocols offered, most preferred first.
 const ALPN: [&[u8]; 2] = [b"h2", b"http/1.1"];
 
+/// ALPN offered by a listener that speaks HTTP/1.1 and nothing else.
+///
+/// The uring engine's TLS lane. Offering `h2` there and then not speaking it
+/// would be worse than not offering it: ALPN is a promise, and a client that
+/// had it accepted would frame its first request as HTTP/2.
+const ALPN_H1: [&[u8]; 1] = [b"http/1.1"];
+
 /// Certificates and private keys, keyed by the router's opaque handle id.
 ///
 /// Published as a whole map rather than mutated in place, for the same reason
@@ -144,6 +151,43 @@ impl ResolvesServerCert for SniResolver {
 /// process-wide default is global mutable state that a library has no business
 /// installing on its embedder's behalf.
 pub fn server_config(resolver: Arc<SniResolver>) -> Result<rustls::ServerConfig, rustls::Error> {
+    let mut config = base_config(resolver)?;
+    config.alpn_protocols = ALPN.iter().map(|p| p.to_vec()).collect();
+    Ok(config)
+}
+
+/// The same configuration with `http/1.1` as the only ALPN protocol.
+///
+/// What the uring engine's TLS listener runs. Identical to [`server_config`] in
+/// every other respect — the same resolver, the same provider, the same
+/// resumption — because the two lanes have to be indistinguishable to a client
+/// that is not asking for HTTP/2, and a benchmark comparing them has to be
+/// comparing the engine rather than the TLS settings.
+pub fn h1_server_config(resolver: Arc<SniResolver>) -> Result<rustls::ServerConfig, rustls::Error> {
+    let mut config = base_config(resolver)?;
+    config.alpn_protocols = ALPN_H1.iter().map(|p| p.to_vec()).collect();
+    Ok(config)
+}
+
+/// Everything both TCP listeners agree on.
+///
+/// # Resumption
+///
+/// A ticketer is installed, which is what turns TLS 1.3 resumption from
+/// stateful into stateless. rustls resumes without one — its default
+/// `session_storage` is an in-memory cache of 256 sessions — but that cache is
+/// per process, so a client that lands on a different replica does a full
+/// handshake, and 256 sessions is nothing in front of real traffic. Tickets
+/// move the state to the client and make a resumption cost one round trip
+/// instead of a signature. nginx ships `ssl_session_tickets on` by default for
+/// the same reason, and a benchmark against it with resumption disabled on our
+/// side would be measuring a configuration nobody deploys.
+///
+/// Keys are generated at startup and rotated every six hours inside rustls.
+/// They are *not* shared between replicas: doing that means distributing a
+/// secret whose compromise retroactively breaks forward secrecy for every
+/// session it covered, and that is a trade an ingress should not make silently.
+fn base_config(resolver: Arc<SniResolver>) -> Result<rustls::ServerConfig, rustls::Error> {
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -151,7 +195,10 @@ pub fn server_config(resolver: Arc<SniResolver>) -> Result<rustls::ServerConfig,
     .with_no_client_auth()
     .with_cert_resolver(resolver);
 
-    config.alpn_protocols = ALPN.iter().map(|p| p.to_vec()).collect();
+    // A ticketer that cannot be built means no system randomness, which is not
+    // a condition to paper over: every key this process is about to use comes
+    // from the same source.
+    config.ticketer = rustls::crypto::ring::Ticketer::new()?;
     Ok(config)
 }
 
@@ -240,5 +287,32 @@ mod tests {
         // every HTTP/2-capable client its multiplexing.
         assert_eq!(ALPN[0], b"h2");
         assert_eq!(ALPN[1], b"http/1.1");
+    }
+
+    #[test]
+    fn the_http1_only_listener_does_not_offer_h2() {
+        // Offering a protocol the engine behind this listener cannot speak is
+        // worse than offering nothing: the client would frame its first request
+        // as HTTP/2 and get an HTTP/1.1 parser.
+        assert_eq!(ALPN_H1.len(), 1);
+        assert_eq!(ALPN_H1[0], b"http/1.1");
+    }
+
+    #[test]
+    fn both_listeners_resume_sessions() {
+        // The two configurations have to differ in ALPN and in nothing else, or
+        // an engine-versus-engine benchmark is measuring the TLS settings.
+        let routes = Arc::new(SharedRouteTable::new(
+            RouteTableBuilder::new().build().expect("an empty table"),
+        ));
+        let resolver = || Arc::new(SniResolver::new(Arc::clone(&routes), Arc::new(CertStore::new())));
+
+        let full = server_config(resolver()).expect("a config");
+        let h1 = h1_server_config(resolver()).expect("a config");
+
+        assert!(full.ticketer.enabled(), "resumption is on for the hyper lane");
+        assert!(h1.ticketer.enabled(), "resumption is on for the uring lane");
+        assert_eq!(full.alpn_protocols.len(), 2);
+        assert_eq!(h1.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
 }

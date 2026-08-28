@@ -92,17 +92,18 @@ pub fn write_static_head_only(out: &mut Vec<u8>, status: u16, body_len: usize, c
     }
 }
 
-/// The v1 gaps, in one place, for `--help` and the startup log.
+/// The gaps that are left, in one place, for `--help` and the startup log.
 ///
 /// Printed at startup rather than buried in a doc comment, because an operator
 /// choosing `--engine uring` should see what they gave up before their first
-/// request fails rather than after.
+/// request fails rather than after. Lines are removed from here as the gaps
+/// close, and [`the_limit_list_names_every_gap`](tests) is what stops a gap
+/// from being closed in the code and left standing here.
 pub const V1_LIMITS: &str = "\
-the uring engine is experimental and serves a subset of the hyper engine:
-  - HTTP/1.1 plaintext only; no TLS termination and no HTTP/2 (502)
-  - no WebSocket or other protocol upgrades (502)
-  - static routes only; --engine uring cannot run in Kubernetes mode
-  - gRPC is refused, as it is on the hyper engine (502)";
+the uring engine serves HTTP/1.1, with TLS, and does not speak:
+  - HTTP/2, in any form, including h2c with prior knowledge (502)
+  - gRPC, which needs HTTP/2 upstream, as on the hyper engine (502)
+  - HTTP/3, which stays on the hyper engine's QUIC listener";
 
 #[cfg(test)]
 mod tests {
@@ -200,10 +201,29 @@ mod tests {
 
     #[test]
     fn the_limit_list_names_every_gap() {
-        for gap in ["TLS", "HTTP/2", "upgrades", "Kubernetes"] {
+        for gap in ["HTTP/2", "gRPC", "HTTP/3"] {
             assert!(
                 V1_LIMITS.contains(gap),
                 "{gap} is missing from the printed limits"
+            );
+        }
+    }
+
+    #[test]
+    fn the_limit_list_does_not_claim_gaps_that_have_closed() {
+        // The failure this guards against is not a wrong list; it is a list
+        // that keeps telling an operator to use --engine hyper for something
+        // this engine has done for a release.
+        for closed in [
+            "no TLS",
+            "plaintext only",
+            "static routes only",
+            "Kubernetes mode",
+            "upgrades",
+        ] {
+            assert!(
+                !V1_LIMITS.contains(closed),
+                "{closed:?} is still listed as a limit after it was implemented"
             );
         }
     }

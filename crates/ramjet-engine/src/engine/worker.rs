@@ -92,6 +92,46 @@ mod kind {
     pub const ADMIN_READ: u8 = 9;
     pub const ADMIN_WRITE: u8 = 10;
     pub const CLOSE: u8 = 11;
+    /// An accept on the TLS listener.
+    ///
+    /// A separate kind rather than a lookup: once a descriptor has been
+    /// accepted the socket no longer says which listener produced it, and the
+    /// completion tag is the only thing that still knows.
+    pub const ACCEPT_TLS: u8 = 12;
+    /// A descriptor dealt out by the acceptor thread from the TLS listener.
+    pub const INTAKE_TLS: u8 = 13;
+}
+
+/// How far the PROXY protocol header in front of a connection has got.
+enum Preface {
+    /// The header is complete. These are the bytes after it, which belong to
+    /// whatever protocol the connection actually speaks.
+    Done(Vec<u8>),
+    /// A valid prefix of a header, and nothing more can be read until the rest
+    /// of it arrives.
+    NeedMore,
+    /// Not a header. The connection is already closing.
+    Rejected,
+}
+
+/// What a listener's accepts become.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// A data-plane connection, terminating TLS or not.
+    Client { tls: bool },
+    /// An admin connection: one request, one answer, closed.
+    Admin,
+}
+
+impl Role {
+    /// The tag kind the listener's next accept is armed with.
+    fn accept_kind(self) -> u8 {
+        match self {
+            Role::Admin => kind::ADMIN_ACCEPT,
+            Role::Client { tls: false } => kind::ACCEPT,
+            Role::Client { tls: true } => kind::ACCEPT_TLS,
+        }
+    }
 }
 
 /// Pack a kind, a generation and a descriptor into the 64 bits a completion
@@ -176,9 +216,32 @@ struct Conn {
     peer: IpAddr,
     phase: Phase,
 
+    /// The TLS session terminating this connection, if it arrived on the TLS
+    /// listener.
+    ///
+    /// `None` is the plaintext path, and every branch below that tests it is
+    /// the difference between the two: `inbox` and `outbox` are plaintext
+    /// either way, and everything from [`Conn::parse_request`] onwards cannot
+    /// tell which listener a request came in on except through
+    /// [`Conn::scheme`].
+    tls: Option<Box<crate::tls::Session>>,
+    /// What `X-Forwarded-Proto` says: `"https"` behind TLS, `"http"` otherwise.
+    scheme: &'static str,
+    /// Bytes collected while a PROXY protocol header is still being read.
+    ///
+    /// `Some` only until the header is complete, and only when the listener was
+    /// configured to expect one. The header comes before everything —
+    /// ciphertext included — so this sits in front of the TLS session rather
+    /// than behind it.
+    preface: Option<Vec<u8>>,
+
     /// Bytes read from the client and not yet consumed.
     inbox: Vec<u8>,
     /// Bytes queued to write to the client.
+    ///
+    /// Plaintext, always. Under TLS these are handed to rustls by
+    /// [`Worker::seal`] and what reaches the socket is the ciphertext it
+    /// produced.
     outbox: Vec<u8>,
     reading: bool,
     writing: bool,
@@ -256,10 +319,13 @@ struct Conn {
 }
 
 impl Conn {
-    fn new(peer: IpAddr) -> Conn {
+    fn new(peer: IpAddr, tls: Option<Box<crate::tls::Session>>) -> Conn {
         Conn {
             peer,
             phase: Phase::Head,
+            scheme: if tls.is_some() { "https" } else { "http" },
+            tls,
+            preface: None,
             inbox: Vec::new(),
             outbox: Vec::new(),
             reading: false,
@@ -348,7 +414,7 @@ impl Conn {
         self.upstream.is_some()
             && self.up_ready
             && !matches!(self.phase, Phase::Head | Phase::Closing)
-            && self.outbox.len() < MAX_PENDING
+            && pending_out_len(self) < MAX_PENDING
     }
 }
 
@@ -394,12 +460,14 @@ pub(crate) struct Worker {
     shutdown: Arc<AtomicBool>,
     helper: Arc<Helper>,
 
-    intake: Intake,
+    /// This core's listeners: a plaintext one, a TLS one, or both.
+    intakes: Vec<Intake>,
     admin: Option<RawFd>,
     notify: RawFd,
     notes: NoteReader,
-    /// Partially received descriptor numbers from the acceptor thread.
-    intake_partial: Vec<u8>,
+    /// Partially received descriptor numbers from the acceptor thread, one
+    /// buffer per intake channel.
+    intake_partial: Vec<(RawFd, Vec<u8>)>,
 
     slots: Vec<Slot>,
     generations: Vec<u32>,
@@ -422,7 +490,7 @@ impl Worker {
         readiness: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
         helper: Arc<Helper>,
-        intake: Intake,
+        intakes: Vec<Intake>,
         admin: Option<RawFd>,
         notify: RawFd,
     ) -> io::Result<Worker> {
@@ -435,8 +503,8 @@ impl Worker {
             metrics,
             readiness,
             shutdown,
+            intakes,
             helper,
-            intake,
             admin,
             notify,
             notes: NoteReader::default(),
@@ -454,9 +522,21 @@ impl Worker {
     /// Drive this core until shutdown.
     pub(crate) fn run(&mut self) -> io::Result<()> {
         self.arm_notify()?;
-        match self.intake {
-            Intake::Listener(fd) => self.arm_accept(fd, kind::ACCEPT)?,
-            Intake::Channel(fd) => self.arm_intake(fd)?,
+        for index in 0..self.intakes.len() {
+            let (source, tls) = {
+                let intake = &self.intakes[index];
+                (intake.fd(), intake.tls)
+            };
+            match self.intakes[index].source {
+                crate::engine::Source::Listener(_) => {
+                    let k = if tls { kind::ACCEPT_TLS } else { kind::ACCEPT };
+                    self.arm_accept(source, k)?;
+                }
+                crate::engine::Source::Channel(_) => {
+                    self.intake_partial.push((source, Vec::new()));
+                    self.arm_intake(source, tls)?;
+                }
+            }
         }
         if let Some(fd) = self.admin {
             self.arm_accept(fd, kind::ADMIN_ACCEPT)?;
@@ -560,11 +640,12 @@ impl Worker {
         Ok(())
     }
 
-    fn arm_intake(&mut self, fd: RawFd) -> io::Result<()> {
+    fn arm_intake(&mut self, fd: RawFd, tls: bool) -> io::Result<()> {
         let generation = self.generation(fd);
         let buf = self.read_buf();
+        let k = if tls { kind::INTAKE_TLS } else { kind::INTAKE };
         self.driver
-            .submit_with(Op::Read { fd, buf }, tag(kind::INTAKE, generation, fd))?;
+            .submit_with(Op::Read { fd, buf }, tag(k, generation, fd))?;
         Ok(())
     }
 
@@ -598,9 +679,11 @@ impl Worker {
         }
 
         match k {
-            kind::ACCEPT => self.on_accept(fd, c, false),
-            kind::ADMIN_ACCEPT => self.on_accept(fd, c, true),
-            kind::INTAKE => self.on_intake(fd, c),
+            kind::ACCEPT => self.on_accept(fd, c, Role::Client { tls: false }),
+            kind::ACCEPT_TLS => self.on_accept(fd, c, Role::Client { tls: true }),
+            kind::ADMIN_ACCEPT => self.on_accept(fd, c, Role::Admin),
+            kind::INTAKE => self.on_intake(fd, c, false),
+            kind::INTAKE_TLS => self.on_intake(fd, c, true),
             kind::NOTIFY => self.on_notify(fd, c),
             kind::DOWN_READ => self.on_client_read(fd, c),
             kind::DOWN_WRITE => self.on_client_write(fd, c),
@@ -617,7 +700,7 @@ impl Worker {
         }
     }
 
-    fn on_accept(&mut self, listener: RawFd, c: Completion, admin: bool) -> io::Result<()> {
+    fn on_accept(&mut self, listener: RawFd, c: Completion, role: Role) -> io::Result<()> {
         let accepted = match c.result {
             Ok(fd) => Some(fd as RawFd),
             Err(ref e) => {
@@ -637,13 +720,12 @@ impl Worker {
             }
         };
 
-        self.arm_accept(listener, if admin { kind::ADMIN_ACCEPT } else { kind::ACCEPT })?;
+        self.arm_accept(listener, role.accept_kind())?;
 
         let Some(fd) = accepted else { return Ok(()) };
-        if admin {
-            self.start_admin(fd)
-        } else {
-            self.start_client(fd)
+        match role {
+            Role::Admin => self.start_admin(fd),
+            Role::Client { tls } => self.start_client(fd, tls),
         }
     }
 
@@ -651,19 +733,29 @@ impl Worker {
     ///
     /// Used only where `SO_REUSEPORT` does not distribute connections — macOS,
     /// where the last socket to bind receives all of them.
-    fn on_intake(&mut self, fd: RawFd, c: Completion) -> io::Result<()> {
+    fn on_intake(&mut self, fd: RawFd, c: Completion, tls: bool) -> io::Result<()> {
         let Some(buf) = c.buf else { return Ok(()) };
         match c.result {
             Ok(n) if n > 0 => {
-                self.intake_partial.extend_from_slice(&buf[..n as usize]);
-                self.recycle_read(buf);
-                while self.intake_partial.len() >= 4 {
-                    let mut number = [0u8; 4];
-                    number.copy_from_slice(&self.intake_partial[..4]);
-                    self.intake_partial.drain(..4);
-                    self.start_client(i32::from_le_bytes(number))?;
+                let mut ready = Vec::new();
+                if let Some((_, partial)) = self
+                    .intake_partial
+                    .iter_mut()
+                    .find(|(channel, _)| *channel == fd)
+                {
+                    partial.extend_from_slice(&buf[..n as usize]);
+                    while partial.len() >= 4 {
+                        let mut number = [0u8; 4];
+                        number.copy_from_slice(&partial[..4]);
+                        partial.drain(..4);
+                        ready.push(i32::from_le_bytes(number));
+                    }
                 }
-                self.arm_intake(fd)
+                self.recycle_read(buf);
+                for accepted in ready {
+                    self.start_client(accepted, tls)?;
+                }
+                self.arm_intake(fd, tls)
             }
             // The acceptor is gone, and with it any reason for this core to be.
             _ => {
@@ -701,7 +793,7 @@ impl Worker {
 
     // ---- client connections -------------------------------------------------
 
-    fn start_client(&mut self, fd: RawFd) -> io::Result<()> {
+    fn start_client(&mut self, fd: RawFd, tls: bool) -> io::Result<()> {
         // The io_uring backend accepts without O_NONBLOCK and applies only
         // TCP_NODELAY; a blocking descriptor would stall this whole core on its
         // first syscall, so both are set here rather than assumed.
@@ -716,7 +808,14 @@ impl Worker {
             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
         self.bump_generation(fd);
-        let mut conn = Conn::new(peer);
+        let session = tls.then(|| Box::new(crate::tls::Session::new()));
+        let mut conn = Conn::new(peer, session);
+        if self.config.proxy_protocol {
+            // Before the TLS record layer and before HTTP: the header is the
+            // very first thing on the connection, and everything after it —
+            // including the ClientHello — belongs to the protocol above.
+            conn.preface = Some(Vec::new());
+        }
         conn.deadline = Some(Instant::now() + CLIENT_IDLE);
         *self.slot(fd) = Slot::Client(Box::new(conn));
         self.metrics.core(self.core).connection_opened();
@@ -733,21 +832,156 @@ impl Worker {
         conn.reading = false;
         match c.result {
             Ok(n) if n > 0 => {
-                conn.inbox.extend_from_slice(&buf[..n as usize]);
                 conn.deadline = Some(Instant::now() + CLIENT_IDLE);
+                self.ingest(&mut conn, &buf[..n as usize]);
             }
-            Ok(_) => conn.client_eof = true,
+            Ok(_) => {
+                conn.client_eof = true;
+                // A TLS peer that vanished without a close_notify has truncated
+                // whatever it was sending. There is nothing left to decrypt, so
+                // the session is finished either way.
+                if let Some(session) = conn.tls.as_mut() {
+                    if !session.established() {
+                        // A handshake that never completed is a failure worth
+                        // counting: an operator watching the handshake rate is
+                        // watching for exactly this.
+                        self.metrics.core(self.core).tls_handshake_failure();
+                        session.kill();
+                    }
+                }
+            }
             Err(_) => {
                 conn.client_eof = true;
                 // A reset client has nothing to receive, so there is no point
                 // flushing anything to it.
                 conn.outbox.clear();
+                if let Some(session) = conn.tls.as_mut() {
+                    session.wire_out().clear();
+                    session.kill();
+                }
                 conn.phase = Phase::Closing;
             }
         }
         self.recycle_read(buf);
         *self.slot(fd) = Slot::Client(conn);
         self.advance(fd)
+    }
+
+    /// Bytes off the client's socket, into its plaintext inbox.
+    ///
+    /// Every layer this connection sits behind is unwound here and nowhere
+    /// else: the PROXY header first, then the TLS record layer, and what comes
+    /// out the far side is what [`Worker::parse_request`] would have read
+    /// straight off a plaintext socket. That is the whole reason the state
+    /// machine below needed no second version for TLS.
+    fn ingest(&mut self, conn: &mut Conn, bytes: &[u8]) {
+        // Owned, because the surplus after a PROXY header lives in a buffer
+        // this function is about to drop. Allocated once per connection and
+        // only when the header feature is on.
+        let leftover;
+        let mut rest = bytes;
+
+        if conn.preface.is_some() {
+            match self.consume_preface(conn, rest) {
+                Preface::Done(surplus) => {
+                    leftover = surplus;
+                    rest = &leftover;
+                }
+                // Either the header is incomplete — nothing else can be read
+                // until it finishes — or it was rejected and the connection is
+                // already closing.
+                Preface::NeedMore | Preface::Rejected => return,
+            }
+        }
+
+        let Some(session) = conn.tls.as_mut() else {
+            conn.inbox.extend_from_slice(rest);
+            return;
+        };
+
+        let mut plain = std::mem::take(&mut conn.inbox);
+        let outcome = session.feed(rest, &mut plain);
+        conn.inbox = plain;
+
+        match outcome {
+            Ok(crate::tls::Step::NeedMore) => {}
+            Ok(crate::tls::Step::Hello(_)) => {
+                // v1 of the TLS lane serves every ClientHello it is offered:
+                // ALPN is `http/1.1` only, so an HTTP/2 client never negotiates
+                // a protocol this engine cannot speak. Dispatch is what turns
+                // this into a decision.
+                let Some(config) = self.config.tls.clone() else {
+                    self.metrics.core(self.core).tls_handshake_failure();
+                    session.kill();
+                    conn.phase = Phase::Closing;
+                    return;
+                };
+                let mut plain = std::mem::take(&mut conn.inbox);
+                let accepted = session.accept(&config, &mut plain);
+                conn.inbox = plain;
+                if accepted.is_err() {
+                    self.metrics.core(self.core).tls_handshake_failure();
+                    conn.phase = Phase::Closing;
+                    return;
+                }
+            }
+            Ok(crate::tls::Step::Live) => {}
+            Err(_) => {
+                // rustls has queued an alert describing the failure; the write
+                // path flushes it before the connection goes.
+                self.metrics.core(self.core).tls_handshake_failure();
+                session.kill();
+                conn.phase = Phase::Closing;
+                return;
+            }
+        }
+
+        if conn.tls.as_mut().is_some_and(|s| s.take_established()) {
+            self.metrics.core(self.core).tls_handshake();
+        }
+    }
+
+    /// Read a PROXY protocol header off the front of the connection.
+    ///
+    /// The same parser the hyper engine uses, and the same trust model: the
+    /// header is **required**, and a connection whose first bytes are not one
+    /// is dropped without an answer. A permissive fallback to the socket's own
+    /// address would let a sender choose per connection whether to be spoofed,
+    /// which is strictly worse than either fixed answer.
+    ///
+    /// Dropping rather than answering is deliberate too. At this point nothing
+    /// is known about what the peer speaks — it may be mid-ClientHello — so an
+    /// HTTP error would be bytes into a stream that is not HTTP.
+    fn consume_preface(&mut self, conn: &mut Conn, bytes: &[u8]) -> Preface {
+        use ramjet_proxy::proxy_protocol::{parse, Parsed};
+
+        let Some(preface) = conn.preface.as_mut() else {
+            return Preface::Done(Vec::new());
+        };
+        preface.extend_from_slice(bytes);
+
+        match parse(preface) {
+            Ok(Parsed::Incomplete) => Preface::NeedMore,
+            Ok(Parsed::Done { consumed, client }) => {
+                // A header that names nobody — a v2 LOCAL command, which is
+                // what a load balancer's own health check sends — is a success
+                // that leaves the socket's peer address standing.
+                if let Some(client) = client {
+                    conn.peer = client.ip();
+                }
+                let surplus = preface.get(consumed..).unwrap_or(&[]).to_vec();
+                conn.preface = None;
+                Preface::Done(surplus)
+            }
+            Err(error) => {
+                tracing::debug!(%error, peer = %conn.peer, "refused a connection with no valid PROXY header");
+                self.metrics.core(self.core).proxy_header_rejected();
+                conn.outbox.clear();
+                conn.phase = Phase::Closing;
+                conn.client_eof = true;
+                Preface::Rejected
+            }
+        }
     }
 
     fn on_client_write(&mut self, fd: RawFd, c: Completion) -> io::Result<()> {
@@ -1024,7 +1258,7 @@ impl Worker {
         // head borrows from it.
         let hop = Hop {
             client: conn.peer,
-            scheme: "http",
+            scheme: conn.scheme,
         };
         conn.request_head.clear();
         {
@@ -1613,9 +1847,16 @@ impl Worker {
             return Ok(());
         };
 
-        if !conn.writing && !conn.outbox.is_empty() {
+        // Under TLS the bytes that reach the socket are never the bytes the
+        // state machine produced, so the plaintext outbox is encrypted here and
+        // the session's ciphertext queue is what gets submitted.
+        seal(&mut conn);
+        if !conn.writing && has_pending_out(&conn) {
             let mut buf = self.write_buf();
-            std::mem::swap(&mut conn.outbox, &mut buf);
+            match conn.tls.as_mut() {
+                Some(session) => std::mem::swap(session.wire_out(), &mut buf),
+                None => std::mem::swap(&mut conn.outbox, &mut buf),
+            }
             let generation = self.generation(fd);
             match self
                 .driver
@@ -1667,7 +1908,7 @@ impl Worker {
             }
         }
 
-        let finished = conn.phase == Phase::Closing && !conn.writing && conn.outbox.is_empty();
+        let finished = conn.phase == Phase::Closing && !conn.writing && !has_pending_out(&conn);
         let borrowed = conn.up_borrowed;
         let upstream = conn.upstream;
         *self.slot(fd) = Slot::Client(conn);
@@ -1922,12 +2163,12 @@ impl Worker {
             }
         }
 
-        // The three descriptors that are not connections, and whose parked
-        // operations are the ones that would otherwise never complete.
-        let intake = match self.intake {
-            Intake::Listener(fd) | Intake::Channel(fd) => fd,
-        };
-        self.close(intake);
+        // The descriptors that are not connections, and whose parked operations
+        // are the ones that would otherwise never complete.
+        let intakes: Vec<RawFd> = self.intakes.iter().map(Intake::fd).collect();
+        for fd in intakes {
+            self.close(fd);
+        }
         if let Some(fd) = self.admin.take() {
             self.close(fd);
         }
@@ -1949,6 +2190,49 @@ impl Worker {
             }
         }
         self.done = done;
+    }
+}
+
+/// Encrypt whatever the state machine has queued for the client.
+///
+/// A no-op on a plaintext connection, and on a TLS connection whose handshake
+/// has not finished — rustls has nowhere to put application data until it has.
+/// What rustls accepts is removed from `outbox`; what it refuses stays there and
+/// is offered again next time round, which is how a response larger than its
+/// internal plaintext cap gets out in pieces rather than being truncated.
+fn seal(conn: &mut Conn) {
+    let Some(session) = conn.tls.as_mut() else {
+        return;
+    };
+    if conn.outbox.is_empty() {
+        return;
+    }
+    let sent = session.seal(&conn.outbox);
+    conn.outbox.drain(..sent);
+}
+
+/// Whether anything is waiting to go to the client.
+///
+/// Under TLS that is the ciphertext queue and not the plaintext one: a
+/// handshake with nothing to say at the application layer still has records to
+/// write, and a connection whose plaintext has all been encrypted still has
+/// bytes on the way out.
+fn has_pending_out(conn: &Conn) -> bool {
+    match &conn.tls {
+        Some(session) => session.has_wire(),
+        None => !conn.outbox.is_empty(),
+    }
+}
+
+/// How much is queued for the client, for the backpressure bound.
+///
+/// Both buffers under TLS: the plaintext waiting to be encrypted and the
+/// ciphertext waiting for the socket are both memory this connection is
+/// holding on a slow reader's behalf.
+fn pending_out_len(conn: &Conn) -> usize {
+    match &conn.tls {
+        Some(session) => conn.outbox.len() + session.wire_len(),
+        None => conn.outbox.len(),
     }
 }
 

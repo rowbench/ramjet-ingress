@@ -141,6 +141,22 @@ pub fn echo() -> Upstream {
     })
 }
 
+/// One counter's value out of a Prometheus exposition.
+///
+/// Zero when the series is absent, which reads the same way in an assertion as
+/// a series that is present and zero — the distinction never matters here,
+/// because every series this engine emits is emitted unconditionally.
+pub fn counter(exposition: &str, name: &str) -> u64 {
+    exposition
+        .lines()
+        .find(|line| {
+            line.split_whitespace().next() == Some(name)
+        })
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
 /// An address nothing is listening on.
 pub fn dead_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a listener");
@@ -378,8 +394,13 @@ impl Response {
 }
 
 /// A client connection that can be reused, so keep-alive is testable.
-pub struct Client {
-    stream: TcpStream,
+///
+/// Generic over the stream so the HTTP reading below is written once and used
+/// for both listeners. That is not tidiness: the response parser is the thing
+/// that decides whether a test passes, and a second copy of it for TLS would be
+/// a second place for a framing assumption to be wrong.
+pub struct Client<S = TcpStream> {
+    pub stream: S,
     buf: Vec<u8>,
     /// Responses still owed, and whether each answers a `HEAD`.
     ///
@@ -389,13 +410,25 @@ pub struct Client {
     pending: std::collections::VecDeque<bool>,
 }
 
-impl Client {
-    pub fn connect(addr: SocketAddr) -> Client {
+impl Client<TcpStream> {
+    pub fn connect(addr: SocketAddr) -> Client<TcpStream> {
         let stream = TcpStream::connect(addr).expect("a connection to the proxy");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("a read timeout");
         stream.set_nodelay(true).expect("nodelay");
+        Client::new(stream)
+    }
+
+    /// Half-close, so the proxy sees end of stream while still able to answer.
+    pub fn shutdown_write(&mut self) {
+        let _ = self.stream.shutdown(Shutdown::Write);
+    }
+}
+
+impl<S: Read + Write> Client<S> {
+    /// A client over an already-connected stream.
+    pub fn new(stream: S) -> Client<S> {
         Client {
             stream,
             buf: Vec::new(),
@@ -442,11 +475,6 @@ impl Client {
         self.note_methods(bytes);
         self.stream.write_all(bytes).expect("bytes were sent");
         self.stream.flush().expect("flushed");
-    }
-
-    /// Half-close, so the proxy sees end of stream while still able to answer.
-    pub fn shutdown_write(&mut self) {
-        let _ = self.stream.shutdown(Shutdown::Write);
     }
 
     pub fn read_response(&mut self) -> Response {
@@ -587,6 +615,8 @@ pub fn get_with(addr: SocketAddr, path: &str, host: &str, extra: &[(&str, &str)]
 /// A running engine, stopped when dropped.
 pub struct Proxy {
     pub addr: SocketAddr,
+    /// The TLS listener's address, for a proxy started with one.
+    pub tls_addr: Option<SocketAddr>,
     pub admin: Option<SocketAddr>,
     pub routes: Arc<SharedRouteTable>,
     pub readiness: Arc<AtomicBool>,
@@ -614,7 +644,7 @@ impl Proxy {
     /// Start an engine, adjusting the configuration first.
     pub fn with_config(table: RouteTable, adjust: impl FnOnce(&mut Config)) -> Proxy {
         let mut config = Config {
-            http: SocketAddr::from(([127, 0, 0, 1], 0)),
+            http: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             admin: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             workers: Some(1),
             // A fast tick so a test does not wait a tenth of a second for every
@@ -623,18 +653,50 @@ impl Proxy {
             ..Config::default()
         };
         adjust(&mut config);
+        Proxy::launch(Arc::new(SharedRouteTable::new(table)), config)
+    }
 
-        let routes = Arc::new(SharedRouteTable::new(table));
+    /// Start an engine whose configuration needs the route table it will serve.
+    ///
+    /// TLS is the case that needs this: the SNI resolver reads certificate
+    /// names out of the very table the engine is about to be handed, so the
+    /// table has to exist before the configuration does. Passing the `Arc`
+    /// rather than a clone of the table is the point — it is the same sharing
+    /// `ramjet-ingressd` does, and a test that built two would not be testing
+    /// it.
+    pub fn with_routes(
+        routes: Arc<SharedRouteTable>,
+        adjust: impl FnOnce(&mut Config, &Arc<SharedRouteTable>),
+    ) -> Proxy {
+        let mut config = Config {
+            http: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            admin: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            workers: Some(1),
+            tick: Duration::from_millis(10),
+            ..Config::default()
+        };
+        adjust(&mut config, &routes);
+        Proxy::launch(routes, config)
+    }
+
+    fn launch(routes: Arc<SharedRouteTable>, config: Config) -> Proxy {
         let readiness = Arc::new(AtomicBool::new(false));
         let engine = Engine::bind(config, Arc::clone(&routes), Arc::clone(&readiness))
             .expect("the engine bound");
-        let addr = engine.http_addr();
+        // Every listener the engine opened, so a caller that asked for TLS
+        // alone still has an address to wait on and to connect to.
+        let http = engine.http_addr();
+        let tls_addr = engine.https_addr();
+        let addr = http
+            .or(tls_addr)
+            .expect("an engine serves at least one listener");
         let admin = engine.admin_addr();
         let shutdown = engine.shutdown();
         let handle = thread::spawn(move || engine.run());
 
         let proxy = Proxy {
             addr,
+            tls_addr,
             admin,
             routes,
             readiness,
@@ -656,12 +718,211 @@ impl Proxy {
         panic!("the engine never started listening on {}", self.addr);
     }
 
+    /// The TLS listener's address, for a proxy that was started with one.
+    pub fn tls(&self) -> SocketAddr {
+        self.tls_addr.expect("a TLS listener")
+    }
+
     /// Scrape the admin listener.
     pub fn admin(&self, path: &str) -> Response {
         let admin = self.admin.expect("an admin listener");
         let mut client = Client::connect(admin);
         client.send(format!("GET {path} HTTP/1.1\r\nHost: admin\r\n\r\n").as_bytes())
     }
+}
+
+// ---------------------------------------------------------------------- tls
+
+/// A self-signed certificate for `names`, and the private key beside it.
+///
+/// Generated per test rather than read from a fixture: a checked-in key is a
+/// key, and an expiry date in a fixture is a test that fails on a Tuesday in
+/// two years.
+pub fn certificate_for(names: &[&str]) -> rustls::sign::CertifiedKey {
+    let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+    let issued = rcgen::generate_simple_self_signed(names).expect("a self-signed certificate");
+    let chain = vec![issued.cert.der().clone()];
+    let key = rustls_pki_types::PrivateKeyDer::try_from(issued.signing_key.serialize_der())
+        .expect("a usable private key");
+    ramjet_proxy::tls::certified_key(chain, key).expect("a certified key")
+}
+
+/// A route table whose single route is served over TLS, with the certificate
+/// store the engine will resolve against.
+///
+/// The two are returned together because they are published together: the
+/// table holds an opaque handle id and the store holds what it points at, and a
+/// test that built one without the other would fail every handshake.
+pub fn tls_table(
+    host: &str,
+    endpoints: &[SocketAddr],
+    cert_names: &[&str],
+) -> (RouteTable, Arc<ramjet_proxy::CertStore>) {
+    const HANDLE: u64 = 1;
+
+    let mut builder = RouteTableBuilder::new();
+    builder
+        .backend(
+            "app",
+            LbPolicy::RoundRobin,
+            endpoints.iter().copied().map(Endpoint::new).collect(),
+        )
+        .expect("a valid backend");
+    builder
+        .route(Some(host), "/", PathType::Prefix, "app")
+        .expect("a valid route");
+    for name in cert_names {
+        builder
+            .certificate(name, Arc::new(ramjet_router::CertifiedKeyHandle::new(HANDLE)))
+            .expect("a valid certificate name");
+    }
+
+    let mut certs = HashMap::new();
+    certs.insert(HANDLE, Arc::new(certificate_for(cert_names)));
+    (
+        builder.build().expect("a valid table"),
+        Arc::new(ramjet_proxy::CertStore::with_certs(certs)),
+    )
+}
+
+/// Start an engine with a TLS listener over `table` and `certs`.
+pub fn tls_proxy(table: RouteTable, certs: Arc<ramjet_proxy::CertStore>) -> Proxy {
+    Proxy::with_routes(Arc::new(SharedRouteTable::new(table)), move |config, routes| {
+        let resolver = Arc::new(ramjet_proxy::SniResolver::new(Arc::clone(routes), certs));
+        config.https = Some(SocketAddr::from(([127, 0, 0, 1], 0)));
+        config.tls = Some(Arc::new(
+            ramjet_proxy::tls::h1_server_config(resolver).expect("a server config"),
+        ));
+    })
+}
+
+/// A TLS client that trusts anything, because the certificate under test was
+/// generated by the test that is about to verify it was served.
+///
+/// Verification is not what these tests are about — rustls's own suite covers
+/// it — and a real root store would mean a real CA, which is a fixture with an
+/// expiry date. What *is* asserted is that the name the client asked for is the
+/// name on the certificate it got back.
+#[derive(Debug)]
+struct TrustAnything(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for TrustAnything {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// A client configuration that resumes sessions across connections.
+///
+/// The resumption cache is what makes a second connection a resumption rather
+/// than a full handshake, so it is shared deliberately and a test that wants
+/// two independent handshakes builds two of these.
+pub fn tls_client_config() -> Arc<rustls::ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(TrustAnything(provider)))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(config)
+}
+
+/// The stream an HTTPS test client reads and writes.
+pub type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+
+/// An HTTPS client, with exactly the same HTTP reading as the plaintext one.
+pub type TlsClient = Client<TlsStream>;
+
+/// Connect to `addr` and handshake for `server_name`.
+pub fn tls_connect(
+    addr: SocketAddr,
+    server_name: &str,
+    config: Arc<rustls::ClientConfig>,
+) -> TlsClient {
+    let name =
+        rustls_pki_types::ServerName::try_from(server_name.to_owned()).expect("a valid server name");
+    let conn = rustls::ClientConnection::new(config, name).expect("a client session");
+    let socket = TcpStream::connect(addr).expect("a TCP connection");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("a read timeout");
+    socket.set_nodelay(true).expect("nodelay");
+    Client::new(rustls::StreamOwned::new(conn, socket))
+}
+
+impl Client<TlsStream> {
+    /// Drive the handshake to completion without sending a request.
+    ///
+    /// `StreamOwned` handshakes lazily, on the first read or write, so anything
+    /// that wants to inspect the negotiated session has to force it first.
+    pub fn handshake(&mut self) {
+        // A zero-length write is enough: rustls completes the handshake before
+        // it will accept any application data, and writes nothing itself.
+        self.stream.write_all(&[]).expect("the handshake completed");
+        self.stream.flush().expect("the handshake flushed");
+    }
+
+    /// The certificate chain the server presented, as DER.
+    pub fn peer_certificates(&self) -> Vec<Vec<u8>> {
+        self.stream
+            .conn
+            .peer_certificates()
+            .map(|certs| certs.iter().map(|c| c.to_vec()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The protocol ALPN settled on.
+    pub fn alpn(&self) -> Option<Vec<u8>> {
+        self.stream.conn.alpn_protocol().map(|p| p.to_vec())
+    }
+}
+
+/// One HTTPS request, on a connection of its own.
+pub fn https_get(addr: SocketAddr, host: &str, path: &str) -> Response {
+    let mut client = tls_connect(addr, host, tls_client_config());
+    client
+        .send(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes())
 }
 
 // ------------------------------------------------------------------- tables

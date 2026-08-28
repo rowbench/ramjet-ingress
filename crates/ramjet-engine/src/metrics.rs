@@ -54,6 +54,13 @@ pub struct CoreMetrics {
     retries: AtomicU64,
     timeouts: AtomicU64,
     route_misses: AtomicU64,
+    tls_handshakes: AtomicU64,
+    tls_handshake_failures: AtomicU64,
+    proxy_headers_rejected: AtomicU64,
+    mirrored: AtomicU64,
+    mirror_dropped: AtomicU64,
+    mirror_skipped: AtomicU64,
+    mirror_failures: AtomicU64,
 }
 
 impl CoreMetrics {
@@ -116,6 +123,41 @@ impl CoreMetrics {
     /// A request matched no route and no default backend.
     pub fn route_miss(&self) {
         self.route_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A TLS handshake completed.
+    pub fn tls_handshake(&self) {
+        self.tls_handshakes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A TLS handshake failed, however it failed.
+    pub fn tls_handshake_failure(&self) {
+        self.tls_handshake_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A connection was dropped for not carrying a valid PROXY header.
+    pub fn proxy_header_rejected(&self) {
+        self.proxy_headers_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A copy was queued for a mirror backend and accepted by it.
+    pub fn mirrored(&self) {
+        self.mirrored.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A copy was discarded because this core's mirror queue was full.
+    pub fn mirror_dropped(&self) {
+        self.mirror_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A copy was not attempted because the request body was too large.
+    pub fn mirror_skipped(&self) {
+        self.mirror_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A mirror backend refused a copy, or had nowhere to send it.
+    pub fn mirror_failure(&self) {
+        self.mirror_failures.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -229,19 +271,16 @@ impl EngineMetrics {
             i64::from(pinned),
         );
 
-        // TLS is not terminated by this engine, so both handshake counters are
-        // structurally zero. They are still emitted: a dashboard that loses a
-        // series when an operator changes engine looks like an outage.
         for (name, help, value) in [
             (
                 "ramjet_tls_handshakes_total",
                 "TLS handshakes completed.",
-                0,
+                self.sum(|c| &c.tls_handshakes),
             ),
             (
                 "ramjet_tls_handshake_failures_total",
                 "TLS handshakes that failed.",
-                0,
+                self.sum(|c| &c.tls_handshake_failures),
             ),
             (
                 "ramjet_upstream_connect_failures_total",
@@ -281,27 +320,25 @@ impl EngineMetrics {
                 "QUIC connections that never became usable HTTP/3 connections.",
                 0,
             ),
-            // And zero again for mirroring, which is wired per TCP serving lane
-            // on the hyper engine and has no counterpart here.
             (
                 "ramjet_mirrored_total",
                 "Requests copied to a mirror backend, which accepted the copy.",
-                0,
+                self.sum(|c| &c.mirrored),
             ),
             (
                 "ramjet_mirror_dropped_total",
                 "Copies discarded because a serving runtime's mirror queue was full.",
-                0,
+                self.sum(|c| &c.mirror_dropped),
             ),
             (
                 "ramjet_mirror_skipped_total",
                 "Copies not attempted because the request body exceeded --mirror-max-body.",
-                0,
+                self.sum(|c| &c.mirror_skipped),
             ),
             (
                 "ramjet_mirror_failures_total",
                 "Copies a mirror backend refused, failed, or did not answer in time.",
-                0,
+                self.sum(|c| &c.mirror_failures),
             ),
         ] {
             let _ = writeln!(out, "# HELP {name} {help}");

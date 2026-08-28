@@ -30,7 +30,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use ramjet_proxy::{
-    CertStore, ListenerConfig, ProxyConfig, ReadinessFlag, Server, Shutdown, UpstreamConfig,
+    CertStore, ListenerConfig, ProxyConfig, ReadinessFlag, Server, Shutdown, SniResolver,
+    UpstreamConfig,
 };
 use ramjet_router::SharedRouteTable;
 use tracing_subscriber::EnvFilter;
@@ -281,41 +282,42 @@ async fn uring_mode(
 
     let loaded = config::load(path)?;
     let summary = loaded.summary;
+    let has_certificates = !loaded.certs.is_empty();
 
-    // Refused rather than ignored. A TLS listener that this engine cannot
-    // terminate would accept connections and fail every handshake, which looks
-    // from outside exactly like a broken certificate.
-    if !loaded.certs.is_empty() {
-        return Err(format!(
-            "{} declares {} certificate(s), and --engine uring does not terminate TLS; \
-             use --engine hyper",
-            path.display(),
-            summary.certificates
-        )
-        .into());
-    }
-    if args.https_explicit && args.https.is_some() {
+    if args.http.is_none() && args.https.is_none() {
         return Err(
-            "--https was given, and --engine uring does not terminate TLS; use --engine hyper"
+            "--engine uring needs a listener; --no-http and --no-https together leave it \
+             nothing to serve"
                 .into(),
-        );
-    }
-    let Some(http) = args.http else {
-        return Err("--engine uring needs a plaintext listener; --no-http leaves it nothing to serve".into());
-    };
-    // Refused for the same reason as TLS: ignoring it would attribute every
-    // request to the load balancer's address, silently, and an operator who
-    // asked for the real client IP would have no way to tell it had not worked.
-    if args.proxy_protocol {
-        return Err(
-            "--proxy-protocol is not implemented on --engine uring; use --engine hyper".into(),
         );
     }
 
     let routes = Arc::new(SharedRouteTable::new(loaded.table));
+    let certs = Arc::new(CertStore::with_certs(loaded.certs));
+
+    // The same rule dev mode applies: without an explicit --https, a TLS
+    // listener over an empty certificate store would fail every handshake, and
+    // binding it anyway would look like a working HTTPS endpoint to anyone
+    // reading the startup output.
+    let https = if args.https_explicit || has_certificates {
+        args.https
+    } else {
+        None
+    };
+    let tls = match https {
+        Some(_) => {
+            let resolver = Arc::new(SniResolver::new(Arc::clone(&routes), Arc::clone(&certs)));
+            Some(Arc::new(ramjet_proxy::tls::h1_server_config(resolver)?))
+        }
+        None => None,
+    };
+
     let readiness = Arc::new(AtomicBool::new(false));
     let config = ramjet_engine::engine::Config {
-        http,
+        http: args.http,
+        https,
+        tls,
+        proxy_protocol: args.proxy_protocol,
         admin: args.admin,
         workers: args.worker_threads,
         connect_timeout: args.connect_timeout,
@@ -332,12 +334,14 @@ async fn uring_mode(
     )?;
 
     println!(
-        "ramjet-ingressd {} — engine {}, {} backend(s), {} endpoint(s), {} route(s){}",
+        "ramjet-ingressd {} — engine {}, {} backend(s), {} endpoint(s), {} route(s), \
+         {} certificate(s){}",
         env!("CARGO_PKG_VERSION"),
         args.engine.as_str(),
         summary.backends,
         summary.endpoints,
         summary.routes,
+        summary.certificates,
         if summary.default_backend {
             ", default backend set"
         } else {
@@ -345,7 +349,15 @@ async fn uring_mode(
         }
     );
     println!("  config   {}", path.display());
-    println!("  http     {}", engine.http_addr());
+    for (label, addr) in [
+        ("http    ", engine.http_addr()),
+        ("https   ", engine.https_addr()),
+    ] {
+        match addr {
+            Some(addr) => println!("  {label} {addr}"),
+            None => println!("  {label} disabled"),
+        }
+    }
     match engine.admin_addr() {
         Some(addr) => {
             println!("  admin    {addr}");

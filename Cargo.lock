@@ -2215,11 +2215,19 @@ name = "ramjet-engine"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "bytes",
+ "http",
  "libc",
  "ramjet",
  "ramjet-http",
  "ramjet-proxy",
  "ramjet-router",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

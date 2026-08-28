@@ -27,15 +27,14 @@
 //! runtime, and it is why the container builds take the parent directory as
 //! their context.
 //!
-//! # What v1 does and does not do
+//! # What this engine does and does not do
 //!
-//! This engine is honest about being partial. Everything it refuses, it refuses
-//! loudly with a status code and an explanation, never by quietly doing
-//! something else.
+//! It is honest about what is missing. Everything it refuses, it refuses loudly
+//! with a status code and an explanation, never by quietly doing something else.
 //!
-//! | | v1 |
+//! | | |
 //! |---|---|
-//! | HTTP/1.1 plaintext, both sides | yes |
+//! | HTTP/1.1, both sides | yes |
 //! | Keep-alive, both sides | yes |
 //! | Pipelined requests | yes |
 //! | `Content-Length` bodies, streamed | yes |
@@ -43,12 +42,10 @@
 //! | Routing, load balancing, canary | yes, the same [`ramjet_router`] |
 //! | `X-Forwarded-*`, `X-Request-Id`, hop-by-hop | yes, same semantics |
 //! | Static route file (`--static-routes`) | yes |
-//! | Kubernetes mode | **no** — rejected at startup |
-//! | TLS termination | **no** — 502 |
+//! | TLS termination, SNI, resumption | yes, the same certificate store |
 //! | HTTP/2 (including h2c) | **no** — 502 |
-//! | WebSocket and other upgrades | **no** — 502 |
+//! | HTTP/3 | **no** — the hyper engine's QUIC listener |
 //!
-//! The four "no" rows are the reason this is not the default engine, and
 //! [`limits`] carries the same list at runtime so `--help` and the logs can
 //! print it.
 //!
@@ -82,3 +79,4 @@ pub mod metrics;
 pub mod rng;
 pub mod route;
 pub mod sys;
+pub mod tls;
