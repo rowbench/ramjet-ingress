@@ -88,6 +88,7 @@ pub mod forward;
 pub mod headers;
 pub mod listener;
 pub mod metrics;
+pub mod proxy_protocol;
 pub mod rng;
 pub mod server;
 pub mod tls;
