@@ -14,6 +14,7 @@ file is about running it.
 | `ramjet-controller` | Kubernetes watches, translation, status writeback |
 | `ramjet-engine` | An experimental second data plane on a completion-based reactor |
 | `ramjet-ingressd` | The daemon that wires them together |
+| `ramjet-top` | A terminal cockpit for a running instance ([README](crates/ramjet-top/README.md)) |
 
 ## Build and test
 
@@ -78,6 +79,24 @@ cargo run -p ramjet-ingressd -- --static-routes crates/ramjet-ingressd/examples/
 Listeners default to `:8080` plaintext, `:8443` TLS, and `:10254` admin
 (`/metrics`, `/healthz`, `/readyz`). `--help` lists every option; each one has
 an environment twin, and a flag always beats the environment.
+
+## Watching it live
+
+The admin port reports counters, and the question you usually have is about
+rates. `ramjet-top` polls `/admin/routes`, `/admin/generations` and `/metrics`,
+differences the counters, and draws them:
+
+```sh
+cargo run -p ramjet-top                 # the local admin port
+ramjet-top 10.0.0.5:10254               # somewhere else
+ramjet-top --once                       # one aligned table, for scripts and CI
+```
+
+Routes sortable by rate, error rate or latency; the generation timeline with
+expandable diffs; a red banner whenever a pin is in effect; and the last good
+data kept on screen, dimmed, when the daemon stops answering. Keybindings and
+the reasoning behind the numbers are in
+[crates/ramjet-top/README.md](crates/ramjet-top/README.md).
 
 ## The container image
 
