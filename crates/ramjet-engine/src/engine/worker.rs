@@ -33,6 +33,58 @@
 //! generation does not match the current one is dropped. Without this, a
 //! cancelled read from a connection that ended would be delivered as input to
 //! whoever inherited its number.
+//!
+//! # Draining
+//!
+//! A stop is a flag every core reads at the top of its completion loop. Reading
+//! it once turns the core from serving into draining, and a draining core is
+//! the same state machine with three differences: it accepts nothing, it
+//! finishes what it is already carrying, and it is counting down.
+//!
+//! ```text
+//!   Open ── shutdown flag ──▶ Draining ── count reaches 0 ──▶ teardown, Ok
+//!                                │
+//!                                └──── grace expires ───────▶ teardown, TimedOut
+//! ```
+//!
+//! **Entering.** [`Worker::begin_drain`] closes the listeners and the intake
+//! channels — so the kernel refuses new connections rather than queueing them
+//! behind a pod that is going away — closes the idle pooled upstreams, and then
+//! classifies every connection this core holds, exactly once:
+//!
+//! | What it is | What happens |
+//! |---|---|
+//! | Nothing queued, no request being served | Closed now. An idle keep-alive connection holds nothing. |
+//! | An upgraded tunnel | Closed now. See below. |
+//! | Serving a request, either direction | Kept, counted, and marked `Connection: close`. |
+//! | Flushing a response it has already produced | Kept and counted until the last byte is written. |
+//!
+//! "Serving a request" is [`Phase::Connecting`], [`Phase::Exchanging`] or
+//! [`Phase::Relaying`] — a request that has been routed and whose exchange has
+//! not ended. A request whose body is still arriving is one of those, and so is
+//! a response still streaming out, which is what makes a mid-body request
+//! in-flight in both directions.
+//!
+//! **Counting down.** The count moves in exactly two places: up in
+//! `begin_drain`, and down in [`Worker::close`], which is the one function
+//! through which a connection's descriptor ever leaves this core. Nothing
+//! polls and nothing scans: a connection ends by being closed, and closing is
+//! what decrements. Setting `client_keep_alive = false` is what makes it end —
+//! the response carries `Connection: close`, and `finish_response` puts the
+//! connection into [`Phase::Closing`] rather than back to
+//! [`Phase::Head`] — so the ordinary completion path drains the core without a
+//! second machine beside it.
+//!
+//! **The deadline.** `begin_drain` records one, and the helper's tick is what
+//! checks it. Past it the core stops waiting, tears down whatever is left, and
+//! `run` returns `TimedOut` — the same outcome, with the same message, that
+//! `ramjet_proxy::Server::run` reports.
+//!
+//! **Tunnels are excluded, deliberately.** Once a connection has been upgraded
+//! there is no request boundary left to finish at, and a WebSocket can
+//! legitimately stay open for hours; waiting for one would stall every rolling
+//! update until the deadline and then kill it anyway. This is the same decision
+//! the hyper engine makes, arrived at the same way.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -42,7 +94,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ramjet::reactor::{Completion, Driver, Op, PlatformDriver};
-use ramjet_router::{RouteTable, SharedRouteTable};
+use ramjet_router::{BackendProtocol, RouteTable, SharedRouteTable};
 
 use crate::codec::{
     self, parse_request_head, parse_response_head, ChunkScan, CodecError, Framing, Head, StartLine,
@@ -103,6 +155,9 @@ mod kind {
 struct MirrorCopy {
     parts: http::request::Parts,
     body: Vec<u8>,
+    /// What the *mirror* backend declared, which need not be what the primary
+    /// speaks: the copy is sent by the tokio-side worker, which can dial either.
+    protocol: ramjet_router::BackendProtocol,
     /// The body went past `--mirror-max-body`, so there will be no copy.
     ///
     /// Kept as a flag rather than dropping the whole `MirrorCopy`, because a
@@ -358,6 +413,15 @@ struct Conn {
     /// Set once the response has been counted, so a connection that fails after
     /// its response is not counted twice.
     counted: bool,
+    /// This connection is one the drain is waiting for.
+    ///
+    /// Set by [`Worker::begin_drain`] and cleared by [`Worker::close`], which
+    /// is what makes the countdown exact: the flag and the worker's counter are
+    /// set and cleared together, in those two places and nowhere else.
+    /// Deliberately **not** cleared by [`Conn::reset`] — a drained connection
+    /// resets when its response completes, and is still the one the drain is
+    /// waiting on until it is actually closed.
+    drain_counted: bool,
 }
 
 impl Conn {
@@ -410,6 +474,7 @@ impl Conn {
             dispatched_at: None,
             deadline: None,
             counted: false,
+            drain_counted: false,
         }
     }
 
@@ -504,6 +569,12 @@ struct AdminConn {
     head: Head,
     reading: bool,
     writing: bool,
+    /// This connection is one the drain is waiting for; see [`Conn`]'s.
+    ///
+    /// An admin connection can be mid-answer when a stop arrives, and a
+    /// truncated `/metrics` scrape at shutdown is how a monitoring gap gets
+    /// blamed on the scraper.
+    drain_counted: bool,
 }
 
 /// One serving core.
@@ -530,6 +601,16 @@ pub(crate) struct Worker {
     generations: Vec<u32>,
     high_water: usize,
     pool: Pool,
+
+    /// When the drain must be over, once one has started. `None` while serving.
+    ///
+    /// Doubles as the drain flag: `Some` means the listeners are already shut
+    /// and nothing new will be accepted. See the module documentation.
+    drain_deadline: Option<Instant>,
+    /// Connections the drain is still waiting for.
+    drain_inflight: usize,
+    /// The deadline passed with connections still open, so `run` reports it.
+    drain_expired: bool,
 
     /// `--max-buf-size`, clamped, resolved once rather than read through the
     /// `Arc<Config>` on every read.
@@ -573,6 +654,9 @@ impl Worker {
             slots: Vec::new(),
             generations: Vec::new(),
             high_water: 0,
+            drain_deadline: None,
+            drain_inflight: 0,
+            drain_expired: false,
             read_bufs: Vec::new(),
             write_bufs: Vec::new(),
             done: Vec::new(),
@@ -580,7 +664,10 @@ impl Worker {
         })
     }
 
-    /// Drive this core until shutdown.
+    /// Drive this core until shutdown, then drain what it is still serving.
+    ///
+    /// Returns `TimedOut` where the grace period ran out with connections still
+    /// open; see the module documentation for what the drain does.
     pub(crate) fn run(&mut self) -> io::Result<()> {
         self.arm_notify()?;
         for index in 0..self.intakes.len() {
@@ -604,7 +691,16 @@ impl Worker {
         }
 
         let mut done = std::mem::take(&mut self.done);
-        while !self.shutdown.load(Ordering::Relaxed) {
+        loop {
+            // Read once per turn round the loop, and only until it has been
+            // acted on: after that the drain's own state says what to do, and
+            // re-reading it would restart a drain that is already running.
+            if self.drain_deadline.is_none() && self.shutdown.load(Ordering::Relaxed) {
+                self.begin_drain()?;
+            }
+            if self.drain_deadline.is_some() && (self.drain_inflight == 0 || self.drain_expired) {
+                break;
+            }
             self.driver.wait(&mut done)?;
             if done.is_empty() {
                 // Nothing in flight at all. The notify pipe is always armed, so
@@ -618,6 +714,16 @@ impl Worker {
         }
         self.done = done;
         self.teardown();
+        if self.drain_expired {
+            // The same error, with the same message, the hyper engine reports:
+            // `ramjet-ingressd` treats a drain that ran out of time as an
+            // outcome rather than a crash, and it can only do that if both
+            // engines say so the same way.
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "shutdown grace period expired with connections still open",
+            ));
+        }
         Ok(())
     }
 
@@ -723,7 +829,20 @@ impl Worker {
     }
 
     /// Close a descriptor through the reactor and forget everything about it.
+    ///
+    /// Every client and admin connection this core holds leaves through here,
+    /// which is what lets the drain's countdown be exact rather than a sweep:
+    /// a connection the drain was waiting for is one closing away from being
+    /// one it is not.
     fn close(&mut self, fd: RawFd) {
+        let counted = match self.slot(fd) {
+            Slot::Client(conn) => std::mem::replace(&mut conn.drain_counted, false),
+            Slot::Admin(conn) => std::mem::replace(&mut conn.drain_counted, false),
+            _ => false,
+        };
+        if counted {
+            self.drain_inflight = self.drain_inflight.saturating_sub(1);
+        }
         self.bump_generation(fd);
         *self.slot(fd) = Slot::Empty;
         let generation = self.generation(fd);
@@ -747,6 +866,19 @@ impl Worker {
         if k != kind::CLOSE && tag_generation(c.user) != self.generation(fd) {
             if let Some(buf) = c.buf {
                 self.recycle_read(buf);
+            }
+            // An accept that raced its own listener's close still produced a
+            // connection, and dropping the completion would leak the
+            // descriptor rather than refuse the client. This is the drain's
+            // race: the listener is shut at the instant a connection was being
+            // taken off its queue.
+            if let (kind::ACCEPT | kind::ACCEPT_TLS | kind::ADMIN_ACCEPT, Ok(accepted)) =
+                (k, &c.result)
+            {
+                // SAFETY: the accept produced this descriptor and nothing has
+                // been submitted for it — the completion it arrived on is being
+                // dropped here.
+                unsafe { sys::close(*accepted as RawFd) };
             }
             return Ok(());
         }
@@ -793,6 +925,18 @@ impl Worker {
             }
         };
 
+        // A drain has shut this listener, so there is neither anything to
+        // re-arm nor anywhere to serve what arrived. Re-arming would be worse
+        // than useless: the descriptor number may already belong to something
+        // else.
+        if self.drain_deadline.is_some() {
+            if let Some(fd) = accepted {
+                // SAFETY: nothing has been submitted for this descriptor.
+                unsafe { sys::close(fd) };
+            }
+            return Ok(());
+        }
+
         self.arm_accept(listener, role.accept_kind())?;
 
         let Some(fd) = accepted else { return Ok(()) };
@@ -825,6 +969,16 @@ impl Worker {
                     }
                 }
                 self.recycle_read(buf);
+                if self.drain_deadline.is_some() {
+                    // Dealt out by the acceptor thread in the moment between
+                    // the stop and its own next poll. There is nowhere to serve
+                    // them, and closing is what tells the client so.
+                    for accepted in ready {
+                        // SAFETY: nothing has been submitted for these.
+                        unsafe { sys::close(accepted) };
+                    }
+                    return Ok(());
+                }
                 for accepted in ready {
                     self.start_client(accepted, tls)?;
                 }
@@ -1341,6 +1495,21 @@ impl Worker {
         conn.route_stats = matched.route;
         conn.canaried = matched.canaried;
 
+        // This engine dials HTTP/1.1 and nothing else, so a backend that needs
+        // an HTTP/2 upstream is refused rather than quietly dialled with the
+        // wrong protocol. Downgrading it silently is the precise failure the
+        // backend-protocol annotation exists to remove, and doing it here
+        // would put that failure back one engine flag away.
+        //
+        // Checked before the gRPC test below because it is the more specific
+        // answer: a gRPC request to a correctly annotated backend is not a
+        // misconfiguration to fix on the Ingress, it is this engine's gap.
+        if backend.protocol() == BackendProtocol::H2c {
+            *self.slot(fd) = Slot::Client(conn);
+            self.fail(fd, 502, limits::NO_H2C_UPSTREAM, false);
+            return Ok(());
+        }
+
         // Checked after routing, exactly as the hyper engine does, so an
         // unrouted gRPC request is a 404 rather than a 502.
         if headers::is_grpc(&conn.head, &conn.inbox) {
@@ -1737,11 +1906,12 @@ impl Worker {
     ///
     /// # Shutdown
     ///
-    /// A tunnel does not hold shutdown open, for the same reason nothing else
-    /// on this engine does: a stop is a flag every core reads on its next tick,
-    /// and `teardown` closes whatever is still open. There is no drain to
-    /// exclude a tunnel from, which is the same end state the hyper engine
-    /// arrives at by excluding it explicitly.
+    /// A tunnel does not hold the drain open. Once a 101 has crossed this hop
+    /// there is no request boundary left to finish at and no bound on how long
+    /// the two ends will keep talking, so `begin_drain` closes tunnels at the
+    /// start rather than waiting out the grace period for something that was
+    /// never going to end inside it. The hyper engine excludes them from its
+    /// own drain for exactly this reason.
     fn begin_tunnel(&mut self, fd: RawFd) -> io::Result<()> {
         let Slot::Client(mut conn) = std::mem::replace(self.slot(fd), Slot::Taken) else {
             *self.slot(fd) = Slot::Empty;
@@ -2152,6 +2322,7 @@ impl Worker {
         conn.mirror = Some(MirrorCopy {
             parts,
             body: Vec::new(),
+            protocol: backend.protocol(),
             too_large: false,
         });
     }
@@ -2187,7 +2358,7 @@ impl Worker {
             lane.skipped();
             return;
         }
-        lane.enqueue(copy.parts, bytes::Bytes::from(copy.body));
+        lane.enqueue(copy.parts, bytes::Bytes::from(copy.body), copy.protocol);
     }
 
     // ---- per-route accounting ----------------------------------------------
@@ -2475,6 +2646,16 @@ impl Worker {
     fn on_tick(&mut self) -> io::Result<()> {
         let now = Instant::now();
 
+        // The drain's clock. It lives here because the tick is the only thing
+        // this reactor has that fires without a peer doing something, and a
+        // deadline that depended on traffic to be noticed would not be one.
+        if let Some(deadline) = self.drain_deadline {
+            if self.drain_inflight > 0 && now >= deadline {
+                self.drain_expired = true;
+                return Ok(());
+            }
+        }
+
         let mut expired = std::mem::take(&mut self.scratch);
         expired.clear();
         self.pool.expire(now, &mut expired);
@@ -2539,6 +2720,7 @@ impl Worker {
             head: Head::default(),
             reading: false,
             writing: false,
+            drain_counted: false,
         }));
         self.drive_admin(fd)
     }
@@ -2680,14 +2862,124 @@ impl Worker {
 
     // ---- shutdown -----------------------------------------------------------
 
+    /// Stop accepting, close what is not serving anything, and start counting.
+    ///
+    /// Runs once per core, at the top of the completion loop, on the turn that
+    /// first sees the stop flag. The module documentation has the table this
+    /// implements and the reasoning behind it; what is worth saying here is the
+    /// ordering, which is not incidental:
+    ///
+    /// 1. **The listeners go first.** Until they are shut, every microsecond
+    ///    spent classifying connections is a microsecond in which another one
+    ///    arrives — and a connection accepted by a pod that is going away is
+    ///    the exact failure a drain exists to prevent. Their descriptors are
+    ///    taken rather than merely closed, so `teardown` cannot close them a
+    ///    second time after the numbers have been handed out again.
+    /// 2. **Then the idle upstreams**, which hold nothing and would otherwise
+    ///    sit in the pool until the process ended.
+    /// 3. **Then the connections**, each classified exactly once. A second pass
+    ///    over the same connection would count it twice and the drain would
+    ///    never reach zero.
+    fn begin_drain(&mut self) -> io::Result<()> {
+        self.drain_deadline = Some(Instant::now() + self.config.shutdown_grace);
+
+        let intakes: Vec<RawFd> = std::mem::take(&mut self.intakes)
+            .iter()
+            .map(Intake::fd)
+            .collect();
+        for fd in intakes {
+            self.close(fd);
+        }
+        self.intake_partial.clear();
+        if let Some(fd) = self.admin.take() {
+            self.close(fd);
+        }
+
+        if !self.pool.is_empty() {
+            let mut idle = std::mem::take(&mut self.scratch);
+            idle.clear();
+            self.pool.drain(&mut idle);
+            for fd in idle.drain(..) {
+                self.close(fd);
+            }
+            self.scratch = idle;
+        }
+
+        for i in 0..self.high_water {
+            let fd = i as RawFd;
+            match self.slots.get(i) {
+                Some(Slot::Client(_)) => self.drain_client(fd),
+                Some(Slot::Admin(_)) => self.drain_admin(fd),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Decide what one client connection does with the drain, and act on it.
+    fn drain_client(&mut self, fd: RawFd) {
+        let Slot::Client(conn) = self.slot(fd) else {
+            return;
+        };
+        // Whether this connection is carrying anything a client is waiting for.
+        // A response already produced but not yet written counts: the bytes are
+        // an answer somebody asked for, and closing under them is the truncated
+        // response a drain is meant to avoid.
+        let serving = matches!(
+            conn.phase,
+            Phase::Connecting | Phase::Exchanging | Phase::Relaying
+        ) || conn.writing
+            || has_pending_out(conn);
+        // A tunnel is excluded whatever it is carrying; see the module docs.
+        let keep = serving && conn.phase != Phase::Tunnel;
+
+        if !keep {
+            self.metrics.core(self.core).connection_closed();
+            self.close(fd);
+            return;
+        }
+
+        // The connection ends with this exchange rather than waiting for
+        // another request on it. Everything that follows from that is already
+        // written: the response head carries `Connection: close`, and
+        // `finish_response` reads the same flag to decide that the connection
+        // is finished rather than ready.
+        conn.client_keep_alive = false;
+        if conn.phase == Phase::Head {
+            // Nothing more will be read, but there are bytes still to write.
+            conn.phase = Phase::Closing;
+        }
+        conn.drain_counted = true;
+        self.drain_inflight += 1;
+    }
+
+    /// The same decision for an admin connection, which has no phase to read.
+    fn drain_admin(&mut self, fd: RawFd) {
+        let Slot::Admin(conn) = self.slot(fd) else {
+            return;
+        };
+        if conn.writing || !conn.outbox.is_empty() {
+            conn.drain_counted = true;
+            self.drain_inflight += 1;
+            return;
+        }
+        // Waiting for a request that will not be answered now.
+        self.close(fd);
+    }
+
     /// Close everything and drain what that cancelled.
+    ///
+    /// This is the end of the core, not the graceful part: whatever is still
+    /// open here is either a connection the grace period could not save or one
+    /// nothing was waiting on. [`Worker::begin_drain`] is the graceful part.
     ///
     /// The order is not incidental. `wait` blocks while *anything* is in
     /// flight, and this core always has at least two operations parked that
     /// nothing external will ever complete: the read on the notify pipe and the
     /// accept on the listener. Closing the connections and then waiting would
     /// therefore block for ever — which it did, until those two were added to
-    /// the list.
+    /// the list. The listeners are usually gone by now, taken by the drain; the
+    /// loop below is empty in that case rather than closing them twice.
     fn teardown(&mut self) {
         if !self.pool.is_empty() {
             let mut idle = std::mem::take(&mut self.scratch);

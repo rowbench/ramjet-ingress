@@ -27,8 +27,18 @@ pub const UPSTREAM_FAILED: &[u8] = b"502 Bad Gateway: the upstream connection fa
 pub const TIMEOUT: &[u8] = b"504 Gateway Timeout: the upstream sent no response headers in time\n";
 
 /// gRPC needs an HTTP/2 upstream, which ramjet does not speak in either engine.
-pub const GRPC: &[u8] =
-    b"502 Bad Gateway: gRPC upstreams require HTTP/2, which ramjet does not yet speak upstream\n";
+pub const GRPC: &[u8] = b"502 Bad Gateway: gRPC requires an HTTP/2 backend; \
+set nginx.ingress.kubernetes.io/backend-protocol: GRPC on the Ingress\n";
+
+/// A backend annotated `backend-protocol: GRPC`, reached on the uring engine.
+///
+/// Distinct from [`GRPC`], and the distinction is the whole point. `GRPC` means
+/// the operator has not told us the backend speaks HTTP/2 and should add the
+/// annotation. This means they have, and it is *this engine* that cannot dial
+/// it — a different problem with a different fix, so it gets a different
+/// sentence rather than a shared vague one.
+pub const NO_H2C_UPSTREAM: &[u8] =
+    b"502 Bad Gateway: this backend needs an HTTP/2 upstream, which the uring engine does not dial; use --engine hyper\n";
 
 /// An upstream switched protocols nobody asked it to.
 ///
@@ -102,7 +112,7 @@ pub fn write_static_head_only(out: &mut Vec<u8>, status: u16, body_len: usize, c
 pub const V1_LIMITS: &str = "\
 the uring engine serves HTTP/1.1, with TLS, and does not speak:
   - HTTP/2, in any form, including h2c with prior knowledge (502)
-  - gRPC, which needs HTTP/2 upstream, as on the hyper engine (502)
+  - HTTP/2 upstreams (backend-protocol: GRPC), and so gRPC (502)
   - HTTP/3, which stays on the hyper engine's QUIC listener";
 
 #[cfg(test)]
@@ -120,6 +130,7 @@ mod tests {
             UPSTREAM_FAILED,
             TIMEOUT,
             GRPC,
+            NO_H2C_UPSTREAM,
             UPGRADE_FAILED,
             NO_HTTP2,
         ] {
@@ -150,6 +161,16 @@ mod tests {
         assert_eq!(
             UPSTREAM_FAILED,
             b"502 Bad Gateway: the upstream connection failed\n"
+        );
+        // GRPC is asserted here because it is the one that *did* drift: the
+        // hyper engine's wording changed when backend-protocol landed and this
+        // copy did not follow, so for a while the two engines told a client
+        // different things about the same misconfiguration. A differential test
+        // with a hole in it is how that happens quietly.
+        assert_eq!(
+            GRPC,
+            b"502 Bad Gateway: gRPC requires an HTTP/2 backend; \
+set nginx.ingress.kubernetes.io/backend-protocol: GRPC on the Ingress\n"
         );
         assert_eq!(
             TIMEOUT,

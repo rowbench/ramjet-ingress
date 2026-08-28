@@ -92,6 +92,16 @@ pub enum Behaviour {
     EchoThenDieOnNext { body: Vec<u8> },
     /// Answer with a chunked body made of these pieces.
     Chunked(Vec<Vec<u8>>),
+    /// Answer with a chunked body whose pieces are spaced out in time.
+    ///
+    /// The response a drain has to carry to the end: by the time the signal
+    /// arrives the head has long since been relayed and the body is still
+    /// coming, so the connection is in flight in a way no request-shaped test
+    /// reaches.
+    SlowChunked {
+        pieces: Vec<Vec<u8>>,
+        gap: Duration,
+    },
     /// Accept an upgrade with a 101, then echo every byte back verbatim.
     ///
     /// Not a WebSocket implementation: the point of passthrough is that the
@@ -284,6 +294,29 @@ fn serve(mut stream: TcpStream, behaviour: Behaviour, seen: Arc<Seen>, stop: Arc
                 }
                 out.extend_from_slice(b"0\r\n\r\n");
                 out
+            }
+            Behaviour::SlowChunked { pieces, gap } => {
+                let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+                if stream.write_all(head).is_err() {
+                    return;
+                }
+                let _ = stream.flush();
+                for piece in pieces {
+                    thread::sleep(*gap);
+                    let mut frame = format!("{:x}\r\n", piece.len()).into_bytes();
+                    frame.extend_from_slice(piece);
+                    frame.extend_from_slice(b"\r\n");
+                    if stream.write_all(&frame).is_err() {
+                        return;
+                    }
+                    let _ = stream.flush();
+                }
+                if stream.write_all(b"0\r\n\r\n").is_err() {
+                    return;
+                }
+                let _ = stream.flush();
+                served += 1;
+                continue;
             }
             Behaviour::RefuseUpgrade => {
                 let body = b"not switching";
@@ -807,6 +840,35 @@ impl Proxy {
         self.tls_addr.expect("a TLS listener")
     }
 
+    /// Ask the engine to drain, without waiting for it.
+    ///
+    /// The signal and the wait are separate so a test can hold a request open
+    /// across the signal, which is the only way to observe a drain at all: a
+    /// test that signalled and waited in one call would never see the middle.
+    pub fn signal_shutdown(&self) {
+        self.shutdown.stop();
+    }
+
+    /// Wait for the engine to finish draining, and report how it went.
+    ///
+    /// `TimedOut` means the grace period expired with connections still open,
+    /// which is an outcome rather than a failure — see the engine's `run`.
+    pub fn wait(&mut self) -> std::io::Result<()> {
+        match self.handle.take() {
+            Some(handle) => handle.join().unwrap_or_else(|_| {
+                Err(std::io::Error::other("a serving core panicked"))
+            }),
+            // Already waited for; the outcome was reported the first time.
+            None => Ok(()),
+        }
+    }
+
+    /// Signal and wait, for a test with nothing to hold open in between.
+    pub fn shutdown(&mut self) -> std::io::Result<()> {
+        self.signal_shutdown();
+        self.wait()
+    }
+
     /// Scrape the admin listener.
     pub fn admin(&self, path: &str) -> Response {
         let admin = self.admin.expect("an admin listener");
@@ -1012,6 +1074,28 @@ pub fn https_get(addr: SocketAddr, host: &str, path: &str) -> Response {
 // ------------------------------------------------------------------- tables
 
 /// A table with one host and one path, pointing at these endpoints.
+/// A table whose single backend is annotated as speaking h2c.
+///
+/// The uring engine cannot dial one, so this exists to prove it says so rather
+/// than dialling HTTP/1.1 at it and hoping.
+pub fn h2c_table_for(host: &str, endpoints: &[SocketAddr]) -> RouteTable {
+    let mut builder = RouteTableBuilder::new();
+    builder
+        .backend_with(
+            "app",
+            endpoints.iter().copied().map(Endpoint::new).collect(),
+            &ramjet_router::BackendOptions {
+                policy: LbPolicy::RoundRobin,
+                protocol: ramjet_router::BackendProtocol::H2c,
+            },
+        )
+        .expect("a valid h2c backend");
+    builder
+        .route(Some(host), "/", PathType::Prefix, "app")
+        .expect("a valid route");
+    builder.build().expect("a valid table")
+}
+
 pub fn table_for(host: &str, endpoints: &[SocketAddr]) -> RouteTable {
     let mut builder = RouteTableBuilder::new();
     builder

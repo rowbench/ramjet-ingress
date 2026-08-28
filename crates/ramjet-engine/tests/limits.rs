@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{echo, get_with, table_for, Client, Proxy};
+use common::{echo, get, get_with, h2c_table_for, table_for, Client, Proxy};
 
 #[test]
 fn an_upgrade_request_is_forwarded_rather_than_refused() {
@@ -194,5 +194,79 @@ fn the_engine_keeps_serving_after_every_refusal() {
         common::get(proxy.addr, "/", "app.example.com").status,
         200,
         "the engine stopped serving after a refusal"
+    );
+}
+
+#[test]
+fn an_h2c_backend_is_refused_rather_than_dialled_as_http_1() {
+    // The failure this prevents is not a 502, it is a 200. Dialling HTTP/1.1 at
+    // a backend annotated `backend-protocol: GRPC` is exactly what that
+    // annotation exists to stop, and doing it silently here would put the bug
+    // back one engine flag away from the fix.
+    let upstream = echo();
+    let proxy = Proxy::start(h2c_table_for("app.example.com", &[upstream.addr]));
+
+    let response = get(proxy.addr, "/", "app.example.com");
+
+    assert_eq!(response.status, 502);
+    assert!(
+        response.text().contains("--engine hyper"),
+        "the refusal must name where it does work: {}",
+        response.text()
+    );
+    assert_eq!(
+        upstream.seen.requests(),
+        0,
+        "nothing may reach an h2c backend from this engine"
+    );
+}
+
+#[test]
+fn an_h2c_backend_is_refused_whatever_the_request_looks_like() {
+    // The backend's protocol decides this, not the content type. A plain GET to
+    // an h2c backend is just as undialable as a gRPC POST.
+    let upstream = echo();
+    let proxy = Proxy::start(h2c_table_for("app.example.com", &[upstream.addr]));
+    let mut client = Client::connect(proxy.addr);
+
+    let grpc = client.send(
+        b"POST /svc/Method HTTP/1.1\r\nHost: app.example.com\r\n\
+          Content-Type: application/grpc\r\nContent-Length: 0\r\n\r\n",
+    );
+
+    assert_eq!(grpc.status, 502);
+    assert!(
+        grpc.text().contains("HTTP/2 upstream"),
+        "a gRPC request to a correctly annotated backend is this engine's gap, \
+         not a misconfiguration to fix on the Ingress: {}",
+        grpc.text()
+    );
+}
+
+#[test]
+fn grpc_to_an_http1_backend_still_points_at_the_annotation() {
+    // The other half of the distinction. Here the operator *has not* said the
+    // backend speaks HTTP/2, so the useful answer is the annotation to add —
+    // and it must be the hyper engine's wording, byte for byte.
+    let upstream = echo();
+    let proxy = Proxy::start(table_for("app.example.com", &[upstream.addr]));
+    let mut client = Client::connect(proxy.addr);
+
+    let response = client.send(
+        b"POST /svc/Method HTTP/1.1\r\nHost: app.example.com\r\n\
+          Content-Type: application/grpc\r\nContent-Length: 0\r\n\r\n",
+    );
+
+    assert_eq!(response.status, 502);
+    assert!(
+        response.text().contains("backend-protocol: GRPC"),
+        "{}",
+        response.text()
+    );
+    assert!(
+        !response.text().contains("--engine hyper"),
+        "this one is fixable on the Ingress, so it must not send the operator \
+         to the other engine: {}",
+        response.text()
     );
 }
