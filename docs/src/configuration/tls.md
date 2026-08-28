@@ -145,7 +145,10 @@ certificates arrive over a watch, after the socket.
 - **`--engine uring` does not terminate TLS.** It answers 502 and names the
   other engine. If the configuration declares certificates, it says so at
   startup.
-- **There is no TLS to the upstream.** Upstream is plaintext HTTP/1.1.
+- **There is no TLS to the upstream.** The upstream side speaks HTTP/1.1, or
+  cleartext HTTP/2 for a backend annotated
+  [`backend-protocol: GRPC`](./annotations.md#backend-protocol) — and both are
+  cleartext, which is why `GRPCS` and `HTTPS` are reported and not honoured.
 - **HTTP/3 shares this listener's certificates exactly** — the same SNI
   resolution, the same store, the same rotation, reaching both transports at the
   same instant because it is the same two pointer stores in the same order. See

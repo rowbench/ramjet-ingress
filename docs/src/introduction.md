@@ -80,13 +80,13 @@ way.
 |---|---|---|
 | Runtime | hyper on tokio | the `ramjet` reactor: io_uring on Linux, kqueue elsewhere |
 | HTTP/1.1 plaintext | yes | yes |
-| TLS termination | yes | no (502) |
-| HTTP/2 downstream | h2 downstream | no (502) |
+| TLS termination | yes | yes, the same resolver |
+| HTTP/2 downstream | yes | by dispatch to a hyper lane in the same process |
 | gRPC and HTTP/2 upstreams | yes, via `backend-protocol: GRPC` | no (502) |
-| WebSocket and upgrades | yes | no (502) |
+| WebSocket and upgrades | yes | yes, passthrough |
 | HTTP/3 over QUIC (`--http3`) | experimental, off by default | no; refused at startup |
-| PROXY protocol (`--proxy-protocol`) | v1 and v2 | no; refused at startup |
-| Kubernetes mode | yes | no; static routes only |
+| PROXY protocol (`--proxy-protocol`) | v1 and v2 | v1 and v2, the same parser |
+| Kubernetes mode | yes | yes |
 | Status | measured against nginx | experimental |
 
 `uring` exists to answer one question. Profiling measured where a request goes
