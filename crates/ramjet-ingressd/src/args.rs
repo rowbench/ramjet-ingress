@@ -297,8 +297,8 @@ HTTP/3 (EXPERIMENTAL):
     so it is not the path to put peak traffic on yet.
 
     No 0-RTT, no QUIC upstream (upstream stays HTTP/1.1), no protocol upgrades,
-    and no PROXY protocol, which has no UDP form. Requires --https and refuses
-    --engine uring.
+    and no PROXY protocol, which has no UDP form. Requires --https, and refuses
+    --engine uring, which speaks no HTTP/2 and so no HTTP/3 either.
 
 BEHIND A LOAD BALANCER:
     --proxy-protocol          Require a PROXY protocol header (v1 or v2) on the
@@ -345,13 +345,17 @@ SERVING:
                               write buffers, and so on the request head this
                               replica will accept    [default: 65536, min 8192]
 
-    `uring` is experimental. It serves HTTP/1.1 plaintext on the ramjet reactor
-    — io_uring on Linux, kqueue elsewhere — to find out whether batched
-    submission gets under the syscall floor the hyper engine measured. It has no
-    TLS, no HTTP/2, no protocol upgrades and no Kubernetes mode, and refuses
-    each of those with a status and an explanation rather than silently doing
-    something else. Everything about routing, load balancing, canaries, headers
-    and /metrics is the same on both.
+    `uring` serves HTTP/1.1 on the ramjet reactor — io_uring on Linux, kqueue
+    elsewhere — to find out whether batched submission gets under the syscall
+    floor the hyper engine measured. It terminates TLS, carries WebSocket and
+    other upgrades, reads the PROXY protocol, and runs in Kubernetes mode, all
+    against the same certificate store and route table the hyper engine reads.
+    What it does not speak is HTTP/2 in any form, and so neither gRPC nor
+    HTTP/3; it refuses those with a status and an explanation rather than
+    silently doing something else. Everything about routing, load balancing,
+    canaries, mirroring, headers and /metrics is the same on both, and a
+    differential test drives the two with identical traffic to keep it that
+    way.
 
     Each runtime owns its connections, its upstream connection pool, and its
     timers, and a connection stays on the one it landed on. Setting this above
@@ -585,14 +589,13 @@ impl Args {
     /// Options that are individually valid and jointly impossible.
     fn check_conflicts(&self) -> Result<(), ArgError> {
         if self.http3 && self.engine == Engine::Uring {
-            // Refused rather than ignored, for the same reason --proxy-protocol
-            // is: the uring engine has no QUIC and no TLS, so honouring the
-            // flag would mean binding nothing and advertising nothing, and the
-            // operator would find out from a client that quietly stayed on
-            // TCP forever.
+            // Refused rather than ignored. HTTP/3 is HTTP/2's semantics over
+            // QUIC, and this engine speaks neither; honouring the flag would
+            // mean binding nothing and advertising nothing, and the operator
+            // would find out from a client that quietly stayed on TCP forever.
             return Err(ArgError::Conflict(
-                "--http3 is not implemented on --engine uring, which has no TLS \
-                 and no QUIC; use --engine hyper"
+                "--http3 is not implemented on --engine uring, which speaks no \
+                 HTTP/2 and so no HTTP/3; use --engine hyper"
                     .to_owned(),
             ));
         }

@@ -104,11 +104,11 @@ pub use history::{
     CertKeys, GenerationHistory, GenerationRecord, PinChange, PinError, DEFAULT_HISTORY_SIZE,
 };
 pub use listener::{Listener, ListenerConfig};
-pub use metrics::Metrics;
+pub use metrics::{Exposition, Metrics};
 pub use mirror::{Mirror, DEFAULT_MIRROR_MAX_BODY, MIRROR_QUEUE_DEPTH};
 pub use server::{
-    serve, ProxyConfig, Server, Shutdown, ShutdownHandle, DEFAULT_ADMIN_PORT, DEFAULT_HTTP_PORT,
-    DEFAULT_HTTPS_PORT, DEFAULT_MAX_BUF_SIZE, MIN_MAX_BUF_SIZE,
+    serve, serve_admin_only, ProxyConfig, Server, Shutdown, ShutdownHandle, DEFAULT_ADMIN_PORT,
+    DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT, DEFAULT_MAX_BUF_SIZE, MIN_MAX_BUF_SIZE,
 };
 pub use tls::{CertStore, SniResolver};
 pub use upstream::{

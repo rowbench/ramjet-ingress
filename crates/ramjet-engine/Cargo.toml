@@ -37,4 +37,6 @@ tracing = { workspace = true }
 rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
+# The opaque diff a generation record carries; only the tests build one.
+serde_json = "1.0"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

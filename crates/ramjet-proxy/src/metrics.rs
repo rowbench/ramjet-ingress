@@ -34,6 +34,31 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Anything that can render a `/metrics` body.
+///
+/// The admin listener serves whichever data plane is running, and there are two
+/// of them: this crate's counters and `ramjet_engine`'s per-core blocks. They
+/// produce byte-identical output for the same events — a differential test
+/// pins that — but they are different types with different insides, and the
+/// admin listener has no business knowing which one it is talking to.
+///
+/// One method, because that is genuinely all the admin listener needs from
+/// either.
+pub trait Exposition: std::fmt::Debug + Send + Sync {
+    /// The Prometheus text exposition for the current counter values.
+    ///
+    /// `generation` and `pinned` are read at scrape time from the route table
+    /// and the generation history, rather than mirrored into the counters on
+    /// every publish.
+    fn render_prometheus(&self, generation: u64, pinned: bool) -> String;
+}
+
+impl Exposition for Metrics {
+    fn render_prometheus(&self, generation: u64, pinned: bool) -> String {
+        Metrics::render_prometheus(self, generation, pinned)
+    }
+}
+
 /// Upper bounds, in seconds, of the upstream latency histogram.
 ///
 /// Chosen around the shape of ingress traffic rather than as round numbers: the

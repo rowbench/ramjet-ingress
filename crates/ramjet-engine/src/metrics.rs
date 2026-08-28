@@ -346,6 +346,18 @@ impl EngineMetrics {
     }
 }
 
+/// The admin listener reads whichever engine is serving through this.
+///
+/// In Kubernetes mode the uring lane leaves its own admin listener unbound and
+/// `ramjet_proxy::serve_admin_only` answers instead, because that is where
+/// `/admin/generations` and `/admin/routes` live. This is the one thing that
+/// listener needs from this engine.
+impl ramjet_proxy::Exposition for EngineMetrics {
+    fn render_prometheus(&self, generation: u64, pinned: bool) -> String {
+        EngineMetrics::render_prometheus(self, generation, pinned)
+    }
+}
+
 fn gauge(out: &mut String, name: &str, help: &str, value: i64) {
     use std::fmt::Write as _;
     let _ = writeln!(out, "# HELP {name} {help}");

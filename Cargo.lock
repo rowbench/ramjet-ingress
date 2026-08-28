@@ -2226,6 +2226,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
+ "serde_json",
  "tokio",
  "tracing",
 ]

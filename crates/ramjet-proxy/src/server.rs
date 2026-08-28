@@ -377,7 +377,7 @@ impl Server {
             config.history_size,
         ));
         let admin_state = Arc::new(AdminState {
-            metrics: Arc::clone(&metrics),
+            metrics: Arc::clone(&metrics) as Arc<dyn crate::metrics::Exposition>,
             routes: Arc::clone(&routes),
             readiness: readiness.clone(),
             history: Arc::clone(&history),
@@ -984,6 +984,51 @@ async fn accept(listener: Option<&Listener>) -> io::Result<(TcpStream, SocketAdd
         Some(listener) => listener.accept().await,
         None => std::future::pending().await,
     }
+}
+
+/// Serve the admin listener, and nothing else, until `shutdown` fires.
+///
+/// For a data plane that is not this crate's. `ramjet_engine` serves traffic on
+/// its own reactor and has an admin listener of its own for the probes and
+/// `/metrics`, but nothing there can answer `/admin/generations` or
+/// `/admin/routes` — those read a [`GenerationHistory`](crate::GenerationHistory)
+/// and a route table, which are exactly the shared state the two engines
+/// already hold in common. So in Kubernetes mode the uring lane leaves its own
+/// admin listener unbound and runs this instead.
+///
+/// It is a tokio task in front of a reactor-based data plane, which sounds
+/// worse than it is: a scrape every fifteen seconds and a rollback once a
+/// quarter is not traffic, and the alternative is a second implementation of
+/// the generation API against the same JSON.
+/// The listener is taken already bound so the caller can read the port the
+/// kernel chose before any traffic is served, which is what a test needs.
+pub async fn serve_admin_only(
+    listener: Listener,
+    state: Arc<AdminState>,
+    mut shutdown: Shutdown,
+) -> io::Result<()> {
+    let builder = connection_builder(DEFAULT_MAX_BUF_SIZE);
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.recv() => break,
+            result = listener.accept() => match result {
+                Ok((stream, _)) => serve_admin(
+                    Arc::clone(&builder),
+                    graceful.watcher(),
+                    Arc::clone(&state),
+                    stream,
+                ),
+                Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
+            },
+        }
+    }
+
+    drop(listener);
+    graceful.shutdown().await;
+    Ok(())
 }
 
 fn serve_admin(

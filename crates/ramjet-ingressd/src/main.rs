@@ -142,18 +142,7 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         (Some(path), Engine::Hyper) => dev_mode(&args, &path).await,
         (Some(path), Engine::Uring) => uring_mode(&args, &path).await,
         (None, Engine::Hyper) => kubernetes::run(&args).await,
-        // Not a missing branch but a refused combination. The uring engine
-        // reads a route table it is handed and has no way to accept a new one
-        // mid-flight, which is the entire job in Kubernetes mode. Serving
-        // Kubernetes traffic from a table frozen at startup would look like it
-        // worked right up until the first deployment.
-        (None, Engine::Uring) => {
-            eprintln!(
-                "ramjet-ingressd: --engine uring serves static routes only; \
-                 pass --static-routes <FILE>, or use --engine hyper for Kubernetes mode"
-            );
-            Ok(ExitCode::FAILURE)
-        }
+        (None, Engine::Uring) => kubernetes::run_uring(&args).await,
     }
 }
 
@@ -293,6 +282,9 @@ async fn uring_mode(
     }
 
     let routes = Arc::new(SharedRouteTable::new(loaded.table));
+    // Kept alongside the store so the one generation dev mode has can be
+    // recorded in the history, exactly as the hyper lane's dev mode does.
+    let cert_keys = Arc::new(loaded.certs.clone());
     let certs = Arc::new(CertStore::with_certs(loaded.certs));
 
     // The same rule dev mode applies: without an explicit --https, a TLS
@@ -326,13 +318,7 @@ async fn uring_mode(
     let mirror_metrics = Arc::new(ramjet_proxy::Metrics::new());
     let mirror = ramjet_engine::mirror::MirrorLane::new(
         ramjet_proxy::Mirror::spawn(
-            ramjet_proxy::Upstream::new(&UpstreamConfig {
-                connect_timeout: args.connect_timeout,
-                response_timeout: args.response_timeout,
-                max_connect_attempts: args.max_connect_attempts,
-                pool_max_idle_per_host: args.upstream_pool_idle,
-                ..UpstreamConfig::default()
-            }),
+            ramjet_proxy::Upstream::new(&upstream_config(args)),
             Arc::clone(&mirror_metrics),
         )
         .with_max_body(args.mirror_max_body),
@@ -345,7 +331,12 @@ async fn uring_mode(
         https,
         tls,
         proxy_protocol: args.proxy_protocol.then_some(args.proxy_protocol_timeout),
-        admin: args.admin,
+        // Left unbound: the tokio listener below answers instead. The engine's
+        // own admin serves `/metrics` and the probes and nothing else, and dev
+        // mode is where an operator reaches for `/admin/routes` and
+        // `ramjet-top`. It stays in the crate for an embedder that wants no
+        // tokio at all, and the engine's own tests cover it.
+        admin: None,
         workers: args.worker_threads,
         connect_timeout: args.connect_timeout,
         response_timeout: args.response_timeout,
@@ -362,6 +353,52 @@ async fn uring_mode(
         Arc::clone(&routes),
         Arc::clone(&readiness),
     )?;
+    let metrics = engine.metrics();
+
+    // The one generation dev mode has, recorded the way the Kubernetes applier
+    // records every generation, so the rollback endpoints work here exactly as
+    // they do there — with nothing to roll back to.
+    let readiness_flag = ReadinessFlag::new();
+    let history = Arc::new(ramjet_proxy::GenerationHistory::new(
+        Arc::clone(&routes),
+        Arc::clone(&certs),
+        args.history_size,
+    ));
+    let audit = ramjet_controller::AuditSink::logging_only();
+    {
+        let table = routes.load_full();
+        let diff = ramjet_controller::ConfigDiff::compute(None, &table);
+        let published = history.record(
+            table.generation(),
+            0,
+            Arc::new(diff.to_json()),
+            table,
+            cert_keys,
+        );
+        audit.applied(&diff, published);
+    }
+    watch_pins(Arc::clone(&history), audit);
+
+    let (admin_handle, admin_shutdown) = Shutdown::channel();
+    let admin_addr = match args.admin {
+        Some(addr) => {
+            let listener = ramjet_proxy::Listener::bind(&ListenerConfig::new(addr))?;
+            let bound = listener.local_addr()?;
+            let state = Arc::new(ramjet_proxy::AdminState {
+                metrics: metrics as Arc<dyn ramjet_proxy::Exposition>,
+                routes: Arc::clone(&routes),
+                readiness: readiness_flag.clone(),
+                history,
+            });
+            tokio::spawn(ramjet_proxy::serve_admin_only(
+                listener,
+                state,
+                admin_shutdown,
+            ));
+            Some(bound)
+        }
+        None => None,
+    };
 
     println!(
         "ramjet-ingressd {} — engine {}, {} backend(s), {} endpoint(s), {} route(s), \
@@ -388,10 +425,11 @@ async fn uring_mode(
             None => println!("  {label} disabled"),
         }
     }
-    match engine.admin_addr() {
+    match admin_addr {
         Some(addr) => {
             println!("  admin    {addr}");
             println!("  probes   http://{addr}/healthz  http://{addr}/readyz  http://{addr}/metrics");
+            println!("  admin    http://{addr}/admin/generations  http://{addr}/admin/routes");
         }
         None => println!("  admin    disabled"),
     }
@@ -406,12 +444,14 @@ async fn uring_mode(
     // The table is read before the listeners bind, so the replica is ready the
     // moment it can accept.
     readiness.store(true, Ordering::Release);
+    readiness_flag.set_ready(true);
 
     let stop = engine.shutdown();
     let mut signal = Shutdown::on_signal();
     tokio::spawn(async move {
         signal.recv().await;
         stop.stop();
+        admin_handle.shutdown();
     });
 
     // The reactor is a blocking loop and is `!Send` per core, so it runs off
@@ -451,6 +491,21 @@ pub(crate) fn watch_pins(
     });
 }
 
+/// The upstream settings every lane dials with.
+///
+/// Shared so that an operator changing `--engine` is not also changing their
+/// connect timeout, which is the kind of difference that makes a benchmark
+/// between the two meaningless.
+pub(crate) fn upstream_config(args: &Args) -> UpstreamConfig {
+    UpstreamConfig {
+        connect_timeout: args.connect_timeout,
+        response_timeout: args.response_timeout,
+        max_connect_attempts: args.max_connect_attempts,
+        pool_max_idle_per_host: args.upstream_pool_idle,
+        ..UpstreamConfig::default()
+    }
+}
+
 /// The listener and upstream configuration both modes share.
 ///
 /// `https` is passed separately because it is the one setting the two modes
@@ -461,13 +516,7 @@ fn proxy_config(args: &Args, https: Option<SocketAddr>) -> ProxyConfig {
         http: args.http.map(ListenerConfig::new),
         https: https.map(ListenerConfig::new),
         admin: args.admin.map(ListenerConfig::new),
-        upstream: UpstreamConfig {
-            connect_timeout: args.connect_timeout,
-            response_timeout: args.response_timeout,
-            max_connect_attempts: args.max_connect_attempts,
-            pool_max_idle_per_host: args.upstream_pool_idle,
-            ..UpstreamConfig::default()
-        },
+        upstream: upstream_config(args),
         shutdown_grace: args.shutdown_grace,
         worker_threads: args.worker_threads,
         max_buf_size: args.max_buf_size,

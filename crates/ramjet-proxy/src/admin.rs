@@ -66,7 +66,7 @@ use serde_json::{json, Value};
 
 use crate::body::ProxyBody;
 use crate::history::{self, GenerationHistory, PinError};
-use crate::metrics::Metrics;
+use crate::metrics::Exposition;
 
 /// The exposition format version Prometheus expects to negotiate.
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -113,8 +113,12 @@ impl ReadinessFlag {
 /// What the admin endpoints read.
 #[derive(Debug)]
 pub struct AdminState {
-    /// Data-plane counters.
-    pub metrics: Arc<Metrics>,
+    /// Data-plane counters, whichever engine is producing them.
+    ///
+    /// Boxed as a trait object rather than generic: this is read once per
+    /// scrape, a few times a minute, and making every caller carry an engine
+    /// parameter to save a virtual call there would be the wrong trade.
+    pub metrics: Arc<dyn Exposition>,
     /// The published table: its generation at scrape time, and its routes for
     /// `/admin/routes`.
     pub routes: Arc<SharedRouteTable>,
@@ -426,7 +430,7 @@ mod tests {
             Arc::new(crate::history::CertKeys::new()),
         );
         Arc::new(AdminState {
-            metrics: Arc::new(Metrics::new()),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
             routes,
             readiness: ReadinessFlag::new(),
             history,

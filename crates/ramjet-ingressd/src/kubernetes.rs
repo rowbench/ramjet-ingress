@@ -168,16 +168,7 @@ pub async fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     let client = kube::Client::try_default().await?;
-    let opts = ControllerOpts {
-        namespace: args.watch_namespace.clone(),
-        class_name: args.ingress_class.clone(),
-        default_backend: args.default_backend.clone(),
-        default_tls_secret: args.default_tls_secret.clone(),
-        publish_address: args.publish_address.clone(),
-        publish_service: args.publish_service.clone(),
-        update_status: args.update_status,
-        ..ControllerOpts::default()
-    };
+    let opts = controller_opts(args);
 
     let routes = Arc::new(SharedRouteTable::new(RouteTableBuilder::new().build()?));
     let certs = Arc::new(CertStore::new());
@@ -274,6 +265,239 @@ pub async fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         return Ok(ExitCode::FAILURE);
     }
     Ok(code)
+}
+
+/// Kubernetes mode on the uring engine.
+///
+/// # What is shared, and what is not
+///
+/// Everything above the sockets is shared with [`run`], because it has to be:
+/// the controller, the applier, the promotion loop, the audit sink and the
+/// generation history all operate on a [`SharedRouteTable`] and a
+/// [`CertStore`], and neither of them knows what an engine is. This function
+/// binds a different data plane under the same control plane, and that is the
+/// whole of the difference.
+///
+/// # Why the admin listener is tokio's
+///
+/// The uring engine has an admin listener of its own, on core 0's reactor,
+/// which answers `/metrics` and the two probes. What it cannot answer is
+/// `/admin/generations` and `/admin/routes` — those read the generation history
+/// and the route table as JSON, and reimplementing that against a hand-rolled
+/// HTTP writer would be a second version of an API that has to agree with the
+/// first. So here the engine's own admin is left unbound and
+/// [`ramjet_proxy::serve_admin_only`] runs instead, reading the same counters
+/// through [`Exposition`](ramjet_proxy::Exposition).
+///
+/// That is a tokio task in front of a reactor data plane, and it costs what a
+/// scrape every fifteen seconds costs. The data plane never touches it.
+pub async fn run_uring(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    if let Some(url) = &args.audit_webhook {
+        AuditSink::check_webhook(url)?;
+    }
+
+    let client = kube::Client::try_default().await?;
+    let opts = controller_opts(args);
+
+    let routes = Arc::new(SharedRouteTable::new(RouteTableBuilder::new().build()?));
+    let certs = Arc::new(CertStore::new());
+    // Two readiness flags for one state, because the two halves want different
+    // types: the applier flips `ReadinessFlag`, and the engine's `/readyz` — if
+    // anything ever asks it directly — reads an `AtomicBool`. They are kept in
+    // step by the applier being the only writer.
+    let readiness = ReadinessFlag::new();
+    let engine_ready = Arc::new(AtomicBool::new(false));
+
+    // The TLS listener binds even though the store is empty, exactly as it does
+    // on the hyper lane: the certificates are arriving over a watch that has
+    // not finished its first list, and refusing to bind 443 would mean a
+    // restart could never recover a cluster's HTTPS.
+    let tls = match args.https {
+        Some(_) => {
+            let resolver = Arc::new(ramjet_proxy::SniResolver::new(
+                Arc::clone(&routes),
+                Arc::clone(&certs),
+            ));
+            Some(Arc::new(ramjet_proxy::tls::h1_server_config(resolver)?))
+        }
+        None => None,
+    };
+
+    let mirror_metrics = Arc::new(ramjet_proxy::Metrics::new());
+    let mirror = ramjet_engine::mirror::MirrorLane::new(
+        ramjet_proxy::Mirror::spawn(
+            ramjet_proxy::Upstream::new(&crate::upstream_config(args)),
+            Arc::clone(&mirror_metrics),
+        )
+        .with_max_body(args.mirror_max_body),
+        mirror_metrics,
+    );
+
+    let engine = ramjet_engine::engine::Engine::bind(
+        ramjet_engine::engine::Config {
+            http: args.http,
+            https: args.https,
+            tls,
+            proxy_protocol: args.proxy_protocol.then_some(args.proxy_protocol_timeout),
+            // Left unbound: the tokio listener below answers instead, because
+            // it is the one that can serve the generation API.
+            admin: None,
+            workers: args.worker_threads,
+            connect_timeout: args.connect_timeout,
+            response_timeout: args.response_timeout,
+            max_connect_attempts: args.max_connect_attempts,
+            pool_max_idle_per_host: args.upstream_pool_idle,
+            max_buf_size: args.max_buf_size,
+            mirror_max_body: args.mirror_max_body,
+            mirror: Some(mirror),
+            ..ramjet_engine::engine::Config::default()
+        },
+        Arc::clone(&routes),
+        Arc::clone(&engine_ready),
+    )?;
+    let metrics = engine.metrics();
+
+    let history = Arc::new(GenerationHistory::new(
+        Arc::clone(&routes),
+        Arc::clone(&certs),
+        args.history_size,
+    ));
+
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        engine = "uring",
+        ingress_class = %args.ingress_class,
+        namespace = args.watch_namespace.as_deref().unwrap_or("<all>"),
+        http = ?engine.http_addr(),
+        https = ?engine.https_addr(),
+        admin = ?args.admin,
+        cores = engine.cores(),
+        "starting in kubernetes mode"
+    );
+
+    let audit = AuditSink::new(
+        Some(client.clone()),
+        &args.ingress_class,
+        args.audit_webhook.as_deref(),
+    )
+    .await?;
+    crate::watch_pins(Arc::clone(&history), audit.clone());
+
+    let (configs, controller) = ramjet_controller::spawn(client.clone(), opts)?;
+
+    let promoter = tokio::spawn(
+        Promoter::new(
+            KubePatcher::new(client),
+            audit.clone(),
+            Arc::clone(&routes),
+            Arc::clone(&history),
+        )
+        .run(configs.clone()),
+    );
+
+    let (handle, shutdown) = Shutdown::channel();
+    let mut signal = Shutdown::on_signal();
+    let on_signal = handle.clone();
+    tokio::spawn(async move {
+        signal.recv().await;
+        on_signal.shutdown();
+    });
+
+    let applier = tokio::spawn(apply(
+        configs,
+        Publisher::new(),
+        Arc::clone(&history),
+        audit,
+        readiness.clone(),
+        handle.clone(),
+    ));
+
+    // `/readyz` is answered by the tokio listener from `readiness`; this keeps
+    // the engine's own view in step for anything that reads it directly.
+    let mirror_ready = {
+        let readiness = readiness.clone();
+        let engine_ready = Arc::clone(&engine_ready);
+        let mut shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                if readiness.is_ready() {
+                    engine_ready.store(true, Ordering::Release);
+                    return;
+                }
+                tokio::select! {
+                    () = shutdown.recv() => return,
+                    () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                }
+            }
+        })
+    };
+
+    let admin = match args.admin {
+        Some(addr) => {
+            let listener = ramjet_proxy::Listener::bind(&ramjet_proxy::ListenerConfig::new(addr))?;
+            let state = Arc::new(ramjet_proxy::AdminState {
+                metrics: metrics as Arc<dyn ramjet_proxy::Exposition>,
+                routes: Arc::clone(&routes),
+                readiness,
+                history: Arc::clone(&history),
+            });
+            Some(tokio::spawn(ramjet_proxy::serve_admin_only(
+                listener,
+                state,
+                shutdown.clone(),
+            )))
+        }
+        None => None,
+    };
+
+    // The reactor is a blocking loop and is `!Send` per core, so it runs off
+    // the async runtime entirely; this task only relays the stop.
+    let stop = engine.shutdown();
+    let mut engine_shutdown = shutdown;
+    tokio::spawn(async move {
+        engine_shutdown.recv().await;
+        stop.stop();
+    });
+    let result = tokio::task::spawn_blocking(move || engine.run())
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e)) })?;
+
+    let control_plane_stopped = controller.is_finished();
+
+    applier.abort();
+    promoter.abort();
+    controller.abort();
+    mirror_ready.abort();
+    if let Some(admin) = admin {
+        admin.abort();
+        let _ = admin.await;
+    }
+    let _ = applier.await;
+    let _ = promoter.await;
+    let _ = controller.await;
+    let _ = mirror_ready.await;
+
+    let code = crate::finish(result)?;
+    if control_plane_stopped {
+        return Ok(ExitCode::FAILURE);
+    }
+    Ok(code)
+}
+
+/// The controller options both modes build the same way.
+fn controller_opts(args: &Args) -> ControllerOpts {
+    ControllerOpts {
+        namespace: args.watch_namespace.clone(),
+        class_name: args.ingress_class.clone(),
+        default_backend: args.default_backend.clone(),
+        default_tls_secret: args.default_tls_secret.clone(),
+        publish_address: args.publish_address.clone(),
+        publish_service: args.publish_service.clone(),
+        update_status: args.update_status,
+        ..ControllerOpts::default()
+    }
 }
 
 /// Records every generation the controller compiles, and publishes the ones a
