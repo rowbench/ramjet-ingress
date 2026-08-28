@@ -105,6 +105,24 @@ fn wait_for(upstream: &Upstream, wanted: usize) {
     );
 }
 
+/// Wait for the mirror worker to have *recorded* `wanted` accepted copies.
+///
+/// A different moment from [`wait_for`], and the gap between them is real: the
+/// worker records a copy only once it has drained the shadow's response, which
+/// happens after the shadow has counted the request. Asserting on the counter
+/// immediately after the upstream saw the request is a race, and it is one that
+/// loses about one run in twenty.
+fn wait_for_mirrored(metrics: &ramjet_proxy::Metrics, wanted: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let seen = metrics.mirrored();
+        if seen >= wanted || Instant::now() >= deadline {
+            return seen;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn a_sampled_request_reaches_the_shadow_backend() {
     let primary = echo();
@@ -149,7 +167,11 @@ fn the_copy_is_marked_and_carries_the_forwarded_headers() {
         200
     );
     wait_for(&shadow, 1);
-    assert_eq!(mirrored.metrics.mirrored(), 1, "the shadow accepted the copy");
+    assert_eq!(
+        wait_for_mirrored(&mirrored.metrics, 1),
+        1,
+        "the shadow accepted the copy"
+    );
 }
 
 #[test]
