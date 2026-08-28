@@ -1,1 +1,1 @@
-{"contender": "nginx", "requested": 10000, "established": 10000, "failed": 0, "open_seconds": 1.7, "mem_before_bytes": 17322475, "mem_at_peak_bytes": 61666754, "mem_after_close_bytes": 17322475, "bytes_per_connection": 4434.4, "retained_after_close_bytes": 0}
+{"contender": "nginx", "requested": 10000, "established": 10000, "failed": 0, "open_seconds": 2.0, "mem_before_bytes": 17332961, "mem_at_peak_bytes": 61677240, "mem_after_close_bytes": 17332961, "bytes_per_connection": 4434.4, "retained_after_close_bytes": 0}

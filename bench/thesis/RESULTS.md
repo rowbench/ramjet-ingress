@@ -16,7 +16,7 @@ connections ramjet-ingress measured 266 MiB — above the 256Mi limit its own
 Helm chart ships by default.
 
 That measurement stands as written, and the work it prompted is recorded in
-[benchmark 4 after the fix](#benchmark-4-after-the-fix-commit-d86269e). The
+[benchmark 4 after the fix](#benchmark-4-after-the-fix-commit-a207115). The
 short version: the memory now comes back — a full connect/close cycle returns
 to 11.5 MiB and the next one does not start higher — and the peak fell to 200.7
 MiB, under the chart's limit. Per connection it is 20.3 KiB against 4.4, so
@@ -524,7 +524,7 @@ idle keep-alive connections would be OOM-killed by its own default manifest.
 that is a real cost", 33.1 MiB against nginx's 12.6 MiB under load — and this
 benchmark shows where that trend ends up.
 
-## Benchmark 4 after the fix, commit d86269e
+## Benchmark 4 after the fix, commit a207115
 
 Benchmark 4 is the one ingress-nginx won, and it found two separate problems: an
 idle keep-alive connection cost ramjet-ingress 27.1 KiB against nginx's 4.4, and
@@ -538,19 +538,19 @@ judged against cannot be checked afterwards.
 
 | Contender | Pass | Established | Idle before | At 10k | After close | Per connection | Retained |
 |---|---|---:|---:|---:|---:|---:|---:|
-| ramjet | 1 | 10,000/10,000 | 2.5 MiB | 200.7 MiB | 11.6 MiB | 20.3 KiB | +9.1 MiB |
-| ramjet | 2 | 10,000/10,000 | 11.6 MiB | 201.1 MiB | 11.5 MiB | 19.4 KiB | -0.2 MiB |
+| ramjet | 1 | 10,000/10,000 | 2.5 MiB | 200.7 MiB | 11.5 MiB | 20.3 KiB | +9.0 MiB |
+| ramjet | 2 | 10,000/10,000 | 11.5 MiB | 201.5 MiB | 11.5 MiB | 19.5 KiB | +0.0 MiB |
 | nginx | 1 | 10,000/10,000 | 16.3 MiB | 58.8 MiB | 16.5 MiB | 4.4 KiB | +0.2 MiB |
 | nginx | 2 | 10,000/10,000 | 16.5 MiB | 58.8 MiB | 16.5 MiB | 4.3 KiB | +0.0 MiB |
 
 ### Reading it
 
 **The retention problem is gone.** Ten thousand connections took the process to
-200.7 MiB; closing them brought it back to 11.6, and a second full cycle peaked
-at 201.1 and settled at 11.5 — *below* where the first pass left it. The figure
-that mattered most in the original run was not the peak but the +228.1 MiB that
-never came back and the +62.7 MiB the next cycle added on top; both are now
-noise. ramjet-ingress now also idles lower than nginx does, 11.5 MiB against
+200.7 MiB; closing them brought it back to 11.5, and a second full cycle peaked
+at 201.5 and settled at 11.5 again — the same number, not a higher one. The
+figure that mattered most in the original run was not the peak but the +228.1
+MiB that never came back and the +62.7 MiB the next cycle added on top; both are
+now zero. ramjet-ingress also idles lower than nginx does, 11.5 MiB against
 16.5.
 
 **The per-connection cost improved by a quarter and ingress-nginx still wins
