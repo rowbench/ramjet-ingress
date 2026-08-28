@@ -523,16 +523,24 @@ impl Engine {
             );
         }
 
-        let mut first_error = None;
+        let mut first_error: Option<io::Error> = None;
         for thread in threads {
-            match thread.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    first_error.get_or_insert(e);
-                }
-                Err(_) => {
-                    first_error.get_or_insert(io::Error::other("a serving core panicked"));
-                }
+            let outcome = match thread.join() {
+                Ok(outcome) => outcome,
+                Err(_) => Err(io::Error::other("a serving core panicked")),
+            };
+            let Err(error) = outcome else { continue };
+            // A drain that ran out of time is an outcome the caller turns into
+            // a clean exit; a core that failed is not. Where one core did each,
+            // the failure is the one worth reporting — held the other way
+            // round, a real fault would leave the process exiting zero because
+            // some other core happened to be slow.
+            let held_is_timeout = first_error
+                .as_ref()
+                .is_some_and(|held| held.kind() == io::ErrorKind::TimedOut);
+            if first_error.is_none() || (held_is_timeout && error.kind() != io::ErrorKind::TimedOut)
+            {
+                first_error = Some(error);
             }
         }
         if let Some(acceptor) = acceptor {
