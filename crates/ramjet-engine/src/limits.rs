@@ -407,12 +407,20 @@ set nginx.ingress.kubernetes.io/backend-protocol: GRPC on the Ingress\n"
     ];
 
     /// Every markdown file this repository documents itself with.
+    ///
+    /// `deploy/` is walked as well as `docs/`, because the tenth instance of
+    /// this drift was hiding in `deploy/README.md` — a file nobody thought of
+    /// as documentation and every operator installing the chart reads.
+    ///
+    /// `bench/` is left out deliberately. Its files are dated measurements, and
+    /// "at the time of this measurement it had no TLS" is a true sentence that
+    /// has to stay writable.
     fn markdown_files() -> Vec<std::path::PathBuf> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..");
         let mut found = vec![root.join("README.md"), root.join("ARCHITECTURE.md")];
-        let mut pending = vec![root.join("docs").join("src")];
+        let mut pending = vec![root.join("docs").join("src"), root.join("deploy")];
         while let Some(dir) = pending.pop() {
             let entries = std::fs::read_dir(&dir)
                 .unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
@@ -434,8 +442,27 @@ set nginx.ingress.kubernetes.io/backend-protocol: GRPC on the Ingress\n"
         // operator actually reads. Every entry in the list was found by hand,
         // one release too late; the point of writing them down is that the next
         // one is found by `cargo test` instead.
+        let files = markdown_files();
+        // A walk that quietly found nothing passes and guards nothing, which is
+        // the same failure as pointing the table guard at a renamed header. So
+        // the corners of it are named: the root, the book, and the one
+        // directory this drift was last found hiding in.
+        for expected in [
+            "ARCHITECTURE.md",
+            "docs/src/limitations.md",
+            "docs/src/operations/engines.md",
+            "deploy/README.md",
+        ] {
+            assert!(
+                files
+                    .iter()
+                    .any(|path| path.to_string_lossy().ends_with(expected)),
+                "{expected} is not being read, so nothing is guarding it"
+            );
+        }
+
         let mut stale = Vec::new();
-        for path in markdown_files() {
+        for path in files {
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             for (claim, closed_by) in RETIRED_CLAIMS {
