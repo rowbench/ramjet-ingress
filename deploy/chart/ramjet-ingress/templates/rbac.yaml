@@ -11,18 +11,34 @@ because a specific piece of the controller cannot run without it:
   secrets              TLS material, filtered server-side to type=kubernetes.io/tls
   endpointslices       the actual pod addresses behind each backend
   ingresses/status     status writeback, as a server-side-apply patch
+  ingresses (patch)    canary auto-promotion, and only that. The loop steps a
+                       canary Ingress's `canary-weight` annotation and records
+                       what it did in `ramjet.dev/auto-promote-status`; on a
+                       breach it writes the weight to 0 and disarms itself.
+                       This is spec-level rather than status-level because an
+                       annotation is object metadata, so `ingresses/status`
+                       cannot carry it — which is why the verb is on the
+                       primary resource above and worth being explicit about.
+                       It is the only write this controller makes to an object
+                       an operator authored. Take it away and automatic
+                       promotion logs a permission error every interval and
+                       changes nothing; every other feature is unaffected, and
+                       an Ingress that never sets `ramjet.dev/auto-promote`
+                       is never touched either way.
   events               the audit trail: one Event on the IngressClass per
-                       published generation, per rollback, and per resume, so
-                       `kubectl describe ingressclass` answers what this
-                       controller has been doing. Cluster-scoped objects get
-                       their Events in `default`, which is why this is not
-                       namespaced. Take it away and the Events are skipped at
-                       debug level; nothing else changes.
+                       published generation, per rollback, and per resume, and
+                       one per automatic promotion step, promotion, or
+                       rollback, so `kubectl describe ingressclass` answers
+                       what this controller has been doing. Cluster-scoped
+                       objects get their Events in `default`, which is why this
+                       is not namespaced. Take it away and the Events are
+                       skipped at debug level; nothing else changes.
 
 Notably absent: pods (endpoints come from EndpointSlice, not from listing
-pods), nodes, configmaps, and any write verb on anything except the status
-subresource and Events. The controller creates nothing else and deletes
-nothing.
+pods), nodes, configmaps, `create` or `delete` on anything but Events, and any
+write verb on an Ingress's `spec`. The controller creates nothing else, deletes
+nothing, and never edits a routing rule — including the backend swap at the end
+of a successful canary promotion, which is deliberately left to a human.
 */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -39,6 +55,13 @@ rules:
       - get
       - list
       - watch
+      # Canary auto-promotion only, and only ever on annotations. An
+      # annotation lives in `metadata`, so the `ingresses/status` rule below
+      # cannot carry it and this has to be the primary resource. `update` is
+      # deliberately absent: a server-side-apply patch names the three keys it
+      # owns, where an update would send a whole object and could clobber a
+      # concurrent edit to a field this controller has no business touching.
+      - patch
   - apiGroups:
       - networking.k8s.io
     resources:

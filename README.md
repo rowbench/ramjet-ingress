@@ -9,11 +9,11 @@ file is about running it.
 
 | Crate | What it is |
 |---|---|
-| `ramjet-router` | Route table, host/path matcher, load balancing, canary |
+| `ramjet-router` | Route table, host/path matcher, load balancing, canary, mirroring |
 | `ramjet-proxy` | Listeners, TLS termination, HTTP/1.1 and HTTP/2, HTTP/3, upstreams |
 | `ramjet-controller` | Kubernetes watches, translation, status writeback |
 | `ramjet-engine` | An experimental second data plane on a completion-based reactor |
-| `ramjet-ingressd` | The daemon that wires them together |
+| `ramjet-ingressd` | The daemon that wires them together, and canary auto-promotion |
 | `ramjet-top` | A terminal cockpit for a running instance ([README](crates/ramjet-top/README.md)) |
 
 ## Build and test
@@ -124,6 +124,64 @@ A rollback is an emergency brake and not desired state: it lives in one
 replica's memory, the controller keeps compiling behind it, and it does not
 survive a restart — after which Kubernetes is the source of truth again. See
 [ARCHITECTURE.md](ARCHITECTURE.md#time-travel-and-the-audit-trail).
+
+## Traffic mirroring
+
+Send a second, fire-and-forget copy of a route's traffic to a shadow backend and
+throw the answer away — a rewrite gets production traffic before it gets
+production responsibility. Annotate the **production** Ingress:
+
+```yaml
+metadata:
+  annotations:
+    ramjet.dev/mirror-backend: shadow/api:80   # namespace optional
+    ramjet.dev/mirror-percent: "10"            # default 100
+    ramjet.dev/mirror-host: shadow.example.com # optional Host override
+```
+
+Copies carry `X-Mirrored-By: ramjet-ingress`. The hard promise is that a mirror
+**cannot slow down or fail the request the client is waiting for**: nothing is
+awaited on the request path, each serving runtime has a bounded queue that drops
+on overflow, responses are drained and discarded, and a shadow backend that is
+down or wedged produces a counter and nothing else. Bodies are the one real
+cost — a request with one is buffered up to `--mirror-max-body` (256 KiB) so
+both copies can have it, and a body over the cap is forwarded whole with the
+mirror skipped. Watch `ramjet_mirrored_total`, `ramjet_mirror_dropped_total`,
+`ramjet_mirror_skipped_total` and `ramjet_mirror_failures_total`.
+
+## Canary auto-promotion
+
+Let a healthy canary promote itself, and pull it back the moment it stops being
+healthy. Annotate the **canary** Ingress; everything but the opt-in has a
+default:
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "5"
+    ramjet.dev/auto-promote: "true"
+    # ramjet.dev/auto-promote-interval: 60s
+    # ramjet.dev/auto-promote-steps: 5,10,25,50,100
+    # ramjet.dev/auto-promote-max-5xx-percent: "1"
+    # ramjet.dev/auto-promote-max-latency-factor: "1.5"
+    # ramjet.dev/auto-promote-min-requests: "50"
+```
+
+Every interval the daemon takes that window's requests, 5xx and latency for the
+canary and stable sides of the route *separately* — the router counts them
+apart — and steps `canary-weight` to the next value. Too little traffic on
+either side holds rather than advancing, because no traffic is not failure. A
+breach of either threshold writes the weight to `0`, sets `auto-promote:
+"false"`, and records `auto-promote-status: "rolled-back: <reason>"`; re-arming
+is a human decision. Reaching the last step records `auto-promote-status:
+promoted` and stops — swapping the production Ingress's backend stays a
+deliberate human edit ([why](ARCHITECTURE.md#why-the-backend-swap-stays-human)).
+
+Decisions land in the logs with their numbers, as Events on the IngressClass
+(`CanaryStepped`, `CanaryPromoted`, `CanaryRolledBack`), and on
+`--audit-webhook`. Everything pauses while a rollback pin is held. Needs
+`networking.k8s.io`/`ingresses`/`patch`, which the chart grants.
 
 ## Watching it live
 

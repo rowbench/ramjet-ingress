@@ -579,6 +579,216 @@ Because the crate is sans-io it has no opinion about how headers are stored.
 fetch; `decide(header, cookie, roll)` takes them as borrowed `&str`. No header
 collection type leaks into the router and nothing is allocated.
 
+### Canary attribution
+
+Per-route counters split by which backend answered. Each route slot carries a
+*second* 128-byte-aligned block per shard, written when the canary took the
+request **in addition** to the route's own — not instead of it.
+
+That direction is the whole design. The other arrangement, stable in one block
+and canary in the other, would make every existing graph of a route's request
+rate step down the moment somebody started a canary, which is exactly the graph
+an operator is watching at that moment. Here the totals stay the totals, the
+canary block says how much of them was the new backend, and the stable share is
+one subtraction. `/admin/routes` reports it as `canary_stats`, `null` on a route
+with no canary — an object full of zeroes could not be told apart from a canary
+nothing has reached yet, and that distinction is what an automatic promotion is
+about to act on.
+
+The cost falls entirely on the diverted request: four more relaxed adds to a
+separate cache line, and nothing at all for a route with no canary.
+
+## Traffic mirroring
+
+A route may carry a **mirror**: a second backend that receives a copy of each
+sampled request and whose response is thrown away. It is how a rewrite gets
+production traffic before it gets production responsibility.
+
+| Annotation | Effect |
+|---|---|
+| `ramjet.dev/mirror-backend` | `namespace/service:port`, or a bare `service:port` in the Ingress's own namespace. Its presence turns mirroring on. |
+| `ramjet.dev/mirror-percent` | share of matching requests copied, `0`–`100`. Default 100. |
+| `ramjet.dev/mirror-host` | `Host` header sent on the copy instead of the client's. |
+
+The prefix is `ramjet.dev`, not `nginx.ingress.kubernetes.io`, and that is a
+deliberate signal: the canary family above is transcribed from ingress-nginx so
+a cluster can swap controllers without rewriting its Ingresses, and there is no
+ingress-nginx spelling of this to be compatible with. An operator reading
+`ramjet.dev/…` knows immediately that moving back loses the behaviour.
+
+`mirror-host` looks cosmetic and is not. A shadow deployment usually answers to
+a different name, and a copy carrying the production `Host` can be routed by
+whatever sits in front of it — possibly straight back to production, which is
+the one outcome a mirror must never produce.
+
+### The invariant
+
+**A mirror must never make the primary request slower or more likely to fail.**
+That is not a goal, it is the property that decides whether the feature can be
+switched on in front of real traffic, and every mechanism below exists for it:
+
+- **Nothing is awaited.** The request path hands the copy to a queue and
+  returns. It never waits for a connection, a response, or a timeout.
+- **The queue is bounded and drops.** One channel per serving runtime, 256 deep,
+  entered with `try_send`. Per-runtime so a wedged shadow fills one core's queue
+  rather than contending for a shared one; bounded because the alternative turns
+  a slow mirror into unbounded memory growth on the pod serving production.
+- **Responses are drained and discarded.** Drained rather than dropped so the
+  upstream connection returns to the pool instead of being closed, which would
+  put a TCP handshake on every mirrored request.
+- **Failures are counted, never propagated.** A mirror backend that is down,
+  refusing, absent, or catatonic produces a number on `/metrics` and nothing
+  else. A five-second deadline, much shorter than the primary's, bounds the one
+  thing a slow mirror can still affect: the queue behind it.
+- **No in-flight accounting.** A copy does not take the `LeastConn` guard its
+  primary does. The guard borrows out of the route table and cannot cross the
+  queue, and letting shadow traffic move production's load-balancing decisions
+  would be its own kind of leak.
+
+### The body, which is the hard part
+
+Everything above is cheap because a request head is small and already in memory.
+A body is neither, and this data plane's whole position on request bodies is
+that it does not buffer them.
+
+So the cap is real and small — `--mirror-max-body`, 256 KiB. A request whose
+body is *known* empty, which is every `GET`, `HEAD`, `OPTIONS` and `DELETE` and
+so the overwhelming majority of ingress traffic, is mirrored with no buffering
+at all and keeps its endpoint failover. A request with a body is read up to the
+cap; if it fits, both copies get the same `Bytes`. If it does not, the bytes
+already read become a **prefix** on the primary's body and the rest keeps
+streaming (`ProxyBody::prefixed`), so the upload resumes from wherever the cap
+stopped it and the mirror is skipped and counted. The primary is never held
+waiting for more than the cap and never fails because of the attempt.
+
+Four counters, because they have four different fixes: `ramjet_mirrored_total`,
+`ramjet_mirror_dropped_total` (queue full — raise the shadow's capacity),
+`ramjet_mirror_skipped_total` (body over the cap — raise `--mirror-max-body`),
+and `ramjet_mirror_failures_total` (the backend refused or did not answer).
+Copies carry `X-Mirrored-By: ramjet-ingress`, so a shadow can tell a copy from
+the real thing before it decides whether to charge somebody's card.
+
+## Canary auto-promotion
+
+A canary Ingress annotated `ramjet.dev/auto-promote: "true"` is stepped up
+automatically on evidence, and pulled to zero on the first sign the evidence has
+turned. It is off unless asked for.
+
+| Annotation | Default | Effect |
+|---|---|---|
+| `ramjet.dev/auto-promote` | `false` | opts this canary in |
+| `ramjet.dev/auto-promote-interval` | `60s` | one observation window |
+| `ramjet.dev/auto-promote-steps` | `5,10,25,50,100` | the weights to walk, sorted |
+| `ramjet.dev/auto-promote-max-5xx-percent` | `1` | canary error budget for a window |
+| `ramjet.dev/auto-promote-max-latency-factor` | `1.5` | canary mean latency vs stable's |
+| `ramjet.dev/auto-promote-min-requests` | `50` | per window, **per side** |
+| `ramjet.dev/auto-promote-status` | — | written by the controller: `promoted`, or `rolled-back: <reason>` |
+
+### The state machine
+
+Every interval, per opted-in canary: take the **window** — this interval's
+deltas only, canary side and stable side separately. If either side saw fewer
+than `min-requests`, **hold**. Otherwise check the gates: canary 5xx percentage
+against `max-5xx-percent`, canary mean latency against stable's times
+`max-latency-factor`. A breach is a **rollback** — weight to 0, `auto-promote`
+to `"false"`, a status saying why. Otherwise **step** to the next weight, or
+**promote** if there is no next weight.
+
+Three things in that are easy to get wrong and are worth naming.
+
+**Holding is not failing.** A canary receiving nothing at 03:00 is a quiet
+service, not a broken one. Gating on both sides — not just the canary's — also
+matters: a latency comparison against four stable requests is not a comparison.
+Rolling back on low traffic would make the feature unusable on anything but the
+busiest routes.
+
+**Windows, not lifetimes.** The counters are cumulative and the process may have
+been up for a week, so a lifetime error rate cannot move fast enough to catch
+anything. Each pass subtracts the previous pass's reading. The first pass after
+a step spans the moment the weight changed and so mixes two ratios — deliberate,
+and it errs safe, because the older and smaller weight is the one
+over-represented.
+
+**Errors are absolute, latency is relative.** An error budget is a number
+somebody actually has, so production being on fire is not a licence to promote a
+canary that is also on fire. Latency has no such absolute: a service that
+legitimately takes two seconds would be un-promotable against a fixed
+threshold, so the canary is compared to what it is replacing.
+
+### Interlocks
+
+- **A rollback pin pauses everything.** An operator holding the emergency brake
+  has taken manual control of what this replica serves; patching Ingresses
+  underneath them would be changing the cluster they are trying to hold still.
+- **A rollback is one-way.** It writes `auto-promote: "false"` alongside the
+  weight, and the loop refuses any canary whose status says it was rolled back
+  even if the annotation is somehow still true. Both, because the guard has to
+  survive a restart — the annotation carries it across a rescheduled pod — and
+  because the two are written in one patch that could half-fail. A canary
+  re-armed automatically after failing once will fail again on the next
+  interval, flapping traffic across a broken backend for as long as nobody is
+  watching.
+- **Reaching the last step is validated before it is accepted.** Stepping to
+  100% and immediately declaring victory would mean full traffic never gets a
+  single window of scrutiny, so promotion happens on the *next* healthy window
+  at the final weight.
+
+Every decision is logged on the `audit` target with its numbers, written as a
+Kubernetes Event on the IngressClass (`CanaryStepped`, `CanaryPromoted`,
+`CanaryRolledBack` — the last as a `Warning`), and POSTed to `--audit-webhook`.
+Holds are `debug` only: on a quiet route they are the normal state, and an Event
+per interval per canary would bury the three that matter.
+
+### Where it lives, and why
+
+In `ramjet-ingressd`. It needs two things that are nowhere else in the same
+place: the per-route split counters, which are in this process behind an atomic
+load, and a Kubernetes client, which the control plane has. `ramjet-proxy` must
+not know what an Ingress is and `ramjet-controller` must not know what a socket
+is, so the one binary depending on both is where the wire goes — the same
+argument that put the rollback-pin bridge there.
+
+The candidates are compiled by the controller into `CompiledConfig.promotions`
+and arrive on the generation channel, which the loop reads through a second
+receiver. It issues no API reads of its own: the controller has already listed
+every Ingress and parsed every annotation, and a loop doing its own `list` would
+cost a cluster-wide read every minute, forever, on every installation, whether
+or not anybody uses the feature. With nobody opted in the list is empty and the
+loop is a timer that does nothing.
+
+The state machine itself is a pure function — `decide(policy, weight, window)` —
+with no clock, no cluster and no counters, so the entire decision table is a
+unit test. The one cluster effect sits behind a one-method trait, and the real
+implementation is a dozen lines.
+
+### Why the backend swap stays human
+
+Reaching 100% means every request is served by the canary backend while the
+production Ingress still names the old one. The obvious next step — rewrite
+`spec.rules[].backend` and delete the canary Ingress — is deliberately left to a
+person, and it looks like the last mile of the same job, so it is worth saying
+why it is not.
+
+Everything this loop does is **reversible by writing one number**. Every state
+it can reach is a weight, and every weight has an inverse the loop already knows
+how to apply; a rollback is the same mechanism as a step. Editing the backend is
+a different kind of change: it is the thing the canary was a rehearsal *for*, it
+normally comes with deleting an object, and undoing it means reconstructing an
+object rather than setting a field. A controller that restructures the resources
+an operator wrote, on a timer, is a controller people turn off. So the loop
+drives the dial to 100, says so in an Event and in the annotation, and stops.
+
+RBAC: this is the only write this controller makes to an object an operator
+authored, and it needs `networking.k8s.io`/`ingresses`/`patch` — spec-level,
+because an annotation is metadata and `ingresses/status` cannot carry it. The
+patches are server-side applies under the `ramjet-ingress` field manager, forced
+because `canary-weight` is normally owned by whoever created the Ingress and
+taking ownership is precisely what opting in means. In a GitOps cluster a
+reconciler that also claims that field will fight this loop and win on its own
+schedule; either exclude `canary-weight` from its managed fields, or do not opt
+that Ingress in. Without the RBAC rule, promotion logs a permission error every
+interval and changes nothing.
+
 ## TLS
 
 `SniMap` resolves a server name to an opaque `CertifiedKeyHandle` using exactly

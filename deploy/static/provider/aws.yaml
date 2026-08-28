@@ -61,6 +61,13 @@ rules:
       - get
       - list
       - watch
+      # Canary auto-promotion only, and only ever on annotations. An
+      # annotation lives in `metadata`, so the `ingresses/status` rule below
+      # cannot carry it and this has to be the primary resource. `update` is
+      # deliberately absent: a server-side-apply patch names the three keys it
+      # owns, where an update would send a whole object and could clobber a
+      # concurrent edit to a field this controller has no business touching.
+      - patch
   - apiGroups:
       - networking.k8s.io
     resources:
