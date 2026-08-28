@@ -1,3 +1,3 @@
-ramjet: cpu=202.54% mem=33.06MiB / 3.825GiB upstream_conns_opened=128 requests=1046870 reqs_per_conn=8179
-nginx: cpu=204.32% mem=12.59MiB / 3.825GiB upstream_conns_opened=39 requests=1056181 reqs_per_conn=27082
-upstream cpu during load: ramjet-bench-up1=58.52% ramjet-bench-up2=56.37% 
+ramjet: cpu=197.86% mem=24.92MiB / 3.825GiB upstream_conns_opened=128 requests=948057 reqs_per_conn=7407
+nginx: cpu=202.92% mem=13.82MiB / 3.825GiB upstream_conns_opened=65 requests=930234 reqs_per_conn=14311
+upstream cpu during load: ramjet-bench-up1=52.24% ramjet-bench-up2=51.06% 

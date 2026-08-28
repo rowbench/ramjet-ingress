@@ -6,6 +6,12 @@ the first measurement, which had nginx 45% ahead, is kept below unchanged. Both
 are reproducible with `./bench/run.sh`, and the rest of this document is about
 how it was measured and what it does and does not mean.
 
+A third run, [after the memory work](#after-the-memory-work-commit-a519dbd), is
+the current one and is not a new head-to-head claim: it was taken to check that
+halving the idle-connection footprint cost no throughput, it did not, and the
+session was too noisy on nginx's side for its own comparison to be worth
+quoting. The tables above it remain the estimate of the gap.
+
 The original reading follows first, because it is what the optimisation work was
 aimed at and the "what this does not test" section applies to both.
 
@@ -300,6 +306,84 @@ route, one host, 128-byte plaintext responses and static configuration. Nothing
 here exercises TLS, HTTP/2, large bodies, thousands of routes, or configuration
 churn under live traffic.
 
+## After the memory work (commit a519dbd)
+
+`bench/thesis/RESULTS.md`'s benchmark 4 sent this page a bill: the data plane
+kept 27 KiB per idle keep-alive connection and did not give it back. Fixing that
+changed two things that could plausibly cost throughput — the per-request
+response future is now boxed, so there is one more allocation on the request
+path, and the global allocator is jemalloc with a one-second decay, so a
+background thread is returning freed pages while traffic flows. This section is
+the committed protocol re-run to find out whether either did.
+
+### Concurrency 64 (median of 3 x 30s runs)
+
+| Contender | RPS | p50 | p90 | p99 | p99.9 |
+|---|---:|---:|---:|---:|---:|
+| ramjet-ingress | 83,369 | 651 us | 930 us | 2,808 us | 10,112 us |
+| nginx | 80,397 | 689 us | 944 us | 3,158 us | 10,186 us |
+| baseline (no proxy) | 237,444 | 226 us | 357 us | 982 us | 3,867 us |
+
+### Concurrency 256 (single 30s run)
+
+| Contender | RPS | p50 | p90 | p99 | p99.9 |
+|---|---:|---:|---:|---:|---:|
+| ramjet-ingress | 83,224 | 2,832 us | 3,793 us | 7,242 us | 21,303 us |
+| nginx | 82,748 | 2,715 us | 3,919 us | 9,924 us | 32,915 us |
+| baseline (no proxy) | 242,170 | 910 us | 1,336 us | 3,595 us | 11,761 us |
+
+### Run-to-run spread (c64 RPS, every run)
+
+| Contender | run 1 | run 2 | run 3 | spread |
+|---|---:|---:|---:|---:|
+| ramjet-ingress | 83,369 | 82,032 | 88,134 | 7.2% |
+| nginx | 74,237 | 80,397 | 86,674 | 15.5% |
+| baseline (no proxy) | 238,880 | 237,444 | 231,236 | 3.2% |
+
+### Added latency of the proxy hop (c64, vs baseline)
+
+| Contender | added p50 | added p99 | RPS vs baseline |
+|---|---:|---:|---:|
+| ramjet-ingress | +425 us | +1,826 us | 35% |
+| nginx | +463 us | +2,176 us | 34% |
+
+### Reading it, and what not to read into it
+
+**Neither change cost throughput.** ramjet-ingress's median is 83,369 against
+4f58bd7's 85,908, which is 3% down — and its best run of the three, 88,134, is
+above that median, on a session whose spread was 7.2%. The c256 cell is 83,224
+against 82,524, slightly up.
+
+**This session was noisy and the head-to-head numbers should not be quoted.**
+nginx's three c64 runs were 74,237, 80,397 and 86,674 — a 15.5% spread against
+the 4.5% it produced when the previous table was taken, and its first round is
+plainly not a measurement of nginx. ramjet-ingress leads both cells here and
+that is a fact about this hour, not about the two proxies. **The
+[after-optimization tables](#after-optimization-commit-4f58bd7) remain the
+better estimate of the gap**; what this run is good for is the only question it
+was run to answer, which is whether the memory work cost anything.
+
+**The controlled answer to that question is in `bench/ab.py`**, because a
+session-to-session difference cannot separate a code change from the machine.
+It alternates two images inside one session, rotating which goes first. Run
+against images built at 4f58bd7 and at this commit, three rounds each:
+
+| | c64 median | c64 p99 | c256 median | c256 p99 |
+|---|---:|---:|---:|---:|
+| before the memory work | 76,781 | 3,500 us | 77,576 | 8,476 us |
+| after | 83,928 | 2,999 us | 81,125 | 7,932 us |
+
+The lead is inside the spread and is not being claimed as a speed-up; what it
+rules out is a cost. Both arms sit below their own committed figures, which is
+the host, and is exactly why the comparison had to be run this way.
+
+**Memory under load fell too, and that was the point.** The diagnostics pass
+measured the ramjet container at **24.9 MiB against 33.1** at the same
+concurrency, with nginx at 13.8 against 12.6. The number that moved most is not
+here at all — it is in `bench/thesis/RESULTS.md`, where ten thousand idle
+connections now peak at 200.7 MiB instead of 266.1 and return to 11.5 MiB
+instead of retaining 230.
+
 ## Known unfairness and deviations
 
 Things that could not be fully eliminated, stated so a reader can discount them:
@@ -340,7 +424,14 @@ Things that could not be fully eliminated, stated so a reader can discount them:
 ./bench/run.sh                                    # ~15 minutes, cleans up after itself
 WARMUP=10s DURATION=5s ROUNDS=1 ./bench/run.sh    # quick smoke test
 python3 bench/report.py                           # re-render tables from committed JSON
+
+IMAGES="ramjet:before ramjet:after" python3 bench/ab.py   # did this commit cost throughput?
 ```
+
+`ab.py` answers a narrower question than `run.sh` and writes nothing. Comparing
+two commits by comparing two `run.sh` sessions measures the machine as much as
+the code; `ab.py` alternates the two images inside one session so that the
+host's mood lands on both arms.
 
 Tunables, all environment variables: `WARMUP`, `DURATION`, `COOLDOWN`,
 `ROUNDS`, `CONC_MAIN`, `CONC_HIGH`.
@@ -378,10 +469,12 @@ and removes only its own containers on exit (including on Ctrl-C) — the docker
 daemon may be shared. Raw oha JSON for every run is committed, so both sets of
 tables can be re-derived without re-running anything:
 
-- `results/` holds the **after** run (commit 4f58bd7), which is what
-  `report.py` reads.
-- `results/before/` holds the **first measurement** (commit d1c08c6) verbatim,
-  including its own `versions.txt` and `diagnostics.txt`. `report.py` globs one
-  directory deep and does not pick these up; to re-render them, point it at the
-  subdirectory or read `results/before/table.md`, which is the table it
-  produced.
+- `results/` holds the **after the memory work** run (commit a519dbd), which is
+  what `report.py` reads.
+- `results/4f58bd7/` holds the **after optimization** run verbatim.
+- `results/before/` holds the **first measurement** (commit d1c08c6) verbatim.
+
+Each archived run keeps its own `versions.txt`, `diagnostics.txt` and
+`table.md`. `report.py` globs one directory deep and does not pick the
+subdirectories up; to re-render one, point it at the subdirectory or read the
+`table.md` it produced.
