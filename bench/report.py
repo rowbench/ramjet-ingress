@@ -11,7 +11,13 @@ import pathlib
 import statistics
 import sys
 
-RESULTS = pathlib.Path(__file__).parent / "results"
+# Which directory to render. Defaults to the committed measurement; run.sh
+# passes its own results directory, which for anything other than the committed
+# protocol is a scratch subdirectory — so a smoke run renders its own numbers
+# instead of appearing to restate the committed ones.
+RESULTS = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else (
+    pathlib.Path(__file__).parent / "results"
+)
 
 # Display name -> filename stem. Order here is the order of the table rows.
 CONTENDERS = [

@@ -64,11 +64,35 @@ CPUS_LOAD="4,5,6,7"   # the load generator must never be the bottleneck
 LOAD_THREADS=4
 
 HOST_HEADER="bench.test"
+
+# Whether anything about the protocol was overridden, decided BEFORE the
+# defaults below fill the variables in.
+#
+# This exists because of a near-miss worth recording. `run_all` starts with
+# `rm -f "${RESULTS_DIR}"/*.json`, so a ROUNDS=1 smoke run deletes the committed
+# measurement's thirty files and writes back three. The tables in RESULTS.md
+# then no longer re-derive from the JSON beside them, and the failure is quiet:
+# the smoke numbers are low but *plausible*, so the next person to run
+# report.py reads them as a regression and goes looking for the commit that
+# caused it. An obviously-broken number gets caught; a plausible one gets
+# believed. So a run that is not the committed protocol does not get to write
+# where the committed protocol's results live.
+PROTOCOL_OVERRIDDEN=""
+for _var in WARMUP DURATION COOLDOWN ROUNDS CONC_MAIN CONC_HIGH; do
+    [ -n "${!_var:-}" ] && PROTOCOL_OVERRIDDEN="yes"
+done
+unset _var
+
 WARMUP="${WARMUP:-10s}"
 DURATION="${DURATION:-30s}"
+COOLDOWN="${COOLDOWN:-15s}"
 ROUNDS="${ROUNDS:-3}"
 CONC_MAIN="${CONC_MAIN:-64}"
 CONC_HIGH="${CONC_HIGH:-256}"
+
+if [ -n "${PROTOCOL_OVERRIDDEN}" ]; then
+    RESULTS_DIR="${BENCH_DIR}/results/scratch"
+fi
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
@@ -251,6 +275,12 @@ measure() {
     local who="$1" conc="$2" run="$3" ip out rps
     ip="$(target_ip "${who}")"
 
+    # Let the package cool and the previous contender's sockets drain before
+    # the warmup starts. Without it each run inherits the thermal state and
+    # lingering TIME_WAIT of whatever ran immediately before it, which is a
+    # systematic effect rather than noise that averaging removes.
+    sleep "${COOLDOWN}"
+
     oha "${ip}" "${conc}" "${WARMUP}" >/dev/null
 
     out="${RESULTS_DIR}/${who}-c${conc}-r${run}.json"
@@ -260,23 +290,38 @@ measure() {
     printf '    %-10s c%-4s run %s  %12s rps\n' "${who}" "${conc}" "${run}" "${rps}"
 }
 
-# Interleaved on purpose: A,B,base then A,B,base again. Running all of A then
-# all of B would hand any thermal or background drift entirely to whichever
-# contender happened to go second.
+# The contenders for one round, rotated so a different one leads each time:
+# round 1 is ramjet,nginx,baseline; round 2 is nginx,baseline,ramjet; and so on.
+#
+# Interleaving alone is not enough, and the reason is worth stating. Plain
+# interleaving assumes the machine is steady *within* a round; on a laptop it is
+# not, because the package heats up as the round proceeds. A fixed order then
+# hands whoever goes first a systematically cooler machine every single round,
+# which is a bias that averaging over rounds cannot remove — it is present in
+# the same direction in every sample. Rotating the lead spreads that advantage
+# evenly across contenders instead.
+rotation() {
+    local round="$1" all=(ramjet nginx baseline) n=3 i out=()
+    for ((i = 0; i < n; i++)); do
+        out+=("${all[$(( (round - 1 + i) % n ))]}")
+    done
+    printf '%s\n' "${out[@]}"
+}
+
 run_all() {
     mkdir -p "${RESULTS_DIR}"
     rm -f "${RESULTS_DIR}"/*.json
 
-    log "c${CONC_MAIN}: ${ROUNDS} interleaved rounds of ${DURATION} (after ${WARMUP} warmup each)"
+    log "c${CONC_MAIN}: ${ROUNDS} rotated rounds of ${DURATION} (${WARMUP} warmup, ${COOLDOWN} cooldown each)"
     for round in $(seq 1 "${ROUNDS}"); do
-        echo "  round ${round}/${ROUNDS}"
-        for who in ramjet nginx baseline; do
+        echo "  round ${round}/${ROUNDS} (order: $(rotation "${round}" | tr '\n' ' '))"
+        for who in $(rotation "${round}"); do
             measure "${who}" "${CONC_MAIN}" "${round}"
         done
     done
 
     log "c${CONC_HIGH}: one round"
-    for who in ramjet nginx baseline; do
+    for who in $(rotation 1); do
         measure "${who}" "${CONC_HIGH}" 1
     done
 }
@@ -362,7 +407,7 @@ main() {
     diagnostics
 
     log "rendering the table"
-    python3 "${BENCH_DIR}/report.py" | tee "${RESULTS_DIR}/table.md"
+    python3 "${BENCH_DIR}/report.py" "${RESULTS_DIR}" | tee "${RESULTS_DIR}/table.md"
 
     log "raw JSON in ${RESULTS_DIR}; write the reading into RESULTS.md"
 }

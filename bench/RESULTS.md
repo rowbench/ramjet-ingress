@@ -24,10 +24,21 @@ aimed at and the "what this does not test" section applies to both.
 - oha 1.16.0, HTTP/1.1 with keep-alive, `--host bench.test` against a literal
   IP so no DNS lookup enters either contender's path.
 - Per contender: a discarded 10s warmup, then 3 x 30s at c64 and 1 x 30s at
-  c256. Runs are **interleaved** (ramjet, nginx, baseline, repeat) so drift is
-  shared rather than handed to whoever went second. c64 rows are the
-  median-throughput run, not a per-column average, so every number in a row
-  comes from one real 30-second measurement.
+  c256. Runs are **interleaved** so drift is shared rather than handed to
+  whoever went second. c64 rows are the median-throughput run, not a per-column
+  average, so every number in a row comes from one real 30-second measurement.
+- **Both measurements below were taken with a fixed within-round order**
+  (ramjet, nginx, baseline, repeated each round). `run.sh` has since been
+  changed to *rotate* which contender leads each round, and to wait a 15s
+  cooldown before each warmup. The reason is that plain interleaving assumes the
+  machine is steady within a round, and on a laptop it is not: the package heats
+  up as the round proceeds, so a fixed order hands whoever goes first a
+  systematically cooler machine in every round — a bias in one direction that
+  averaging over rounds cannot remove. Rotation spreads it evenly. Neither table
+  below has been re-measured under the rotated protocol, so read the numbers as
+  carrying that bias in ramjet's favour at c64, bounded by the size of the
+  within-round drift (the baseline's 13.3% spread is the visible upper bound on
+  it, and the contenders' 1.7-5.3% spread the likelier scale).
 - **Baseline** is a third nginx pinned to the *proxies' own cores* serving the
   body directly, which makes "proxy overhead" a like-for-like subtraction: the
   same 2 cores, the same response, with and without the extra hop.
@@ -326,10 +337,41 @@ Things that could not be fully eliminated, stated so a reader can discount them:
 ## Reproducing
 
 ```sh
-./bench/run.sh                                   # ~11 minutes, cleans up after itself
-WARMUP=2s DURATION=5s ROUNDS=1 ./bench/run.sh    # quick smoke test
-python3 bench/report.py                          # re-render tables from committed JSON
+./bench/run.sh                                    # ~15 minutes, cleans up after itself
+WARMUP=10s DURATION=5s ROUNDS=1 ./bench/run.sh    # quick smoke test
+python3 bench/report.py                           # re-render tables from committed JSON
 ```
+
+Tunables, all environment variables: `WARMUP`, `DURATION`, `COOLDOWN`,
+`ROUNDS`, `CONC_MAIN`, `CONC_HIGH`.
+
+**Overriding any of them redirects output to `results/scratch/`** (gitignored),
+so only an unmodified committed-protocol run can write where the committed
+measurement lives. That guard is there because the alternative failed quietly:
+`run_all` begins by deleting `results/*.json`, so a `ROUNDS=1` smoke run removed
+the measurement's files and wrote back three, leaving the tables above unable to
+re-derive from the JSON beside them. The dangerous part was not the breakage but
+its plausibility — the smoke numbers were low enough to read as a regression and
+high enough to be believed, which is exactly the kind of wrong number that gets
+quoted instead of caught.
+
+**Do not shorten `WARMUP` below 10s, including in the smoke test.** A cold
+contender measures its own warmup rather than its throughput, and the effect is
+large enough to look like a regression: a 2s warmup measured 39,000 rps at c64
+and 72,549 rps at c128 in the run immediately after — throughput rising with
+concurrency is the signature of a first run that had not finished warming. The
+effect grew with the per-core runtime change, because there is now a connection
+pool, timer wheel and buffer set to warm per core rather than one of each.
+
+**Check the host before trusting any number.** The baseline is the right canary
+because it has nothing under test — plain nginx, static body, no proxying — so
+any shortfall in it is the machine. On a quiet host it measures ~248,000 rps.
+Below ~230,000 the host is busy and the run is not worth starting; measurements
+taken there have shown 20-40% run-to-run spread against the 1.7-4.5% this
+harness produces on a quiet machine. Note that this is host-side contention
+(browsers, Kubernetes GUIs, Spotlight indexing a fresh `target/`), and it
+reaches the guest through vCPU preemption, so container `--cpuset` pinning does
+not protect against it.
 
 `run.sh` is idempotent, namespaces everything it creates as `ramjet-bench-*`,
 and removes only its own containers on exit (including on Ctrl-C) — the docker

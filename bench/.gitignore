@@ -1,0 +1,4 @@
+# Output of any run that is not the committed protocol (see run.sh's
+# PROTOCOL_OVERRIDDEN). Smoke runs land here so they cannot overwrite the
+# measurement that RESULTS.md's tables are re-derived from.
+results/scratch/
