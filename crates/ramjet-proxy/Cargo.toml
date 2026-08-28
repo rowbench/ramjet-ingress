@@ -27,6 +27,11 @@ hyper-util = { version = "0.1", features = [
 ] }
 pin-project-lite = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
+# One event, on the connection-drop path when a PROXY header is rejected. The
+# binary already links this through `ramjet-controller`, and a filtered-out
+# event is an atomic load, so the alternative — dropping connections with no
+# way to find out why — costs more than the dependency does.
+tracing.workspace = true
 tokio = { workspace = true, features = [
     "rt",
     "net",

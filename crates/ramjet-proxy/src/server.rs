@@ -96,12 +96,26 @@
 //! connection object.
 //!
 //! What was in this crate's control has been taken out. The response future no
-//! longer sits inside the connection (see `serve_proxy`), which was 2.9 KiB per
+//! longer sits inside the connection (see `serve_http`), which was 2.9 KiB per
 //! connection held whether or not a request was in flight.
+//!
+//! # The PROXY protocol
+//!
+//! With `proxy_protocol` set, a connection on a traffic listener must open with
+//! a PROXY header naming the real client, and the address it names replaces the
+//! socket's peer in [`ConnInfo`] — so `X-Forwarded-For` and `X-Real-IP` describe
+//! the client rather than the load balancer. The read happens in the connection
+//! task and *before* the TLS handshake, which is the order the wire has: the
+//! balancer sends the header itself and then relays the client's ClientHello.
+//!
+//! The admin listener never reads one. See [`proxy_protocol`] for the trust
+//! model, which is the part that matters: enabling this on a socket the
+//! internet can reach hands out IP spoofing.
 
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -110,6 +124,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use ramjet_router::SharedRouteTable;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_rustls::TlsAcceptor;
@@ -118,6 +133,7 @@ use crate::admin::{self, AdminState, ReadinessFlag};
 use crate::forward::{self, ConnInfo, ProxyState, Scheme};
 use crate::listener::{Listener, ListenerConfig};
 use crate::metrics::{ConnectionGuard, Metrics};
+use crate::proxy_protocol;
 use crate::tls::{self, CertStore, SniResolver};
 use crate::upstream::{Upstream, UpstreamConfig};
 
@@ -182,6 +198,20 @@ pub struct ProxyConfig {
     ///
     /// Clamped up to [`MIN_MAX_BUF_SIZE`], which is the smallest hyper accepts.
     pub max_buf_size: usize,
+    /// Require a PROXY protocol header on the traffic listeners, waiting this
+    /// long for it. `None` — the default — disables it.
+    ///
+    /// This covers the HTTP and HTTPS listeners and deliberately **not** the
+    /// admin one: metrics are scraped by Prometheus and the probes are called
+    /// by the kubelet, neither of which speaks the protocol, and both of which
+    /// reach the pod directly rather than through the load balancer.
+    ///
+    /// Enabling it changes who the data plane believes its clients are. Read
+    /// the trust model in [`crate::proxy_protocol`] before
+    /// turning it on: the header *is* the client identity, so a listener that
+    /// accepts one must be reachable only by a load balancer that always sends
+    /// it.
+    pub proxy_protocol: Option<Duration>,
 }
 
 impl Default for ProxyConfig {
@@ -198,6 +228,10 @@ impl Default for ProxyConfig {
             shutdown_grace: Duration::from_secs(30),
             worker_threads: None,
             max_buf_size: DEFAULT_MAX_BUF_SIZE,
+            // Off, and it has to be: a listener that requires the header
+            // refuses every connection that does not carry one, so defaulting
+            // it on would mean a fresh deployment serves nothing.
+            proxy_protocol: None,
         }
     }
 }
@@ -235,6 +269,7 @@ pub struct Server {
     readiness: ReadinessFlag,
     grace: Duration,
     max_buf_size: usize,
+    proxy_protocol: Option<Duration>,
 }
 
 impl Server {
@@ -298,6 +333,7 @@ impl Server {
             readiness,
             grace: config.shutdown_grace,
             max_buf_size: config.max_buf_size,
+            proxy_protocol: config.proxy_protocol,
         })
     }
 
@@ -346,6 +382,7 @@ impl Server {
             metrics,
             grace,
             max_buf_size,
+            proxy_protocol,
             ..
         } = self;
 
@@ -359,6 +396,7 @@ impl Server {
                 acceptor: acceptor.clone(),
                 grace,
                 max_buf_size,
+                proxy_protocol,
             },
         )?;
 
@@ -465,6 +503,7 @@ struct LaneConfig {
     acceptor: Option<TlsAcceptor>,
     grace: Duration,
     max_buf_size: usize,
+    proxy_protocol: Option<Duration>,
 }
 
 /// The serving runtimes and the round-robin over them.
@@ -553,6 +592,24 @@ impl Workers {
     }
 }
 
+/// Everything one serving runtime hands to each of its connections.
+///
+/// Shared through a single `Arc` rather than cloning three of them per
+/// connection: all four fields are read-only for the life of the lane.
+struct Lane {
+    builder: Arc<auto::Builder<TokioExecutor>>,
+    state: Arc<ProxyState>,
+    acceptor: Option<TlsAcceptor>,
+    proxy_protocol: Option<Duration>,
+    /// Whether a rejected PROXY header has already been reported on this lane.
+    ///
+    /// The failure this exists for is a load balancer that is not sending the
+    /// header at all, and that fails *every* connection — so a line per
+    /// occurrence would bury the outage under its own logs. The first rejection
+    /// is a warning naming the cause, the rest are `debug`.
+    proxy_protocol_warned: AtomicBool,
+}
+
 /// One serving runtime: accepts handed-off connections until the lane closes,
 /// then drains. Returns whether the drain finished inside `grace`.
 fn serve_lane(
@@ -567,49 +624,162 @@ fn serve_lane(
         acceptor,
         grace,
         max_buf_size,
+        proxy_protocol,
     } = config;
     runtime.block_on(async move {
         // Built inside the runtime, and one per lane: this is the pool the
         // module docs are about.
-        let state = Arc::new(ProxyState {
-            routes,
-            upstream: Upstream::new(&upstream),
-            metrics,
+        let lane = Arc::new(Lane {
+            builder: connection_builder(max_buf_size),
+            state: Arc::new(ProxyState {
+                routes,
+                upstream: Upstream::new(&upstream),
+                metrics,
+            }),
+            acceptor,
+            proxy_protocol,
+            proxy_protocol_warned: AtomicBool::new(false),
         });
         let graceful = GracefulShutdown::new();
-        let builder = connection_builder(max_buf_size);
 
         while let Some(job) = jobs.recv().await {
             let Ok(stream) = TcpStream::from_std(job.stream) else {
                 continue;
             };
-            match (job.conn.scheme, &acceptor) {
-                (Scheme::Https, Some(acceptor)) => serve_tls(
-                    Arc::clone(&builder),
-                    graceful.watcher(),
-                    Arc::clone(&state),
-                    acceptor.clone(),
-                    stream,
-                    job.guard,
-                    job.conn.remote,
-                ),
-                // A TLS connection with no acceptor cannot happen — `bind`
-                // builds one whenever the listener exists — but serving it as
-                // plaintext would be worse than closing it.
-                (Scheme::Https, None) => drop(stream),
-                (Scheme::Http, _) => serve_proxy(
-                    Arc::clone(&builder),
-                    graceful.watcher(),
-                    Arc::clone(&state),
-                    stream,
-                    job.guard,
-                    job.conn,
-                ),
-            }
+            spawn_connection(
+                Arc::clone(&lane),
+                graceful.watcher(),
+                stream,
+                job.guard,
+                job.conn,
+            );
         }
 
         tokio::time::timeout(grace, graceful.shutdown()).await.is_ok()
     })
+}
+
+/// Spawns the task that carries one client connection to its close.
+///
+/// Everything that can block on the peer happens in here rather than in the
+/// accept loop, and the PROXY header is the newest reason why: waiting up to
+/// `proxy_protocol_timeout` for a stalled sender on the accept path would let
+/// one connection hold up every other accept on the process.
+fn spawn_connection(
+    lane: Arc<Lane>,
+    watcher: Watcher,
+    stream: TcpStream,
+    guard: ConnectionGuard,
+    conn: ConnInfo,
+) {
+    tokio::spawn(async move {
+        // The guard lives in the task, not the accept loop, so a connection
+        // that ends by panic or abort still decrements the gauge.
+        let _guard = guard;
+
+        let Some(timeout) = lane.proxy_protocol else {
+            serve_client(&lane, watcher, stream, conn).await;
+            return;
+        };
+
+        // Before the TLS handshake, not after: the load balancer speaks the
+        // PROXY protocol itself and then relays the client's bytes untouched,
+        // so on an HTTPS listener the header arrives ahead of the ClientHello.
+        match proxy_protocol::accept(stream, timeout).await {
+            Ok((stream, client)) => {
+                let conn = ConnInfo {
+                    // A header that names nobody — LOCAL, UNKNOWN, UNSPEC — is
+                    // valid and leaves the socket's own peer standing.
+                    remote: client.unwrap_or(conn.remote),
+                    scheme: conn.scheme,
+                };
+                serve_client(&lane, watcher, stream, conn).await;
+            }
+            Err(error) => {
+                // Loud once, quiet after. Silence here would be the worst
+                // outcome: with the flag on and a balancer that does not send
+                // the header, every connection dies and the symptom looks like
+                // a network fault rather than the configuration mistake it is.
+                if lane.proxy_protocol_warned.swap(true, AtomicOrdering::Relaxed) {
+                    tracing::debug!(
+                        %error,
+                        peer = %conn.remote,
+                        "dropped a connection with no valid PROXY protocol header"
+                    );
+                } else {
+                    tracing::warn!(
+                        %error,
+                        peer = %conn.remote,
+                        "dropped a connection with no valid PROXY protocol header; \
+                         this listener requires one, so check that the load balancer \
+                         in front of it is configured to send it (further occurrences \
+                         are logged at debug)"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Serves one connection, terminating TLS first if it arrived on that listener.
+///
+/// Generic over the stream so the ordinary path keeps a bare `TcpStream`: with
+/// `--proxy-protocol` off there is no wrapper and no extra branch per read.
+async fn serve_client<S>(lane: &Lane, watcher: Watcher, stream: S, conn: ConnInfo)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match (conn.scheme, &lane.acceptor) {
+        (Scheme::Https, Some(acceptor)) => {
+            // The handshake happens here rather than in the accept loop; it is
+            // tens of microseconds of arithmetic and one slow client should not
+            // delay everyone else's accept.
+            let stream = match acceptor.clone().accept(stream).await {
+                Ok(stream) => {
+                    lane.state.metrics.record_tls_handshake();
+                    stream
+                }
+                Err(_) => {
+                    // A failed handshake is routine at the edge — port
+                    // scanners, clients with no matching cipher, an SNI we hold
+                    // no certificate for. It is counted, not logged per
+                    // occurrence.
+                    lane.state.metrics.record_tls_handshake_failure();
+                    return;
+                }
+            };
+            serve_http(lane, watcher, stream, conn).await;
+        }
+        // A TLS connection with no acceptor cannot happen — `bind` builds one
+        // whenever the listener exists — but serving it as plaintext would be
+        // worse than closing it.
+        (Scheme::Https, None) => drop(stream),
+        (Scheme::Http, _) => serve_http(lane, watcher, stream, conn).await,
+    }
+}
+
+/// Runs HTTP over an established stream until the connection ends.
+async fn serve_http<S>(lane: &Lane, watcher: Watcher, stream: S, conn: ConnInfo)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let state = Arc::clone(&lane.state);
+    let service = service_fn(move |request| {
+        let state = Arc::clone(&state);
+        // Boxed, and it is worth the allocation. hyper's HTTP/1 dispatcher
+        // keeps the in-flight response future in a `Pin<Box<Option<S::Future>>>`
+        // that it allocates when the connection is created and holds for the
+        // connection's whole life. Unboxed, that is `forward::handle`'s whole
+        // state machine — 2.9 KiB — charged to every idle keep-alive connection
+        // that is not serving anything. Boxing moves it to one allocation per
+        // request, paid by traffic instead of by silence.
+        Box::pin(async move { Ok::<_, Infallible>(forward::handle(state, conn, request).await) })
+    });
+    let connection = lane
+        .builder
+        .serve_connection_with_upgrades(TokioIo::new(stream), service)
+        .into_owned();
+    let _ = watcher.watch(connection).await;
 }
 
 /// Binds and runs in one call, for a caller that has no reason to look at the
@@ -639,86 +809,6 @@ async fn accept(listener: Option<&Listener>) -> io::Result<(TcpStream, SocketAdd
         Some(listener) => listener.accept().await,
         None => std::future::pending().await,
     }
-}
-
-fn serve_proxy(
-    builder: Arc<auto::Builder<TokioExecutor>>,
-    watcher: Watcher,
-    state: Arc<ProxyState>,
-    stream: TcpStream,
-    guard: ConnectionGuard,
-    conn: ConnInfo,
-) {
-    tokio::spawn(async move {
-        // The guard lives in the task, not the accept loop, so a connection
-        // that ends by panic or abort still decrements the gauge.
-        let _guard = guard;
-        let service = service_fn(move |request| {
-            let state = Arc::clone(&state);
-            // Boxed, and it is worth the allocation. hyper's HTTP/1 dispatcher
-            // keeps the in-flight response future in a
-            // `Pin<Box<Option<S::Future>>>` that it allocates when the
-            // connection is created and holds for the connection's whole life.
-            // Unboxed, that is `forward::handle`'s whole state machine — 2.9
-            // KiB — charged to every idle keep-alive connection that is not
-            // serving anything. Boxing moves it to one allocation per request,
-            // paid by traffic instead of by silence.
-            Box::pin(
-                async move { Ok::<_, Infallible>(forward::handle(state, conn, request).await) },
-            )
-        });
-        let connection = builder
-            .serve_connection_with_upgrades(TokioIo::new(stream), service)
-            .into_owned();
-        let _ = watcher.watch(connection).await;
-    });
-}
-
-fn serve_tls(
-    builder: Arc<auto::Builder<TokioExecutor>>,
-    watcher: Watcher,
-    state: Arc<ProxyState>,
-    acceptor: TlsAcceptor,
-    stream: TcpStream,
-    guard: ConnectionGuard,
-    remote: SocketAddr,
-) {
-    let metrics = Arc::clone(&state.metrics);
-    tokio::spawn(async move {
-        let _guard = guard;
-        // The handshake happens here rather than in the accept loop; it is tens
-        // of microseconds of arithmetic and one slow client should not delay
-        // everyone else's accept.
-        let stream = match acceptor.accept(stream).await {
-            Ok(stream) => {
-                metrics.record_tls_handshake();
-                stream
-            }
-            Err(_) => {
-                // A failed handshake is routine at the edge — port scanners,
-                // clients with no matching cipher, an SNI we hold no
-                // certificate for. It is counted, not logged per occurrence.
-                metrics.record_tls_handshake_failure();
-                return;
-            }
-        };
-
-        let conn = ConnInfo {
-            remote,
-            scheme: Scheme::Https,
-        };
-        let service = service_fn(move |request| {
-            let state = Arc::clone(&state);
-            // Boxed for the reason `serve_proxy` gives.
-            Box::pin(
-                async move { Ok::<_, Infallible>(forward::handle(state, conn, request).await) },
-            )
-        });
-        let connection = builder
-            .serve_connection_with_upgrades(TokioIo::new(stream), service)
-            .into_owned();
-        let _ = watcher.watch(connection).await;
-    });
 }
 
 fn serve_admin(

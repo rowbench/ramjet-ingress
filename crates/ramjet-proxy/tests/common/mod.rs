@@ -208,6 +208,8 @@ pub struct ProxyOptions {
     /// once, so one-per-core each would be a thread per core per test.
     /// `lifecycle.rs` covers the multi-runtime path explicitly.
     pub workers: Option<usize>,
+    /// Require a PROXY protocol header on the traffic listeners.
+    pub proxy_protocol: Option<Duration>,
 }
 
 impl Default for ProxyOptions {
@@ -218,6 +220,7 @@ impl Default for ProxyOptions {
             upstream: UpstreamConfig::default(),
             grace: Duration::from_secs(10),
             workers: Some(1),
+            proxy_protocol: None,
         }
     }
 }
@@ -249,6 +252,7 @@ impl TestProxy {
             upstream: options.upstream,
             shutdown_grace: options.grace,
             worker_threads: options.workers,
+            proxy_protocol: options.proxy_protocol,
             ..ProxyConfig::default()
         };
 
