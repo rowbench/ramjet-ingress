@@ -134,6 +134,39 @@ pub struct Config {
     pub tick: Duration,
 }
 
+/// Environment variable that makes [`probe`] report the reactor as
+/// unavailable.
+///
+/// A test hook, and named as one. The failure it stands in for — `io_uring`
+/// blocked by seccomp — needs a container with a specific policy to reproduce,
+/// which is not something a `cargo test` can arrange, and a fallback path that
+/// is only exercised in production is a fallback path nobody has seen work. It
+/// is also the only way an operator can check that *their* deployment falls
+/// back the way they expect before it has to.
+pub const UNAVAILABLE_ENV: &str = "RAMJET_URING_UNAVAILABLE";
+
+/// Whether this host will let the engine start.
+///
+/// Creating a reactor is the whole test: on Linux that is an `io_uring_setup`
+/// syscall, which is what Docker's default seccomp profile blocks and what an
+/// old kernel refuses. It costs one ring's worth of setup and teardown, and
+/// running it before any listener binds is what makes falling back to the other
+/// engine possible — after a bind, the ports are taken and the fallback would
+/// have to unbind them first.
+///
+/// The error is returned rather than logged so the caller can decide whether it
+/// is fatal, and can put the real reason in front of an operator either way.
+/// "io_uring is unavailable" without the `errno` is a support ticket.
+pub fn probe() -> io::Result<()> {
+    if std::env::var_os(UNAVAILABLE_ENV).is_some_and(|value| value == "1") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{UNAVAILABLE_ENV}=1 is set"),
+        ));
+    }
+    ramjet::reactor::PlatformDriver::new().map(drop)
+}
+
 /// The smallest read buffer this engine will use, whatever it is asked for.
 ///
 /// A buffer below this can still serve any request — the head parser resumes

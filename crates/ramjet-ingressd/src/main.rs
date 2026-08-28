@@ -138,12 +138,56 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     init_logging();
 
-    match (args.static_routes.clone(), args.engine) {
+    let engine = match select_engine(args.engine) {
+        Ok(engine) => engine,
+        Err(error) => return Err(error),
+    };
+
+    match (args.static_routes.clone(), engine) {
+        (Some(path), Engine::Uring | Engine::UringStrict) => uring_mode(&args, &path).await,
         (Some(path), Engine::Hyper) => dev_mode(&args, &path).await,
-        (Some(path), Engine::Uring) => uring_mode(&args, &path).await,
+        (None, Engine::Uring | Engine::UringStrict) => kubernetes::run_uring(&args).await,
         (None, Engine::Hyper) => kubernetes::run(&args).await,
-        (None, Engine::Uring) => kubernetes::run_uring(&args).await,
     }
+}
+
+/// Which engine will actually serve, after asking the host whether it can.
+///
+/// The probe happens here, before anything binds, and that ordering is the
+/// whole reason it is a separate step: falling back after a listener is up
+/// would mean unbinding the ports the other engine needs, in the window where a
+/// load balancer is already sending traffic at them.
+///
+/// The reason is always logged, with the `errno` behind it. "io_uring is
+/// unavailable" without that is a support ticket rather than an answer, and the
+/// two causes an operator actually hits — a kernel too old, and Docker's
+/// default seccomp profile blocking `io_uring_setup` — are told apart only by
+/// which error comes back.
+fn select_engine(requested: Engine) -> Result<Engine, Box<dyn std::error::Error>> {
+    if !requested.is_uring() {
+        return Ok(requested);
+    }
+    let Err(error) = ramjet_engine::engine::probe() else {
+        return Ok(requested);
+    };
+
+    if requested.is_strict() {
+        return Err(format!(
+            "--engine uring-strict was requested and the ramjet reactor will not start \
+             on this host: {error}. On Linux this is usually io_uring_setup blocked by \
+             seccomp — Docker's default profile does that — or a kernel older than 5.6. \
+             Use --engine uring to fall back to hyper instead, or --engine hyper"
+        )
+        .into());
+    }
+
+    tracing::warn!(
+        %error,
+        requested = requested.as_str(),
+        serving = Engine::Hyper.as_str(),
+        "the ramjet reactor will not start on this host; falling back to the hyper engine"
+    );
+    Ok(Engine::Hyper)
 }
 
 /// Sends `tracing` output to stderr, filtered by `RUST_LOG`.
@@ -404,7 +448,7 @@ async fn uring_mode(
         "ramjet-ingressd {} — engine {}, {} backend(s), {} endpoint(s), {} route(s), \
          {} certificate(s){}",
         env!("CARGO_PKG_VERSION"),
-        args.engine.as_str(),
+        Engine::Uring.as_str(),
         summary.backends,
         summary.endpoints,
         summary.routes,

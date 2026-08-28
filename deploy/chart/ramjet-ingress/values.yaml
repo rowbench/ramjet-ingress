@@ -161,6 +161,28 @@ proxyProtocol:
 http3:
   enabled: false
 
+# Which data plane serves traffic.
+#
+#   hyper         hyper on tokio. Everything works, and it is what the numbers
+#                 in docs/performance.md were measured on.
+#   uring         the ramjet reactor: io_uring on Linux, kqueue elsewhere. It
+#                 terminates TLS, carries WebSocket upgrades, reads the PROXY
+#                 protocol, and applies generations exactly as hyper does. What
+#                 it does not speak is HTTP/2, and so neither gRPC nor HTTP/3.
+#   uring-strict  the same, and a refusal to start rather than a fallback.
+#
+# `uring` falls back to `hyper` where the reactor will not start, logging the
+# reason. That is not hypothetical: Docker's default seccomp profile blocks
+# io_uring_setup, and whether a given cluster's runtime allows it depends on the
+# node image, the container runtime, and the pod's own seccomp profile. Read the
+# replica's first log line to see which engine it actually chose, rather than
+# assuming it got what it asked for — /metrics deliberately does not say, so
+# that a dashboard built against one engine is correct about the other.
+#
+# `uring-strict` is for a deployment that would rather crash-loop visibly than
+# serve on an engine it did not pick.
+engine: hyper
+
 ports:
   http: 8080
   # The TLS listener, or 0 to have none at all. Zero is what you want when

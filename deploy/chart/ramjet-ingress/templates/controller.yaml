@@ -80,6 +80,7 @@ spec:
             - --no-https
             {{- end }}
             - --admin=:{{ .Values.ports.admin }}
+            - --engine={{ .Values.engine }}
             {{- if .Values.http3.enabled }}
             - --http3
             {{- end }}

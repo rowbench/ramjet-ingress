@@ -72,9 +72,22 @@ pub enum Engine {
     Hyper,
     /// The `ramjet` reactor: io_uring on Linux, kqueue elsewhere.
     ///
-    /// HTTP/1.1 plaintext only, static routes only. See `ramjet_engine` for the
-    /// full list of what it refuses.
+    /// HTTP/1.1 with TLS. What it refuses is HTTP/2, and so gRPC and HTTP/3;
+    /// see `ramjet_engine` for the list.
+    ///
+    /// Falls back to [`Engine::Hyper`] on a host where the reactor cannot
+    /// start, which in practice means `io_uring_setup` blocked by seccomp —
+    /// Docker's default profile does exactly that.
     Uring,
+    /// The same engine, and a refusal to start rather than a fallback.
+    ///
+    /// For a deployment that chose this engine on purpose and would rather
+    /// crash-loop visibly than serve on the other one. A pod that silently
+    /// fell back has none of the properties its operator selected it for and
+    /// no obvious sign that anything happened; `kubectl get pods` showing
+    /// `CrashLoopBackOff` is the louder failure, and sometimes that is what is
+    /// wanted.
+    UringStrict,
 }
 
 impl Engine {
@@ -83,7 +96,18 @@ impl Engine {
         match self {
             Engine::Hyper => "hyper",
             Engine::Uring => "uring",
+            Engine::UringStrict => "uring-strict",
         }
+    }
+
+    /// Whether this selection runs the reactor engine.
+    pub fn is_uring(self) -> bool {
+        matches!(self, Engine::Uring | Engine::UringStrict)
+    }
+
+    /// Whether a reactor that will not start is fatal.
+    pub fn is_strict(self) -> bool {
+        self == Engine::UringStrict
     }
 }
 
@@ -338,7 +362,8 @@ UPSTREAMS:
     it, the only cost is file descriptors.
 
 SERVING:
-    --engine <NAME>           Data plane: hyper or uring     [default: hyper]
+    --engine <NAME>           Data plane: hyper, uring or uring-strict
+                                                             [default: hyper]
     --worker-threads <N>      Serving runtimes, one per thread
                                               [default: one per available core]
     --max-buf-size <BYTES>    Ceiling on one client connection's HTTP/1 read and
@@ -356,6 +381,13 @@ SERVING:
     canaries, mirroring, headers and /metrics is the same on both, and a
     differential test drives the two with identical traffic to keep it that
     way.
+
+    `uring` falls back to `hyper` on a host where the reactor will not start,
+    logging the reason. In practice that means io_uring_setup blocked by
+    seccomp, which Docker's default profile does. `uring-strict` refuses to
+    start instead, for a deployment that would rather crash-loop visibly than
+    serve on an engine it did not choose. On macOS and BSD the reactor uses
+    kqueue and this never comes up.
 
     Each runtime owns its connections, its upstream connection pool, and its
     timers, and a connection stays on the one it landed on. Setting this above
@@ -588,7 +620,7 @@ impl Args {
 
     /// Options that are individually valid and jointly impossible.
     fn check_conflicts(&self) -> Result<(), ArgError> {
-        if self.http3 && self.engine == Engine::Uring {
+        if self.http3 && self.engine.is_uring() {
             // Refused rather than ignored. HTTP/3 is HTTP/2's semantics over
             // QUIC, and this engine speaks neither; honouring the flag would
             // mean binding nothing and advertising nothing, and the operator
@@ -765,10 +797,11 @@ fn engine(option: &str, value: &str) -> Result<Engine, ArgError> {
     match value {
         "hyper" => Ok(Engine::Hyper),
         "uring" => Ok(Engine::Uring),
+        "uring-strict" => Ok(Engine::UringStrict),
         _ => Err(ArgError::BadValue {
             option: option.to_owned(),
             value: value.to_owned(),
-            kind: "engine (hyper or uring)",
+            kind: "engine (hyper, uring or uring-strict)",
         }),
     }
 }
@@ -946,7 +979,7 @@ mod tests {
             matches!(&error, ArgError::BadValue { option, .. } if option == "--engine"),
             "{error:?}"
         );
-        assert!(error.to_string().contains("hyper or uring"), "{error}");
+        assert!(error.to_string().contains("hyper, uring or uring-strict"), "{error}");
     }
 
     #[test]
