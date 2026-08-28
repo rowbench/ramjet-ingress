@@ -224,6 +224,7 @@ async fn dev_mode(
     for (label, addr) in [
         ("http    ", server.http_addr()),
         ("https   ", server.https_addr()),
+        ("http3   ", server.http3_addr()),
         ("admin   ", server.admin_addr()),
     ] {
         match addr {
@@ -431,6 +432,12 @@ fn proxy_config(args: &Args, https: Option<SocketAddr>) -> ProxyConfig {
         proxy_protocol: args
             .proxy_protocol
             .then_some(args.proxy_protocol_timeout),
+        // The QUIC listener takes the TLS listener's address, in UDP, and
+        // follows it: where a mode decides not to open the TLS listener at all
+        // — dev mode with no certificates declared — there is nothing for
+        // HTTP/3 to serve either, and the startup banner says so rather than
+        // leaving a UDP port that fails every handshake.
+        http3: args.http3.then_some(https).flatten(),
     }
 }
 

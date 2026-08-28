@@ -119,6 +119,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use http::header::{self, HeaderValue};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
@@ -133,6 +134,7 @@ use crate::admin::{self, AdminState, ReadinessFlag};
 use crate::body::ProxyBody;
 use crate::forward::{self, ConnInfo, ProxyState, Scheme};
 use crate::history::{GenerationHistory, DEFAULT_HISTORY_SIZE};
+use crate::http3;
 use crate::listener::{Listener, ListenerConfig};
 use crate::metrics::{ConnectionGuard, Metrics};
 use crate::proxy_protocol;
@@ -220,6 +222,18 @@ pub struct ProxyConfig {
     /// accepts one must be reachable only by a load balancer that always sends
     /// it.
     pub proxy_protocol: Option<Duration>,
+
+    /// UDP address for the experimental HTTP/3 listener, or `None` — the
+    /// default — for no QUIC socket at all.
+    ///
+    /// The port is normally the TLS listener's own, in UDP: `alt-svc` tells a
+    /// client to retry the same authority over QUIC, so a different port would
+    /// have to be advertised and separately reachable.
+    ///
+    /// Off costs nothing. No socket is bound, no thread is started, no `alt-svc`
+    /// header is added, and quinn never runs. See [`http3`](crate::http3) for
+    /// what is and is not supported when it is on.
+    pub http3: Option<SocketAddr>,
 }
 
 impl Default for ProxyConfig {
@@ -241,6 +255,9 @@ impl Default for ProxyConfig {
             // refuses every connection that does not carry one, so defaulting
             // it on would mean a fresh deployment serves nothing.
             proxy_protocol: None,
+            // Experimental, and a UDP port an operator did not ask for is a
+            // port a security review did not either.
+            http3: None,
         }
     }
 }
@@ -280,6 +297,7 @@ pub struct Server {
     grace: Duration,
     max_buf_size: usize,
     proxy_protocol: Option<Duration>,
+    http3: Option<http3::Listener>,
 }
 
 impl Server {
@@ -313,14 +331,28 @@ impl Server {
         // Built only when there is something to serve it on: a TLS config over
         // an empty cert store fails every handshake, and constructing one for a
         // listener that does not exist would hide that.
-        let tls = match https {
-            Some(_) => {
-                let resolver = Arc::new(SniResolver::new(Arc::clone(&routes), Arc::clone(&certs)));
-                let config = tls::server_config(resolver)
+        //
+        // One resolver for both listeners, and that is the point rather than a
+        // saving. TLS and QUIC ask the same question — which certificate serves
+        // this name — and sharing the resolver means they cannot answer it
+        // differently, now or after a rotation: it is the same `SniMap` in the
+        // same route table and the same `CertStore`, published by the same two
+        // stores in the same order.
+        let resolver = (https.is_some() || config.http3.is_some())
+            .then(|| Arc::new(SniResolver::new(Arc::clone(&routes), Arc::clone(&certs))));
+        let tls = match (&https, &resolver) {
+            (Some(_), Some(resolver)) => {
+                let config = tls::server_config(Arc::clone(resolver))
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 Some(Arc::new(config))
             }
-            None => None,
+            _ => None,
+        };
+        let http3 = match (config.http3, &resolver) {
+            (Some(addr), Some(resolver)) => {
+                Some(http3::Listener::bind(addr, Arc::clone(resolver))?)
+            }
+            _ => None,
         };
 
         let metrics = Arc::new(Metrics::new());
@@ -355,6 +387,7 @@ impl Server {
             grace: config.shutdown_grace,
             max_buf_size: config.max_buf_size,
             proxy_protocol: config.proxy_protocol,
+            http3,
         })
     }
 
@@ -366,6 +399,11 @@ impl Server {
     /// The TLS address actually bound.
     pub fn https_addr(&self) -> Option<SocketAddr> {
         self.https.as_ref().and_then(|l| l.local_addr().ok())
+    }
+
+    /// The UDP address the HTTP/3 listener bound, if it is enabled.
+    pub fn http3_addr(&self) -> Option<SocketAddr> {
+        self.http3.as_ref().map(http3::Listener::local_addr)
     }
 
     /// The admin address actually bound.
@@ -414,8 +452,17 @@ impl Server {
             grace,
             max_buf_size,
             proxy_protocol,
+            http3,
             ..
         } = self;
+
+        // Advertised only when there is actually a UDP socket to advertise. An
+        // `alt-svc` naming a port nothing is listening on costs every client
+        // that believes it a failed QUIC attempt and a fallback, on every
+        // connection, until the advertisement expires.
+        let alt_svc = http3
+            .as_ref()
+            .and_then(|listener| http3::alt_svc_value(listener.local_addr().port()));
 
         let acceptor = tls.map(TlsAcceptor::from);
         let mut workers = Workers::start(
@@ -428,8 +475,29 @@ impl Server {
                 grace,
                 max_buf_size,
                 proxy_protocol,
+                alt_svc,
             },
         )?;
+
+        // The QUIC listener gets a thread of its own rather than a share of the
+        // round-robin: it is not handed accepted sockets, it owns an endpoint.
+        // Its shard index continues past the TCP runtimes' so that two of them
+        // never write to the same per-route counter block.
+        let http3 = http3
+            .map(|listener| {
+                http3::spawn(
+                    listener,
+                    http3::ServeConfig {
+                        routes: Arc::clone(&routes),
+                        metrics: Arc::clone(&metrics),
+                        upstream,
+                        grace,
+                        shard: worker_threads,
+                    },
+                    shutdown.clone(),
+                )
+            })
+            .transpose()?;
 
         // Admin lives on the caller's runtime; see the module docs.
         let graceful = GracefulShutdown::new();
@@ -483,18 +551,36 @@ impl Server {
         // drain in parallel with the admin listener rather than after it —
         // they are the ones holding client requests, and making them wait for
         // a metrics scrape to finish would be the wrong order.
-        let (drained, admin_drained) = tokio::join!(
+        // The QUIC endpoint drains alongside them for the same reason, and
+        // closes its own socket: it has no listener to drop, because the
+        // endpoint is what keeps delivering packets to connections that are
+        // still finishing.
+        let (drained, admin_drained, h3_drained) = tokio::join!(
             workers.drain(),
             tokio::time::timeout(grace, graceful.shutdown()),
+            drain_http3(http3),
         );
 
-        if !drained || admin_drained.is_err() {
+        if !drained || !h3_drained || admin_drained.is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "shutdown grace period expired with connections still open",
             ));
         }
         Ok(())
+    }
+}
+
+/// Waits for the HTTP/3 runtime to drain, or reports success if there was not
+/// one.
+///
+/// A separate function rather than an `Option` dance inside the `join!`: an
+/// absent listener has to contribute `true` to the outcome, and writing that
+/// inline is how a disabled feature ends up failing a shutdown.
+async fn drain_http3(handle: Option<http3::Handle>) -> bool {
+    match handle {
+        Some(handle) => handle.drain().await,
+        None => true,
     }
 }
 
@@ -535,6 +621,8 @@ struct LaneConfig {
     grace: Duration,
     max_buf_size: usize,
     proxy_protocol: Option<Duration>,
+    /// The `alt-svc` value advertising the QUIC listener, when there is one.
+    alt_svc: Option<HeaderValue>,
 }
 
 /// The serving runtimes and the round-robin over them.
@@ -639,6 +727,13 @@ struct Lane {
     /// occurrence would bury the outage under its own logs. The first rejection
     /// is a warning naming the cause, the rest are `debug`.
     proxy_protocol_warned: AtomicBool,
+    /// The `alt-svc` value to append to TLS responses, when HTTP/3 is running.
+    ///
+    /// This is the entire advertisement mechanism, and it lives here — one
+    /// place, on the response path of the one listener it applies to — rather
+    /// than in `forward`, which has no business knowing which listener a
+    /// process happens to have opened.
+    alt_svc: Option<HeaderValue>,
 }
 
 /// One serving runtime: accepts handed-off connections until the lane closes,
@@ -659,6 +754,7 @@ fn serve_lane(
         grace,
         max_buf_size,
         proxy_protocol,
+        alt_svc,
     } = config;
     runtime.block_on(async move {
         // Built inside the runtime, and one per lane: this is the pool the
@@ -674,6 +770,7 @@ fn serve_lane(
             acceptor,
             proxy_protocol,
             proxy_protocol_warned: AtomicBool::new(false),
+            alt_svc,
         });
         let graceful = GracefulShutdown::new();
 
@@ -799,8 +896,17 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let state = Arc::clone(&lane.state);
+    // Resolved once per connection rather than per request, and only for TLS:
+    // `alt-svc` points a client at the QUIC port for the *same authority*, and
+    // an advertisement sent over plaintext would be telling a client to move
+    // from `http://` to a port serving HTTPS.
+    let alt_svc = match conn.scheme {
+        Scheme::Https => lane.alt_svc.clone(),
+        Scheme::Http => None,
+    };
     let service = service_fn(move |request| {
         let state = Arc::clone(&state);
+        let alt_svc = alt_svc.clone();
         // `map` is the whole conversion: `ProxyBody::Stream` delegates every
         // poll straight to `Incoming`, so naming the crate's own body type on
         // the way in costs this path nothing and is what lets a request that
@@ -813,7 +919,13 @@ where
         // state machine — 2.9 KiB — charged to every idle keep-alive connection
         // that is not serving anything. Boxing moves it to one allocation per
         // request, paid by traffic instead of by silence.
-        Box::pin(async move { Ok::<_, Infallible>(forward::handle(state, conn, request).await) })
+        Box::pin(async move {
+            let mut response = forward::handle(state, conn, request).await;
+            if let Some(value) = alt_svc {
+                response.headers_mut().insert(header::ALT_SVC, value);
+            }
+            Ok::<_, Infallible>(response)
+        })
     });
     let connection = lane
         .builder

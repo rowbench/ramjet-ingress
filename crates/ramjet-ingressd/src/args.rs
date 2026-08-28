@@ -38,6 +38,14 @@ pub enum ArgError {
     /// An argument that was not valid UTF-8.
     #[error("argument {0:?} is not valid UTF-8")]
     NotUtf8(OsString),
+    /// Two options that each parse but cannot both be honoured.
+    ///
+    /// Separate from [`BadValue`](ArgError::BadValue) because nothing about
+    /// either option is wrong on its own: the pair is. Refusing at startup is
+    /// the point — the alternative is a flag that was accepted and then
+    /// quietly did nothing.
+    #[error("{0}")]
+    Conflict(String),
     /// A value that could not be parsed as the option's type.
     #[error("`{value}` is not a valid {kind} for `{option}`")]
     BadValue {
@@ -149,6 +157,11 @@ pub struct Args {
     pub proxy_protocol: bool,
     /// How long a sender gets to deliver a complete PROXY header.
     pub proxy_protocol_timeout: Duration,
+    /// Serve HTTP/3 over QUIC on the TLS listener's port, in UDP.
+    ///
+    /// Experimental. It adds a UDP socket, one serving thread, and an
+    /// `alt-svc` header on TLS responses; with it off none of those exist.
+    pub http3: bool,
 }
 
 impl Default for Args {
@@ -186,6 +199,9 @@ impl Default for Args {
             // sender writes, so a sender that has not finished it in five
             // seconds is not going to.
             proxy_protocol_timeout: Duration::from_secs(5),
+            // Experimental, and a UDP port nobody asked for is a UDP port
+            // nobody reviewed.
+            http3: false,
         }
     }
 }
@@ -258,6 +274,28 @@ LISTENERS:
     an explicit --https or --no-https, the TLS listener is skipped when the
     configuration declares no certificates. In Kubernetes mode it always binds:
     the certificates arrive over a watch, after the socket.
+
+HTTP/3 (EXPERIMENTAL):
+    --http3                   Also serve HTTP/3 over QUIC, on the --https port
+                              in UDP, and advertise it with alt-svc.
+
+    Off by default, and off costs nothing: no UDP socket is bound, no thread is
+    started, and no header is added. On, the TLS listener's responses carry
+    `alt-svc: h3=\":<port>\"; ma=86400`, which is how a client learns to retry
+    over QUIC — so the same port number has to be reachable over UDP as well as
+    TCP, all the way through whatever is in front of this process. An AWS NLB
+    forwards UDP; most other cloud load balancers do not, or do only on a
+    separate listener. See deploy/README.md.
+
+    It shares the TLS listener's certificates, exactly: the same SNI resolution,
+    the same store, the same rotation. What it does not share is the thread
+    budget — the QUIC endpoint runs on one dedicated runtime rather than one per
+    core, because sharding a UDP port by 4-tuple breaks connection migration —
+    so it is not the path to put peak traffic on yet.
+
+    No 0-RTT, no QUIC upstream (upstream stays HTTP/1.1), no protocol upgrades,
+    and no PROXY protocol, which has no UDP form. Requires --https and refuses
+    --engine uring.
 
 BEHIND A LOAD BALANCER:
     --proxy-protocol          Require a PROXY protocol header (v1 or v2) on the
@@ -339,7 +377,8 @@ RAMJET_HISTORY_SIZE, RAMJET_AUDIT_WEBHOOK,
 RAMJET_HTTP, RAMJET_HTTPS, RAMJET_ADMIN, RAMJET_CONNECT_TIMEOUT,
 RAMJET_RESPONSE_TIMEOUT, RAMJET_MAX_CONNECT_ATTEMPTS, RAMJET_UPSTREAM_POOL_IDLE,
 RAMJET_MAX_BUF_SIZE, RAMJET_WORKER_THREADS, RAMJET_SHUTDOWN_GRACE,
-RAMJET_ENGINE, RAMJET_PROXY_PROTOCOL, RAMJET_PROXY_PROTOCOL_TIMEOUT).
+RAMJET_ENGINE, RAMJET_PROXY_PROTOCOL, RAMJET_PROXY_PROTOCOL_TIMEOUT,
+RAMJET_HTTP3).
 A flag always beats the environment. RUST_LOG sets the log filter.
 
 ADMIN ENDPOINTS:
@@ -460,6 +499,7 @@ impl Args {
                     args.worker_threads = Some(number(&name, &value()?)?.max(1));
                 }
                 "--engine" => args.engine = engine(&name, &value()?)?,
+                "--http3" => args.http3 = true,
                 "--proxy-protocol" => args.proxy_protocol = true,
                 "--proxy-protocol-timeout" => {
                     args.proxy_protocol_timeout = seconds(&name, &value()?)?;
@@ -471,7 +511,45 @@ impl Args {
             }
         }
 
+        // Combinations that each parse and cannot both be honoured. Checked
+        // after everything is known, because a flag beats its environment twin
+        // and the conflict is a property of the result rather than of the order
+        // things arrived in.
+        //
+        // Skipped for --help and --version, which are requests for text and
+        // should answer even when the rest of the command line is wrong.
+        if !args.help && !args.version {
+            args.check_conflicts()?;
+        }
         Ok(args)
+    }
+
+    /// Options that are individually valid and jointly impossible.
+    fn check_conflicts(&self) -> Result<(), ArgError> {
+        if self.http3 && self.engine == Engine::Uring {
+            // Refused rather than ignored, for the same reason --proxy-protocol
+            // is: the uring engine has no QUIC and no TLS, so honouring the
+            // flag would mean binding nothing and advertising nothing, and the
+            // operator would find out from a client that quietly stayed on
+            // TCP forever.
+            return Err(ArgError::Conflict(
+                "--http3 is not implemented on --engine uring, which has no TLS \
+                 and no QUIC; use --engine hyper"
+                    .to_owned(),
+            ));
+        }
+        if self.http3 && self.https.is_none() {
+            // HTTP/3 is served on the TLS listener's port in UDP, and the
+            // `alt-svc` header that advertises it names that port. With no TLS
+            // listener there is no port to take, nothing to advertise it on,
+            // and no client that would ever look.
+            return Err(ArgError::Conflict(
+                "--http3 serves on the --https port in UDP, and --no-https \
+                 leaves it none; give --https a port back or drop --http3"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn from_environment<E>(env: &E) -> Result<Args, ArgError>
@@ -539,6 +617,9 @@ impl Args {
         }
         if let Some(value) = env("RAMJET_ENGINE") {
             args.engine = engine("RAMJET_ENGINE", &value)?;
+        }
+        if let Some(value) = env("RAMJET_HTTP3") {
+            args.http3 = boolean("RAMJET_HTTP3", &value)?;
         }
         if let Some(value) = env("RAMJET_PROXY_PROTOCOL") {
             args.proxy_protocol = boolean("RAMJET_PROXY_PROTOCOL", &value)?;
@@ -1020,6 +1101,55 @@ mod tests {
             ramjet_proxy::DEFAULT_HISTORY_SIZE
         );
         assert_eq!(parse(&[]).expect("valid").audit_webhook, None);
+    }
+
+    #[test]
+    fn http3_is_off_unless_asked_for() {
+        // A UDP socket a deployment did not ask for is one nobody firewalled.
+        assert!(!parse(&[]).expect("valid").http3);
+    }
+
+    #[test]
+    fn http3_takes_a_flag_and_an_environment_twin() {
+        assert!(parse(&["--http3"]).expect("valid").http3);
+
+        let env = |name: &str| match name {
+            "RAMJET_HTTP3" => Some("true".to_owned()),
+            _ => None,
+        };
+        assert!(Args::parse(Vec::<String>::new(), env).expect("valid").http3);
+    }
+
+    #[test]
+    fn http3_and_the_uring_engine_is_refused_at_startup() {
+        // The uring engine has neither TLS nor QUIC. Accepting the flag and
+        // doing nothing would leave an operator waiting for h3 traffic that
+        // was never going to arrive.
+        let error = parse(&["--http3", "--engine", "uring", "--static-routes", "r.yaml"])
+            .expect_err("refused");
+        let message = error.to_string();
+        assert!(
+            matches!(error, ArgError::Conflict(_)),
+            "expected a conflict, got {message}"
+        );
+        assert!(message.contains("--engine hyper"), "{message} names no way out");
+    }
+
+    #[test]
+    fn http3_without_a_tls_listener_is_refused_at_startup() {
+        // h3 is served on the --https port in UDP and advertised by alt-svc
+        // naming that port. With no TLS listener there is no port and no
+        // response to advertise it on.
+        let error = parse(&["--http3", "--no-https"]).expect_err("refused");
+        assert!(matches!(error, ArgError::Conflict(_)), "{error}");
+    }
+
+    #[test]
+    fn help_still_prints_over_a_refused_combination() {
+        // `--help` is a request for text. Answering it with a usage error
+        // about two other flags is the least useful moment to be strict.
+        let args = parse(&["--http3", "--no-https", "--help"]).expect("help wins");
+        assert!(args.help);
     }
 
     #[test]

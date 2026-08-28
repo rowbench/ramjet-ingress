@@ -155,6 +155,40 @@ pub fn server_config(resolver: Arc<SniResolver>) -> Result<rustls::ServerConfig,
     Ok(config)
 }
 
+/// Builds the `rustls::ServerConfig` the QUIC listener hands to quinn.
+///
+/// It differs from [`server_config`] in exactly three ways, and every one of
+/// them is forced:
+///
+/// - **ALPN is `h3` alone.** An `h3` connection that negotiated `h2` would be
+///   two peers framing the same stream differently.
+/// - **TLS 1.3 only.** QUIC carries the TLS 1.3 handshake as its own frames and
+///   has no encoding for anything earlier; offering TLS 1.2 here would produce
+///   a configuration quinn refuses to build.
+/// - **No 0-RTT.** `max_early_data_size` is zeroed explicitly rather than left
+///   to a default. Early data is replayable by anyone who captured it, and
+///   which requests are safe to replay is a judgement an application makes, not
+///   one an ingress can make on its behalf.
+///
+/// What it deliberately does *not* differ in is the certificate resolver: the
+/// caller passes the same [`SniResolver`] the TLS listener holds, so a name
+/// resolves to the same certificate over QUIC as over TCP, and a rotation
+/// reaches both at the same instant because it is the same two `ArcSwap`s.
+pub fn quic_server_config(
+    resolver: Arc<SniResolver>,
+) -> Result<rustls::ServerConfig, rustls::Error> {
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_no_client_auth()
+    .with_cert_resolver(resolver);
+
+    config.alpn_protocols = vec![crate::http3::ALPN_H3.to_vec()];
+    config.max_early_data_size = 0;
+    Ok(config)
+}
+
 /// Parses a DER certificate chain and private key into a `CertifiedKey`.
 ///
 /// Offered here so callers loading certificates — the controller, or the dev

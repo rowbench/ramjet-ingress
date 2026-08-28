@@ -105,6 +105,9 @@ pub struct Metrics {
     upstream_retries: AtomicU64,
     upstream_timeouts: AtomicU64,
     route_misses: AtomicU64,
+    h3_connections: AtomicU64,
+    h3_requests: AtomicU64,
+    h3_handshake_failures: AtomicU64,
 }
 
 impl Metrics {
@@ -182,6 +185,35 @@ impl Metrics {
         self.route_misses.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a QUIC connection that became a usable HTTP/3 connection.
+    #[inline]
+    pub fn record_h3_connection(&self) {
+        self.h3_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a request that arrived over HTTP/3.
+    ///
+    /// Counted in addition to `ramjet_requests_total`, not instead of it: the
+    /// response goes through the same forwarding path and is classed there like
+    /// any other. This series answers a different question — how much of the
+    /// traffic actually took the QUIC path — which is the one an operator has
+    /// while deciding whether the advertisement is working.
+    #[inline]
+    pub fn record_h3_request(&self) {
+        self.h3_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a QUIC connection that never became a usable HTTP/3 one.
+    ///
+    /// A failed QUIC handshake — no acceptable version, no certificate for the
+    /// SNI — and an h3 setup that did not complete both land here, because the
+    /// question they answer is the same: how many peers reached the UDP port
+    /// and got nothing back.
+    #[inline]
+    pub fn record_h3_handshake_failure(&self) {
+        self.h3_handshake_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Connections currently being served.
     pub fn active_connections(&self) -> i64 {
         self.active_connections.load(Ordering::Relaxed)
@@ -209,6 +241,21 @@ impl Metrics {
     /// Requests re-dispatched to a different endpoint.
     pub fn retries(&self) -> u64 {
         self.upstream_retries.load(Ordering::Relaxed)
+    }
+
+    /// HTTP/3 connections established.
+    pub fn h3_connections(&self) -> u64 {
+        self.h3_connections.load(Ordering::Relaxed)
+    }
+
+    /// Requests that arrived over HTTP/3.
+    pub fn h3_requests(&self) -> u64 {
+        self.h3_requests.load(Ordering::Relaxed)
+    }
+
+    /// QUIC connections that never became usable HTTP/3 ones.
+    pub fn h3_handshake_failures(&self) -> u64 {
+        self.h3_handshake_failures.load(Ordering::Relaxed)
     }
 
     /// Renders the Prometheus text exposition format.
@@ -291,6 +338,21 @@ impl Metrics {
                 "ramjet_route_misses_total",
                 "Requests that matched no route and no default backend.",
                 &self.route_misses,
+            ),
+            (
+                "ramjet_h3_connections_total",
+                "HTTP/3 connections established on the QUIC listener.",
+                &self.h3_connections,
+            ),
+            (
+                "ramjet_h3_requests_total",
+                "Requests that arrived over HTTP/3.",
+                &self.h3_requests,
+            ),
+            (
+                "ramjet_h3_handshake_failures_total",
+                "QUIC connections that never became usable HTTP/3 connections.",
+                &self.h3_handshake_failures,
             ),
         ] {
             let _ = writeln!(out, "# HELP {name} {help}");

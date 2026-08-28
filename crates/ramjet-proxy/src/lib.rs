@@ -87,6 +87,7 @@ pub mod body;
 pub mod forward;
 pub mod headers;
 pub mod history;
+pub mod http3;
 pub mod listener;
 pub mod metrics;
 pub mod proxy_protocol;
@@ -96,7 +97,7 @@ pub mod tls;
 pub mod upstream;
 
 pub use admin::{AdminState, ReadinessFlag};
-pub use body::ProxyBody;
+pub use body::{BodyError, ProxyBody};
 pub use forward::{ConnInfo, ProxyState, Scheme};
 pub use history::{
     CertKeys, GenerationHistory, GenerationRecord, PinChange, PinError, DEFAULT_HISTORY_SIZE,

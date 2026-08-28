@@ -263,6 +263,24 @@ impl EngineMetrics {
                 "Requests that matched no route and no default backend.",
                 self.sum(|c| &c.route_misses),
             ),
+            // Zero for the same reason the TLS handshake counters are: this
+            // engine has no QUIC listener, and a dashboard that loses a series
+            // when an operator changes engine looks like an outage.
+            (
+                "ramjet_h3_connections_total",
+                "HTTP/3 connections established on the QUIC listener.",
+                0,
+            ),
+            (
+                "ramjet_h3_requests_total",
+                "Requests that arrived over HTTP/3.",
+                0,
+            ),
+            (
+                "ramjet_h3_handshake_failures_total",
+                "QUIC connections that never became usable HTTP/3 connections.",
+                0,
+            ),
         ] {
             let _ = writeln!(out, "# HELP {name} {help}");
             let _ = writeln!(out, "# TYPE {name} counter");
