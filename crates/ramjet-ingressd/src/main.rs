@@ -685,6 +685,12 @@ fn proxy_config(args: &Args, https: Option<SocketAddr>) -> ProxyConfig {
 /// A drain that ran out of time is reported and then exits zero: the shutdown
 /// was requested and did everything it was allowed to, and a non-zero exit
 /// would make a normal rolling update look like a crash.
+///
+/// One function for both engines, and that is the whole reason
+/// `ramjet_engine::engine::Engine::run` reports an expired grace period with
+/// the same `TimedOut` kind `ramjet_proxy::Server::run` uses. Before the uring
+/// engine drained, its `run` could not produce that error and this arm was
+/// reachable from one lane only.
 fn finish(result: std::io::Result<()>) -> Result<ExitCode, Box<dyn std::error::Error>> {
     match result {
         Ok(()) => {
@@ -696,5 +702,46 @@ fn finish(result: std::io::Result<()>) -> Result<ExitCode, Box<dyn std::error::E
             Ok(ExitCode::SUCCESS)
         }
         Err(error) => Err(Box::new(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `Ok` arm of [`finish`] is `ExitCode::SUCCESS`, and `ExitCode` has
+    /// no `PartialEq` to assert that against — so "was it reported or was it
+    /// propagated" is the whole distinction these tests can draw, and it is
+    /// also the whole distinction that matters: a propagated error is what
+    /// `main` turns into a non-zero exit.
+    fn exits_zero(result: Result<ExitCode, Box<dyn std::error::Error>>) -> bool {
+        result.is_ok()
+    }
+
+    #[test]
+    fn a_drain_that_ran_out_of_time_still_exits_zero() {
+        // Both engines report an expired grace period this way. A non-zero
+        // exit would make every rolling update that ran long show up as a
+        // crash in `kubectl get pods`, which is where an operator looks for
+        // real ones.
+        let expired = std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "shutdown grace period expired with connections still open",
+        );
+        assert!(exits_zero(finish(Err(expired))));
+    }
+
+    #[test]
+    fn a_clean_drain_exits_zero() {
+        assert!(exits_zero(finish(Ok(()))));
+    }
+
+    #[test]
+    fn a_data_plane_that_actually_failed_does_not_exit_zero() {
+        // The other half, and the reason the arm above is written against one
+        // error kind rather than swallowing everything: a listener that could
+        // not be bound, or a serving core that panicked, has to be visible.
+        let failed = std::io::Error::other("a serving core panicked");
+        assert!(!exits_zero(finish(Err(failed))));
     }
 }
