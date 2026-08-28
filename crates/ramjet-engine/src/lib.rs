@@ -76,6 +76,7 @@ pub mod headers;
 pub mod helper;
 pub mod limits;
 pub mod metrics;
+pub mod mirror;
 pub mod rng;
 pub mod route;
 pub mod sys;

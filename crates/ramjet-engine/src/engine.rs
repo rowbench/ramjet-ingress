@@ -106,11 +106,41 @@ pub struct Config {
     pub pool_max_idle_per_host: usize,
     /// How long an idle upstream connection is kept.
     pub pool_idle_timeout: Duration,
+    /// Ceiling on one connection's read buffer.
+    ///
+    /// The same `--max-buf-size` the hyper engine takes, and it means the same
+    /// thing on both: the most one read can deliver, and so the memory a
+    /// connection can be holding on the read side. It is a *ceiling* on that
+    /// engine because hyper grows its buffer from a smaller start; here it is
+    /// the buffer, because these are allocated once, pooled, and never
+    /// truncated — restoring a shrunk one would cost a `memset` per read.
+    ///
+    /// Clamped up to [`MIN_BUF_SIZE`], which is the smallest a request head is
+    /// reliably read in.
+    pub max_buf_size: usize,
+    /// Largest request body copied to a mirror backend.
+    pub mirror_max_body: usize,
+    /// Where sampled copies go, or `None` where mirroring is not wired up.
+    ///
+    /// The worker draining this queue is a tokio task, so it has to be started
+    /// by the embedder from inside a runtime; the reactor threads only ever
+    /// `try_send` into it, which needs no runtime at all. A route with a mirror
+    /// annotation and no lane here simply makes no copies, which is the correct
+    /// behaviour for a data plane with nowhere to put them.
+    pub mirror: Option<crate::mirror::MirrorLane>,
     /// Listen backlog.
     pub backlog: i32,
     /// How often the helper thread ticks, which sets timeout resolution.
     pub tick: Duration,
 }
+
+/// The smallest read buffer this engine will use, whatever it is asked for.
+///
+/// A buffer below this can still serve any request — the head parser resumes
+/// across reads — but a head that needs several reads to arrive costs several
+/// completions, and 8 KiB is where that stops happening for ordinary traffic.
+/// The hyper engine clamps to the same number for the same reason.
+pub const MIN_BUF_SIZE: usize = 8 * 1024;
 
 impl Default for Config {
     fn default() -> Self {
@@ -129,6 +159,9 @@ impl Default for Config {
             max_connect_attempts: 3,
             pool_max_idle_per_host: 128,
             pool_idle_timeout: Duration::from_secs(90),
+            max_buf_size: 16 * 1024,
+            mirror_max_body: ramjet_proxy::DEFAULT_MIRROR_MAX_BODY,
+            mirror: None,
             backlog: 1024,
             tick: Duration::from_millis(100),
         }
@@ -250,8 +283,15 @@ impl Engine {
             None => (None, None),
         };
 
+        // The mirror worker's counters are reported alongside this engine's own,
+        // so a scrape shows one set of mirror numbers whichever lane is serving.
+        let metrics = match config.mirror.as_ref() {
+            Some(lane) => EngineMetrics::with_mirror(cores, Arc::clone(lane.metrics())),
+            None => EngineMetrics::new(cores),
+        };
+
         Ok(Engine {
-            metrics: Arc::new(EngineMetrics::new(cores)),
+            metrics: Arc::new(metrics),
             config: Arc::new(config),
             routes,
             readiness,

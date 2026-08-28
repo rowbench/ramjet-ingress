@@ -312,6 +312,33 @@ async fn uring_mode(
         None => None,
     };
 
+    // The mirror worker is a tokio task and has to be started from inside the
+    // runtime. The reactor threads only `try_send` into its queue, which needs
+    // no runtime at all, so this is the one piece of the uring lane that lives
+    // on the other side.
+    //
+    // One queue for the whole engine rather than one per core: the hyper lane
+    // gives each serving runtime its own so that a slow shadow fills one
+    // runtime's queue rather than contending for a shared one, and that
+    // argument does not carry here — the reactor threads are not the ones
+    // draining it, and a `try_send` on a full channel is the same
+    // constant-time drop from any of them.
+    let mirror_metrics = Arc::new(ramjet_proxy::Metrics::new());
+    let mirror = ramjet_engine::mirror::MirrorLane::new(
+        ramjet_proxy::Mirror::spawn(
+            ramjet_proxy::Upstream::new(&UpstreamConfig {
+                connect_timeout: args.connect_timeout,
+                response_timeout: args.response_timeout,
+                max_connect_attempts: args.max_connect_attempts,
+                pool_max_idle_per_host: args.upstream_pool_idle,
+                ..UpstreamConfig::default()
+            }),
+            Arc::clone(&mirror_metrics),
+        )
+        .with_max_body(args.mirror_max_body),
+        mirror_metrics,
+    );
+
     let readiness = Arc::new(AtomicBool::new(false));
     let config = ramjet_engine::engine::Config {
         http: args.http,
@@ -324,6 +351,9 @@ async fn uring_mode(
         response_timeout: args.response_timeout,
         max_connect_attempts: args.max_connect_attempts,
         pool_max_idle_per_host: args.upstream_pool_idle,
+        max_buf_size: args.max_buf_size,
+        mirror_max_body: args.mirror_max_body,
+        mirror: Some(mirror),
         ..ramjet_engine::engine::Config::default()
     };
 

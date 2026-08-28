@@ -56,10 +56,6 @@ pub struct CoreMetrics {
     route_misses: AtomicU64,
     tls_handshakes: AtomicU64,
     tls_handshake_failures: AtomicU64,
-    mirrored: AtomicU64,
-    mirror_dropped: AtomicU64,
-    mirror_skipped: AtomicU64,
-    mirror_failures: AtomicU64,
 }
 
 impl CoreMetrics {
@@ -133,32 +129,20 @@ impl CoreMetrics {
     pub fn tls_handshake_failure(&self) {
         self.tls_handshake_failures.fetch_add(1, Ordering::Relaxed);
     }
-
-    /// A copy was queued for a mirror backend and accepted by it.
-    pub fn mirrored(&self) {
-        self.mirrored.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// A copy was discarded because this core's mirror queue was full.
-    pub fn mirror_dropped(&self) {
-        self.mirror_dropped.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// A copy was not attempted because the request body was too large.
-    pub fn mirror_skipped(&self) {
-        self.mirror_skipped.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// A mirror backend refused a copy, or had nowhere to send it.
-    pub fn mirror_failure(&self) {
-        self.mirror_failures.fetch_add(1, Ordering::Relaxed);
-    }
 }
 
 /// Every core's counters, and the merge that turns them into an exposition.
 #[derive(Debug)]
 pub struct EngineMetrics {
     cores: Box<[CoreMetrics]>,
+    /// The mirror worker's own counters, when mirroring is wired up.
+    ///
+    /// Not per-core, and deliberately not: three of the four are written by a
+    /// tokio task that outlives the request that queued the copy, so there is
+    /// no core to attribute them to. They are the hyper engine's `Metrics`,
+    /// shared with the worker, which is also what keeps the numbers on the two
+    /// lanes the same shape.
+    mirror: Option<std::sync::Arc<ramjet_proxy::Metrics>>,
 }
 
 impl EngineMetrics {
@@ -166,7 +150,25 @@ impl EngineMetrics {
     pub fn new(cores: usize) -> Self {
         EngineMetrics {
             cores: (0..cores.max(1)).map(|_| CoreMetrics::default()).collect(),
+            mirror: None,
         }
+    }
+
+    /// Counters for `cores` serving threads, reporting a mirror worker's
+    /// numbers alongside their own.
+    pub fn with_mirror(cores: usize, mirror: std::sync::Arc<ramjet_proxy::Metrics>) -> Self {
+        EngineMetrics {
+            mirror: Some(mirror),
+            ..EngineMetrics::new(cores)
+        }
+    }
+
+    /// One of the mirror series, or zero where mirroring is not wired up.
+    ///
+    /// Zero rather than an absent series: a dashboard that loses a line when an
+    /// operator turns a feature off looks like an outage.
+    fn mirror(&self, pick: impl Fn(&ramjet_proxy::Metrics) -> u64) -> u64 {
+        self.mirror.as_deref().map_or(0, pick)
     }
 
     /// The block belonging to one core.
@@ -317,22 +319,22 @@ impl EngineMetrics {
             (
                 "ramjet_mirrored_total",
                 "Requests copied to a mirror backend, which accepted the copy.",
-                self.sum(|c| &c.mirrored),
+                self.mirror(ramjet_proxy::Metrics::mirrored),
             ),
             (
                 "ramjet_mirror_dropped_total",
                 "Copies discarded because a serving runtime's mirror queue was full.",
-                self.sum(|c| &c.mirror_dropped),
+                self.mirror(ramjet_proxy::Metrics::mirror_dropped),
             ),
             (
                 "ramjet_mirror_skipped_total",
                 "Copies not attempted because the request body exceeded --mirror-max-body.",
-                self.sum(|c| &c.mirror_skipped),
+                self.mirror(ramjet_proxy::Metrics::mirror_skipped),
             ),
             (
                 "ramjet_mirror_failures_total",
                 "Copies a mirror backend refused, failed, or did not answer in time.",
-                self.sum(|c| &c.mirror_failures),
+                self.mirror(ramjet_proxy::Metrics::mirror_failures),
             ),
         ] {
             let _ = writeln!(out, "# HELP {name} {help}");

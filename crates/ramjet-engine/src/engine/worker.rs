@@ -56,15 +56,6 @@ use crate::metrics::EngineMetrics;
 use crate::route;
 use crate::sys;
 
-/// Size of a read buffer, and so the most one completion can deliver.
-///
-/// These are allocated once and **never truncated**: a read buffer is handed to
-/// the reactor at its full length, comes back at its full length, and the bytes
-/// that arrived are copied out. Keeping them full-length is what avoids a
-/// 16 KiB `memset` per read, which at this request rate would cost more than
-/// the copy it replaced.
-const READ_BUF: usize = 16 * 1024;
-
 /// How much may be queued for one peer before we stop reading from the other.
 ///
 /// This is the whole of the backpressure story: a client that will not read its
@@ -100,6 +91,25 @@ mod kind {
     pub const ACCEPT_TLS: u8 = 12;
     /// A descriptor dealt out by the acceptor thread from the TLS listener.
     pub const INTAKE_TLS: u8 = 13;
+}
+
+/// A sampled copy of a request, being assembled while the original streams.
+///
+/// The head is complete the moment routing finishes; the body is not, so the
+/// copy waits here until the request's body ends and is queued then. That costs
+/// the primary nothing — the bytes are copied out of a buffer they were passing
+/// through anyway — which is why this engine does not need the hyper engine's
+/// buffer-then-dispatch step.
+struct MirrorCopy {
+    parts: http::request::Parts,
+    body: Vec<u8>,
+    /// The body went past `--mirror-max-body`, so there will be no copy.
+    ///
+    /// Kept as a flag rather than dropping the whole `MirrorCopy`, because a
+    /// skip is a number an operator needs: "the shadow is getting nothing"
+    /// and "the shadow is getting nothing *because the bodies are too big*"
+    /// are different problems.
+    too_large: bool,
 }
 
 /// How far the PROXY protocol header in front of a connection has got.
@@ -290,6 +300,18 @@ struct Conn {
     /// The table this request was routed against, held so retries see the same
     /// endpoints a mid-request publish cannot change.
     snapshot: Option<Arc<RouteTable>>,
+    /// The matched rule's index into the table's per-route counters.
+    ///
+    /// `None` when the default backend answered: there is no rule to attribute
+    /// the request to, and inventing one would put traffic against a route the
+    /// table does not contain.
+    route_stats: Option<u32>,
+    /// Whether the canary took this request, which decides whether the route's
+    /// canary block is written as well as its own.
+    canaried: bool,
+    /// A copy of this request waiting for its body, when the rule's mirror
+    /// sampled it.
+    mirror: Option<MirrorCopy>,
     stats_index: u32,
     endpoint_index: usize,
     /// How many endpoints the backend has.
@@ -363,6 +385,9 @@ impl Conn {
             upstream_eof: false,
             upgrade: None,
             snapshot: None,
+            route_stats: None,
+            canaried: false,
+            mirror: None,
             stats_index: 0,
             endpoint_index: 0,
             endpoint_count: 0,
@@ -395,6 +420,9 @@ impl Conn {
         self.upgrade = None;
         self.method_was_head = false;
         self.snapshot = None;
+        self.route_stats = None;
+        self.canaried = false;
+        self.mirror = None;
         self.targets.clear();
         self.attempt = 0;
         self.replayable = false;
@@ -494,6 +522,9 @@ pub(crate) struct Worker {
     high_water: usize,
     pool: Pool,
 
+    /// `--max-buf-size`, clamped, resolved once rather than read through the
+    /// `Arc<Config>` on every read.
+    read_buf_size: usize,
     read_bufs: Vec<Vec<u8>>,
     write_bufs: Vec<Vec<u8>>,
     done: Vec<Completion>,
@@ -518,6 +549,7 @@ impl Worker {
             core,
             driver: PlatformDriver::new()?,
             pool: Pool::new(config.pool_max_idle_per_host, config.pool_idle_timeout),
+            read_buf_size: config.max_buf_size.max(crate::engine::MIN_BUF_SIZE),
             config,
             routes,
             metrics,
@@ -607,22 +639,34 @@ impl Worker {
         &mut self.slots[i]
     }
 
+    /// A read buffer, and so the most one completion can deliver.
+    ///
+    /// Its size is `--max-buf-size`, read off the configuration rather than a
+    /// constant so the two engines are actually running the same bound when a
+    /// benchmark compares them.
+    ///
+    /// These are allocated once and **never truncated**: a buffer is handed to
+    /// the reactor at its full length, comes back at its full length, and the
+    /// bytes that arrived are copied out. Keeping them full-length is what
+    /// avoids a `memset` per read, which at this request rate would cost more
+    /// than the copy it replaced.
     fn read_buf(&mut self) -> Vec<u8> {
-        self.read_bufs.pop().unwrap_or_else(|| vec![0u8; READ_BUF])
+        let size = self.read_buf_size;
+        self.read_bufs.pop().unwrap_or_else(|| vec![0u8; size])
     }
 
     /// Return a read buffer, restoring its full length without a `memset`.
     ///
-    /// A read buffer is only ever handed out at `READ_BUF` bytes and comes back
+    /// A read buffer is only ever handed out at its full size and comes back
     /// the same length — the reactor returns a caller-supplied buffer at the
     /// caller's length, not trimmed — so this is a no-op in the normal case and
     /// a cheap guard against a future change that is not.
     fn recycle_read(&mut self, mut buf: Vec<u8>) {
-        if buf.capacity() < READ_BUF || self.read_bufs.len() >= 8 {
+        if buf.capacity() < self.read_buf_size || self.read_bufs.len() >= 8 {
             return;
         }
-        if buf.len() != READ_BUF {
-            buf.resize(READ_BUF, 0);
+        if buf.len() != self.read_buf_size {
+            buf.resize(self.read_buf_size, 0);
         }
         self.read_bufs.push(buf);
     }
@@ -1252,13 +1296,25 @@ impl Worker {
         };
         let path = headers::routing_path(target, &conn.inbox).unwrap_or("/");
 
-        let Some(backend) = route::select_backend(&snapshot, host, path, &conn.head, &conn.inbox)
+        let Some(matched) = route::match_request(&snapshot, host, path, &conn.head, &conn.inbox)
         else {
             self.metrics.core(self.core).route_miss();
             *self.slot(fd) = Slot::Client(conn);
             self.fail(fd, 404, limits::NO_ROUTE, false);
             return Ok(());
         };
+        let backend = matched.backend;
+        // Recorded on the connection rather than kept as a borrow: the snapshot
+        // is held for the life of the request, but this state machine hands the
+        // connection back to a slot between completions and cannot carry a
+        // reference across that. The indices are stable within the snapshot, so
+        // looking the counters up again at record time reaches the same block.
+        //
+        // A request answered by the default backend has no rule and so is
+        // counted only in the process-wide series: it matched nothing, and
+        // attributing it to a route would invent one that is not in the table.
+        conn.route_stats = matched.route;
+        conn.canaried = matched.canaried;
 
         // Checked after routing, exactly as the hyper engine does, so an
         // unrouted gRPC request is a 404 rather than a 502.
@@ -1320,6 +1376,17 @@ impl Worker {
             conn.request_head = head_out;
             conn.inbox = inbox;
         }
+        // Mirrored after the forwarded headers are on and before the request
+        // target is rewritten to an endpoint: the copy carries exactly the
+        // headers the real backend will see, and its own URI.
+        self.plan_mirror(&mut conn, &snapshot, matched.mirror, framing);
+        // A request with no body is complete the moment its head is, which is
+        // the overwhelming majority of ingress traffic and the case that costs
+        // nothing at all.
+        if conn.request_body.is_done() {
+            self.send_mirror(&mut conn);
+        }
+
         let consumed = conn.head.len;
         conn.inbox.drain(..consumed);
         conn.head_consumed = true;
@@ -1464,10 +1531,17 @@ impl Worker {
             match conn.request_body.take(&inbox) {
                 Ok((n, done)) => {
                     conn.up_outbox.extend_from_slice(&inbox[..n]);
+                    // The copy is taken here, out of a buffer these bytes were
+                    // passing through anyway, so the primary waits for nothing.
+                    if conn.mirror.is_some() {
+                        let taken = inbox[..n].to_vec();
+                        self.mirror_body(&mut conn, &taken);
+                    }
                     conn.inbox = inbox;
                     conn.inbox.drain(..n);
                     if done {
                         conn.request_body = Body::Done;
+                        self.send_mirror(&mut conn);
                     }
                     progressed = n > 0;
                 }
@@ -1550,9 +1624,7 @@ impl Worker {
                 }
             };
             if let Some(started) = conn.dispatched_at.take() {
-                self.metrics
-                    .core(self.core)
-                    .upstream_latency(started.elapsed());
+                self.record_upstream_latency(&conn, started.elapsed());
             }
             conn.upstream_keep_alive =
                 codec::keep_alive(&conn.up_head, &conn.up_inbox, conn.up_head.version())
@@ -1590,10 +1662,7 @@ impl Worker {
             // told a status, so nothing may be retried.
             conn.committed = true;
             conn.deadline = Some(Instant::now() + self.config.response_timeout);
-            if !conn.counted {
-                self.metrics.core(self.core).response(status);
-                conn.counted = true;
-            }
+            self.record_response(&mut conn, status);
         }
 
         // Relay body bytes verbatim — including chunk framing, which is
@@ -1709,14 +1778,9 @@ impl Worker {
         // An upgraded connection is never pooled: it is not HTTP any more.
         conn.upstream_keep_alive = false;
         if let Some(started) = conn.dispatched_at.take() {
-            self.metrics
-                .core(self.core)
-                .upstream_latency(started.elapsed());
+            self.record_upstream_latency(&conn, started.elapsed());
         }
-        if !conn.counted {
-            self.metrics.core(self.core).response(101);
-            conn.counted = true;
-        }
+        self.record_response(&mut conn, 101);
 
         *self.slot(fd) = Slot::Client(conn);
         Ok(())
@@ -1871,10 +1935,7 @@ impl Worker {
             conn.inbox.drain(..consumed);
             conn.head_consumed = true;
         }
-        if !conn.counted {
-            self.metrics.core(self.core).response(status);
-            conn.counted = true;
-        }
+        self.record_response(&mut conn, status);
         let mut out = std::mem::take(&mut conn.outbox);
         if conn.method_was_head {
             limits::write_static_head_only(&mut out, status, body.len(), close);
@@ -1998,6 +2059,162 @@ impl Worker {
     fn exhausted(&mut self, fd: RawFd) -> io::Result<()> {
         self.fail(fd, 502, limits::CONNECT_FAILED, false);
         self.drive(fd)
+    }
+
+    // ---- mirroring ----------------------------------------------------------
+
+    /// Decide where a sampled request's copy is going, and start assembling it.
+    ///
+    /// Everything that needs the route table happens here, while the snapshot
+    /// is in hand: which backend, which endpoint, which `Host`. What is left
+    /// for later is the body, and queueing.
+    ///
+    /// A mirror whose backend has no ready endpoints is counted as a failure
+    /// rather than ignored. An operator who configured a mirror and sees no
+    /// copies arriving should be able to tell "the shadow Service has no ready
+    /// pods" from "the annotation never took effect".
+    fn plan_mirror(
+        &self,
+        conn: &mut Conn,
+        snapshot: &RouteTable,
+        spec: Option<&ramjet_router::MirrorSpec>,
+        framing: Framing,
+    ) {
+        conn.mirror = None;
+        let Some(spec) = spec else { return };
+        let Some(lane) = self.config.mirror.as_ref() else {
+            return;
+        };
+        // A chunked request body is forwarded verbatim on this lane — chunk
+        // framing and all — so the bytes streaming past are not the body, they
+        // are the body's encoding. The mirror worker sends what it is given as
+        // a self-framed request, which would double-encode them. Decoding a
+        // body this engine deliberately does not decode, to make a copy of it,
+        // is not a trade worth making: it is counted as a skip instead, which
+        // is the same number the hyper lane reports for a body it could not
+        // reproduce.
+        if !matches!(framing, Framing::Empty | Framing::Length(_)) {
+            lane.skipped();
+            return;
+        }
+        let Some(backend) = snapshot.backend(spec.backend()) else {
+            return;
+        };
+        if backend.endpoints().is_empty() {
+            lane.failed();
+            return;
+        }
+        // No in-flight accounting for a mirrored request: the guard borrows out
+        // of the route table and cannot cross the queue, and letting shadow
+        // traffic move production's load-balancing decisions would be its own
+        // kind of leak.
+        let Some((index, _)) =
+            ramjet_router::select_endpoint(backend, snapshot.stats(), crate::rng::next_u64())
+        else {
+            lane.failed();
+            return;
+        };
+        let Some(endpoint) = backend.endpoints().get(index) else {
+            lane.failed();
+            return;
+        };
+        let Some(parts) = crate::mirror::parts_for(&conn.request_head, endpoint.addr, spec.host())
+        else {
+            lane.failed();
+            return;
+        };
+
+        conn.mirror = Some(MirrorCopy {
+            parts,
+            body: Vec::new(),
+            too_large: false,
+        });
+    }
+
+    /// Keep a copy of request-body bytes on their way upstream.
+    fn mirror_body(&self, conn: &mut Conn, bytes: &[u8]) {
+        let Some(copy) = conn.mirror.as_mut() else {
+            return;
+        };
+        if copy.too_large {
+            return;
+        }
+        if copy.body.len() + bytes.len() > self.config.mirror_max_body {
+            // Past the cap the bytes already held are released too: keeping
+            // them would be memory spent on a copy that is not going to be
+            // made.
+            copy.body = Vec::new();
+            copy.too_large = true;
+            return;
+        }
+        copy.body.extend_from_slice(bytes);
+    }
+
+    /// The request body is complete: hand the copy over, or count the skip.
+    fn send_mirror(&self, conn: &mut Conn) {
+        let Some(copy) = conn.mirror.take() else {
+            return;
+        };
+        let Some(lane) = self.config.mirror.as_ref() else {
+            return;
+        };
+        if copy.too_large {
+            lane.skipped();
+            return;
+        }
+        lane.enqueue(copy.parts, bytes::Bytes::from(copy.body));
+    }
+
+    // ---- per-route accounting ----------------------------------------------
+
+    /// Count a response against the process-wide series and the route's own.
+    ///
+    /// Always the matched route's block; additionally the route's canary block
+    /// when the canary took the request. Both, rather than one or the other —
+    /// the totals have to stay the totals, or every graph an operator has jumps
+    /// the moment a canary starts.
+    ///
+    /// The counter blocks are reached through the snapshot the request is
+    /// already holding, and they outlive it, so recording after a rebuild still
+    /// lands in the block the new generation serves.
+    fn record_response(&self, conn: &mut Conn, status: u16) {
+        if conn.counted {
+            return;
+        }
+        conn.counted = true;
+        self.metrics.core(self.core).response(status);
+
+        let Some(index) = conn.route_stats else { return };
+        let Some(table) = conn.snapshot.as_ref() else {
+            return;
+        };
+        let Some(slot) = table.route_stats().slot(index) else {
+            return;
+        };
+        // One block per serving core, so two cores never contend on the same
+        // cache line for the same route; the remainder against the shard count
+        // is taken inside the router.
+        slot.shard(self.core).record_response(status);
+        if conn.canaried {
+            slot.canary_shard(self.core).record_response(status);
+        }
+    }
+
+    /// Observe an upstream's response-header latency, in the same two places.
+    fn record_upstream_latency(&self, conn: &Conn, elapsed: Duration) {
+        self.metrics.core(self.core).upstream_latency(elapsed);
+
+        let Some(index) = conn.route_stats else { return };
+        let Some(table) = conn.snapshot.as_ref() else {
+            return;
+        };
+        let Some(slot) = table.route_stats().slot(index) else {
+            return;
+        };
+        slot.shard(self.core).record_upstream_latency(elapsed);
+        if conn.canaried {
+            slot.canary_shard(self.core).record_upstream_latency(elapsed);
+        }
     }
 
     // ---- in-flight accounting ----------------------------------------------

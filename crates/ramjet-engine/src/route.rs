@@ -11,11 +11,37 @@
 //! One snapshot is loaded per request and everything below reads through it, so
 //! a configuration published mid-request cannot change the answer halfway.
 
-use ramjet_router::{select_endpoint, Backend, Endpoint, RouteTable};
+use ramjet_router::{
+    select_endpoint, Backend, Endpoint, MirrorSpec, RouteTable, MIRROR_PERCENT_TOTAL,
+};
 
 use crate::codec::{Framing, Head};
 use crate::headers;
 use crate::rng;
+
+/// What the router said about a request, in the pieces the forward path needs.
+///
+/// The same four facts `ramjet_proxy::forward::Matched` carries, and for the
+/// same reasons: which backend serves it, which rule's counters it belongs to,
+/// whether the canary took it, and whether it was sampled for a mirror. Two
+/// engines answering differently here would be two engines routing differently,
+/// which is what the cross-engine differential test exists to catch.
+#[derive(Debug, Clone, Copy)]
+pub struct Matched<'t> {
+    /// Where to forward, after any canary decision.
+    pub backend: &'t Backend,
+    /// The matched rule's index into the table's per-route counters, or `None`
+    /// when the default backend answered and there is no rule to attribute the
+    /// request to.
+    pub route: Option<u32>,
+    /// Whether the canary took this request.
+    ///
+    /// Only the *attribution* depends on this; which route the request counts
+    /// against does not. See [`match_request`].
+    pub canaried: bool,
+    /// The rule's mirror, present only when this request was sampled for it.
+    pub mirror: Option<&'t MirrorSpec>,
+}
 
 /// What a request was routed to.
 #[derive(Debug, Clone, Copy)]
@@ -28,20 +54,42 @@ pub struct Route<'t> {
     pub endpoint: &'t Endpoint,
 }
 
-/// Pick the backend for a request, honouring any canary on the matched rule.
+/// Match a request and apply any canary and mirror on the rule it matched.
 ///
 /// Returns `None` when nothing matched and there is no default backend, which
 /// is the 404 path.
-pub fn select_backend<'t>(
+///
+/// A canary that diverts a request does **not** change which route it is
+/// counted against: the request matched that rule, and moving its numbers to a
+/// second route the moment somebody starts a canary would break the graph an
+/// operator is watching precisely then. What the canary decision changes is
+/// which *blocks* of that one route are written — the route's own always, and
+/// the route's canary block as well when the canary took it — so the split is
+/// available without the totals ever moving. That is the hyper engine's rule,
+/// stated the same way because it has to be the same rule.
+pub fn match_request<'t>(
     table: &'t RouteTable,
     host: &str,
     path: &str,
     head: &Head,
     buf: &[u8],
-) -> Option<&'t Backend> {
+) -> Option<Matched<'t>> {
     let matched = table.match_request(host, path)?;
+    let route = matched.rule().map(|rule| rule.stats_index());
+
+    // Independent of the canary: a mirror belongs to the rule, so a request the
+    // canary diverted is sampled on exactly the same terms as a stable one.
+    let mirror = matched
+        .mirror()
+        .filter(|spec| spec.sample(rng::below(MIRROR_PERCENT_TOTAL)));
+
     let Some(canary) = matched.canary() else {
-        return Some(matched.backend());
+        return Some(Matched {
+            backend: matched.backend(),
+            route,
+            canaried: false,
+            mirror,
+        });
     };
 
     let header_value = canary
@@ -53,14 +101,17 @@ pub fn select_backend<'t>(
         .and_then(|name| headers::cookie_value(head, buf, name));
     let roll = rng::below(canary.weight_total());
 
-    if canary.decide(header_value, cookie_value, roll) {
-        // A canary naming a backend that is no longer in the table is a
-        // configuration that changed under a live request, not a reason to
-        // fail one: serve production.
-        table.backend(canary.backend()).or(Some(matched.backend()))
-    } else {
-        Some(matched.backend())
-    }
+    let diverted = canary.decide(header_value, cookie_value, roll);
+    // A canary naming a backend the table does not hold is a controller bug,
+    // not a reason to fail the request: serve production instead. It is also
+    // not canary traffic, because it did not reach the canary.
+    let canary_backend = diverted.then(|| table.backend(canary.backend())).flatten();
+    Some(Matched {
+        backend: canary_backend.unwrap_or(matched.backend()),
+        route,
+        canaried: canary_backend.is_some(),
+        mirror,
+    })
 }
 
 /// Pick the first endpoint, by the backend's own load-balancing policy.
@@ -154,7 +205,7 @@ mod tests {
         let table = builder.build().expect("a valid table");
         let (head, buf) = head_of(b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n");
         let backend =
-            select_backend(&table, "app.example.com", "/", &head, &buf).expect("a backend");
+            match_request(&table, "app.example.com", "/", &head, &buf).expect("a backend").backend;
         assert_eq!(backend.name(), "prod");
     }
 
@@ -169,7 +220,7 @@ mod tests {
             .expect("a valid route");
         let table = builder.build().expect("a valid table");
         let (head, buf) = head_of(b"GET / HTTP/1.1\r\nHost: nope.invalid\r\n\r\n");
-        assert!(select_backend(&table, "nope.invalid", "/", &head, &buf).is_none());
+        assert!(match_request(&table, "nope.invalid", "/", &head, &buf).is_none());
     }
 
     #[test]
@@ -185,8 +236,8 @@ mod tests {
                 format!("GET / HTTP/1.1\r\nHost: app.example.com\r\nX-Canary: {header}\r\n\r\n");
             let (head, buf) = head_of(wire.as_bytes());
             let backend =
-                select_backend(&table, "app.example.com", "/", &head, &buf).expect("a backend");
-            assert_eq!(backend.name(), expected, "x-canary: {header}");
+                match_request(&table, "app.example.com", "/", &head, &buf).expect("a backend");
+            assert_eq!(backend.backend.name(), expected, "x-canary: {header}");
         }
     }
 
@@ -202,7 +253,7 @@ mod tests {
                      Cookie: session=abc; canary=always; theme=dark\r\n\r\n";
         let (head, buf) = head_of(wire);
         let backend =
-            select_backend(&table, "app.example.com", "/", &head, &buf).expect("a backend");
+            match_request(&table, "app.example.com", "/", &head, &buf).expect("a backend").backend;
         assert_eq!(backend.name(), "canary");
     }
 
@@ -217,8 +268,9 @@ mod tests {
         let (head, buf) = head_of(b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n");
         let diverted = (0..600)
             .filter(|_| {
-                select_backend(&table, "app.example.com", "/", &head, &buf)
+                match_request(&table, "app.example.com", "/", &head, &buf)
                     .expect("a backend")
+                    .backend
                     .name()
                     == "canary"
             })
@@ -242,8 +294,8 @@ mod tests {
             let (head, buf) = head_of(b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n");
             for _ in 0..200 {
                 let backend =
-                    select_backend(&table, "app.example.com", "/", &head, &buf).expect("backend");
-                assert_eq!(backend.name(), expected, "weight {weight}");
+                    match_request(&table, "app.example.com", "/", &head, &buf).expect("backend");
+                assert_eq!(backend.backend.name(), expected, "weight {weight}");
             }
         }
     }
