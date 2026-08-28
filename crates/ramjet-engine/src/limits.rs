@@ -30,13 +30,13 @@ pub const TIMEOUT: &[u8] = b"504 Gateway Timeout: the upstream sent no response 
 pub const GRPC: &[u8] =
     b"502 Bad Gateway: gRPC upstreams require HTTP/2, which ramjet does not yet speak upstream\n";
 
-/// A protocol upgrade, which v1 of this engine does not carry.
+/// An upstream switched protocols nobody asked it to.
 ///
-/// The hyper engine tunnels these. Lifting it here means keeping a connection
-/// pair spliced after the HTTP exchange ends, which is a second state machine
-/// rather than a missing branch — see the crate docs.
-pub const NO_UPGRADE: &[u8] =
-    b"502 Bad Gateway: the uring engine does not carry protocol upgrades; use --engine hyper\n";
+/// A 101 answering a request with no `Upgrade` leaves this hop unable to say
+/// how the rest of the connection is framed, and unwilling to guess. The same
+/// body the hyper engine sends when half of an upgrade is missing.
+pub const UPGRADE_FAILED: &[u8] =
+    b"502 Bad Gateway: the upstream refused to complete the upgrade\n";
 
 /// An HTTP/2 request, including h2c with prior knowledge.
 pub const NO_HTTP2: &[u8] =
@@ -120,7 +120,7 @@ mod tests {
             UPSTREAM_FAILED,
             TIMEOUT,
             GRPC,
-            NO_UPGRADE,
+            UPGRADE_FAILED,
             NO_HTTP2,
         ] {
             let text = std::str::from_utf8(body).expect("ascii body");

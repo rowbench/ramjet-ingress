@@ -92,6 +92,22 @@ pub enum Behaviour {
     EchoThenDieOnNext { body: Vec<u8> },
     /// Answer with a chunked body made of these pieces.
     Chunked(Vec<Vec<u8>>),
+    /// Accept an upgrade with a 101, then echo every byte back verbatim.
+    ///
+    /// Not a WebSocket implementation: the point of passthrough is that the
+    /// proxy does not know or care what the bytes mean, so an upstream that
+    /// reverses them would test the same thing. Echoing is just the easiest
+    /// thing to assert against.
+    UpgradeEcho,
+    /// Accept an upgrade with a 101 and then say these bytes, unprompted.
+    ///
+    /// A server that speaks first, which a WebSocket server may.
+    UpgradeThenSpeak(Vec<u8>),
+    /// Answer an upgrade request with an ordinary response instead.
+    ///
+    /// A backend that does not speak the protocol the client asked for. The
+    /// answer belongs to the client, not to the proxy.
+    RefuseUpgrade,
 }
 
 /// Start an upstream with the given behaviour.
@@ -269,6 +285,42 @@ fn serve(mut stream: TcpStream, behaviour: Behaviour, seen: Arc<Seen>, stop: Arc
                 out.extend_from_slice(b"0\r\n\r\n");
                 out
             }
+            Behaviour::RefuseUpgrade => {
+                let body = b"not switching";
+                let mut out = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                out.extend_from_slice(body);
+                out
+            }
+            Behaviour::UpgradeEcho | Behaviour::UpgradeThenSpeak(_) => {
+                let protocol = header_of(&head, "upgrade").unwrap_or_else(|| "websocket".into());
+                let mut out = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: {protocol}\r\n\
+                     Connection: Upgrade\r\n\r\n"
+                )
+                .into_bytes();
+                if let Behaviour::UpgradeThenSpeak(first) = &behaviour {
+                    out.extend_from_slice(first);
+                }
+                if stream.write_all(&out).is_err() {
+                    return;
+                }
+                let _ = stream.flush();
+                // Whatever the client pipelined behind its handshake is already
+                // tunnel traffic, so it is echoed rather than parsed.
+                if !buf.is_empty() {
+                    let carried = std::mem::take(&mut buf);
+                    if stream.write_all(&carried).is_err() {
+                        return;
+                    }
+                    let _ = stream.flush();
+                }
+                tunnel_echo(&mut stream, &stop);
+                return;
+            }
         };
 
         if stream.write_all(&response).is_err() {
@@ -284,6 +336,38 @@ fn serve(mut stream: TcpStream, behaviour: Behaviour, seen: Arc<Seen>, stop: Arc
 
 /// Reflect the request back so a test can assert on what actually crossed the
 /// hop.
+/// Echo every byte until the peer stops sending, then half-close.
+///
+/// The upstream half of an upgrade test. Deliberately byte-oriented: there is
+/// no framing here because passthrough has none to have.
+fn tunnel_echo(stream: &mut TcpStream, stop: &Arc<AtomicBool>) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut chunk = [0u8; 8192];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                // The peer half-closed. Answer in kind so the proxy sees the
+                // upstream's end of stream rather than a reset.
+                let _ = stream.shutdown(Shutdown::Write);
+                return;
+            }
+            Ok(n) => {
+                if stream.write_all(&chunk[..n]).is_err() {
+                    return;
+                }
+                let _ = stream.flush();
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return,
+        }
+    }
+}
+
 fn echo_response(head: &str, body: &[u8], reply: &[u8]) -> Vec<u8> {
     let mut out = String::from("HTTP/1.1 200 OK\r\n");
     let mut lines = head.split("\r\n");

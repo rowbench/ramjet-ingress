@@ -56,8 +56,9 @@ const SELF_WRITTEN: [&[u8]; 5] = [
 pub struct Hop {
     /// The client's address, as seen by this proxy.
     pub client: IpAddr,
-    /// The scheme the client used. Always `"http"` in v1: this engine binds no
-    /// TLS listener.
+    /// The scheme the client used: `"https"` when the connection arrived on
+    /// the TLS listener, `"http"` otherwise. It follows the connection rather
+    /// than the process, because one engine serves both listeners.
     pub scheme: &'static str,
 }
 
@@ -84,9 +85,27 @@ fn connection_lists(head: &Head, buf: &[u8], name: &[u8]) -> bool {
 /// The `Upgrade` header alone does not count: RFC 9110 requires
 /// `Connection: upgrade` beside it, and a bare `Upgrade` is a hint a server may
 /// ignore. The hyper engine applies the same test, so the two agree on which
-/// requests are refused by this engine's no-upgrade limit.
+/// requests are forwarded as upgrade attempts.
 pub fn wants_upgrade(head: &Head, buf: &[u8]) -> bool {
     connection_lists(head, buf, b"upgrade") && head.header(buf, b"upgrade").is_some()
+}
+
+/// The protocol named by an `Upgrade` header, if this message asked for one.
+///
+/// Returned as bytes out of the caller's buffer rather than a string: the value
+/// is forwarded verbatim, and a protocol token this hop does not recognise is
+/// still one the two endpoints may have agreed on.
+pub fn upgrade_protocol<'a>(head: &'a Head, buf: &'a [u8]) -> Option<&'a [u8]> {
+    if !connection_lists(head, buf, b"upgrade") {
+        return None;
+    }
+    let value = trim_ows(head.header(buf, b"upgrade")?);
+    (!value.is_empty()).then_some(value)
+}
+
+/// Whether a response head is a `101 Switching Protocols`.
+pub fn is_switching_protocols(head: &Head) -> bool {
+    matches!(head.start, StartLine::Status { code: 101, .. })
 }
 
 /// Whether a header should be copied through unchanged.
@@ -159,6 +178,7 @@ pub fn write_upstream_request(
     endpoint: SocketAddr,
     framing: Framing,
     close: bool,
+    upgrade: Option<&[u8]>,
 ) {
     let StartLine::Request { method, target, .. } = head.start else {
         debug_assert!(false, "write_upstream_request needs a request head");
@@ -216,7 +236,15 @@ pub fn write_upstream_request(
     if framing == Framing::Chunked {
         field(out, b"Transfer-Encoding", b"chunked");
     }
-    if close {
+    // `Connection` and `Upgrade` were both stripped as hop-by-hop, which is
+    // correct — they describe *this* hop. An upgrade then has to restate them
+    // for the hop being opened, or the origin sees a request that no longer
+    // asks to switch protocols and answers it as an ordinary GET. The hyper
+    // engine does the same thing through `restore_upgrade`.
+    if let Some(protocol) = upgrade {
+        field(out, b"Connection", b"upgrade");
+        field(out, b"Upgrade", protocol);
+    } else if close {
         field(out, b"Connection", b"close");
     }
     out.extend_from_slice(b"\r\n");
@@ -233,6 +261,7 @@ pub fn write_downstream_response(
     buf: &[u8],
     framing: Framing,
     close: bool,
+    upgrade: Option<&[u8]>,
 ) {
     let StartLine::Status { code, reason, .. } = head.start else {
         debug_assert!(false, "write_downstream_response needs a status head");
@@ -264,7 +293,13 @@ pub fn write_downstream_response(
     if framing == Framing::Chunked {
         field(out, b"Transfer-Encoding", b"chunked");
     }
-    if close {
+    // A 101 that lost its `Connection: upgrade` is a 101 the client will not
+    // act on: RFC 9110 requires both, and a browser that sees only the status
+    // treats the connection as still speaking HTTP.
+    if let Some(protocol) = upgrade {
+        field(out, b"Connection", b"upgrade");
+        field(out, b"Upgrade", protocol);
+    } else if close {
         field(out, b"Connection", b"close");
     }
     out.extend_from_slice(b"\r\n");
@@ -346,7 +381,7 @@ mod tests {
         assert!(parse_request_head(wire, &mut head).expect("valid request"));
         let framing = request_framing(&head, wire).expect("valid framing");
         let mut out = Vec::new();
-        write_upstream_request(&mut out, &head, wire, hop(), endpoint(), framing, false);
+        write_upstream_request(&mut out, &head, wire, hop(), endpoint(), framing, false, None);
         String::from_utf8(out).expect("ascii head")
     }
 
@@ -355,7 +390,7 @@ mod tests {
         let mut head = Head::default();
         assert!(parse_response_head(wire, &mut head).expect("valid response"));
         let mut out = Vec::new();
-        write_downstream_response(&mut out, &head, wire, framing, close);
+        write_downstream_response(&mut out, &head, wire, framing, close, None);
         String::from_utf8(out).expect("ascii head")
     }
 

@@ -207,6 +207,9 @@ enum Phase {
     Exchanging,
     /// The response head is sent; its body is streaming.
     Relaying,
+    /// The upstream accepted an upgrade. There is no HTTP left in either
+    /// direction, only bytes.
+    Tunnel,
     /// Nothing more will be read; flush what is queued and close.
     Closing,
 }
@@ -274,6 +277,15 @@ struct Conn {
     response_body: Body,
     response_head_seen: bool,
     upstream_keep_alive: bool,
+    /// The upstream has closed its half. Only meaningful in a tunnel, where an
+    /// end of stream is a half-close rather than the end of the exchange.
+    upstream_eof: bool,
+    /// The protocol this request asked to upgrade to, if it asked.
+    ///
+    /// Kept as bytes rather than parsed: this hop forwards the token and does
+    /// not need to know what it means. A `None` here on a 101 response means
+    /// the upstream switched protocols nobody asked it to.
+    upgrade: Option<Vec<u8>>,
 
     /// The table this request was routed against, held so retries see the same
     /// endpoints a mid-request publish cannot change.
@@ -348,6 +360,8 @@ impl Conn {
             response_body: Body::Done,
             response_head_seen: false,
             upstream_keep_alive: true,
+            upstream_eof: false,
+            upgrade: None,
             snapshot: None,
             stats_index: 0,
             endpoint_index: 0,
@@ -377,6 +391,8 @@ impl Conn {
         self.response_body = Body::Done;
         self.response_head_seen = false;
         self.upstream_keep_alive = true;
+        self.upstream_eof = false;
+        self.upgrade = None;
         self.method_was_head = false;
         self.snapshot = None;
         self.targets.clear();
@@ -405,6 +421,9 @@ impl Conn {
             Phase::Connecting | Phase::Exchanging => {
                 !self.request_body.is_done() && self.up_outbox.len() < MAX_PENDING
             }
+            // A tunnel reads from both ends for as long as both are open; the
+            // only thing that stops it is the other side falling behind.
+            Phase::Tunnel => self.up_outbox.len() < MAX_PENDING,
             Phase::Relaying | Phase::Closing => false,
         }
     }
@@ -414,6 +433,7 @@ impl Conn {
         self.upstream.is_some()
             && self.up_ready
             && !matches!(self.phase, Phase::Head | Phase::Closing)
+            && !self.upstream_eof
             && pending_out_len(self) < MAX_PENDING
     }
 }
@@ -1079,6 +1099,15 @@ impl Worker {
             *self.slot(down) = Slot::Empty;
             return Ok(());
         };
+        // Inside a tunnel an end of stream is one peer hanging up, not a
+        // truncated response: there is no response any more.
+        if conn.phase == Phase::Tunnel {
+            conn.upstream_eof = true;
+            conn.up_reading = false;
+            *self.slot(down) = Slot::Client(conn);
+            return self.advance(down);
+        }
+
         let complete = conn.response_head_seen && matches!(conn.response_body, Body::UntilClose);
         if complete {
             // A response with no framing header ends exactly here, and the
@@ -1115,6 +1144,7 @@ impl Worker {
                 Phase::Head => self.parse_request(fd)?,
                 Phase::Connecting => false,
                 Phase::Exchanging | Phase::Relaying => self.pump_bodies(fd)?,
+                Phase::Tunnel => self.pump_tunnel(fd)?,
                 Phase::Closing => false,
             };
             if !progressed {
@@ -1194,11 +1224,11 @@ impl Worker {
             .method(&conn.inbox)
             .is_some_and(|m| m.eq_ignore_ascii_case(b"HEAD"));
 
-        if headers::wants_upgrade(&conn.head, &conn.inbox) {
-            *self.slot(fd) = Slot::Client(conn);
-            self.fail(fd, 502, limits::NO_UPGRADE, true);
-            return Ok(());
-        }
+        // An upgrade is forwarded, not answered. Whether it becomes a tunnel is
+        // the upstream's decision, made when its response head arrives: a
+        // backend that answers 200 to a WebSocket handshake is a backend that
+        // does not speak WebSocket, and that answer belongs to the client.
+        conn.upgrade = headers::upgrade_protocol(&conn.head, &conn.inbox).map(<[u8]>::to_vec);
 
         // One snapshot, taken once, so nothing below can see two configurations.
         let snapshot = self.routes.load_full();
@@ -1264,6 +1294,7 @@ impl Worker {
         {
             let inbox = std::mem::take(&mut conn.inbox);
             let mut head_out = std::mem::take(&mut conn.request_head);
+            let upgrade = conn.upgrade.clone();
             headers::write_upstream_request(
                 &mut head_out,
                 &conn.head,
@@ -1272,6 +1303,7 @@ impl Worker {
                 conn.targets[0],
                 framing,
                 false,
+                upgrade.as_deref(),
             );
             conn.request_head = head_out;
             conn.inbox = inbox;
@@ -1484,6 +1516,16 @@ impl Worker {
                 Ok(true) => {}
             }
 
+            // A 101 is not a response with a body, it is the end of HTTP on
+            // this connection. Deciding that here, before framing is worked
+            // out, is what keeps the switch out of the body machinery: there
+            // is no framing to compute, because everything after the head
+            // belongs to whatever protocol the two ends just agreed on.
+            if headers::is_switching_protocols(&conn.up_head) {
+                *self.slot(fd) = Slot::Client(conn);
+                return self.begin_tunnel(fd).map(|()| true);
+            }
+
             let framing = match codec::response_framing(
                 &conn.up_head,
                 &conn.up_inbox,
@@ -1522,6 +1564,7 @@ impl Worker {
                     &up_inbox,
                     framing,
                     close_client,
+                    None,
                 );
                 conn.outbox = out;
                 conn.up_inbox = up_inbox;
@@ -1572,6 +1615,153 @@ impl Worker {
             self.finish_response(fd)?;
             return Ok(true);
         }
+        Ok(moved)
+    }
+
+    /// The upstream accepted an upgrade: relay the 101 and stop speaking HTTP.
+    ///
+    /// # Why there is no frame parsing here
+    ///
+    /// Passthrough needs none. Once a 101 has crossed this hop the two
+    /// endpoints have agreed on a protocol, and every byte after the head is
+    /// theirs — a WebSocket frame, or whatever else they settled on, is opaque
+    /// to a proxy that is not inspecting it. So this is a byte pump, and it
+    /// costs the same two buffers however chatty the protocol on top turns out
+    /// to be. The hyper engine's `splice` is the same decision.
+    ///
+    /// # Shutdown
+    ///
+    /// A tunnel does not hold shutdown open, for the same reason nothing else
+    /// on this engine does: a stop is a flag every core reads on its next tick,
+    /// and `teardown` closes whatever is still open. There is no drain to
+    /// exclude a tunnel from, which is the same end state the hyper engine
+    /// arrives at by excluding it explicitly.
+    fn begin_tunnel(&mut self, fd: RawFd) -> io::Result<()> {
+        let Slot::Client(mut conn) = std::mem::replace(self.slot(fd), Slot::Taken) else {
+            *self.slot(fd) = Slot::Empty;
+            return Ok(());
+        };
+
+        // A 101 to a request that never asked to upgrade leaves this hop with
+        // no idea how the rest of the connection is framed, and no honest way
+        // to guess. The client has had no bytes yet, so it can still be told.
+        let Some(protocol) = conn.upgrade.clone() else {
+            *self.slot(fd) = Slot::Client(conn);
+            self.fail(fd, 502, limits::UPGRADE_FAILED, true);
+            return self.drive(fd);
+        };
+
+        // The upstream normally echoes `Upgrade`; where it did not, the
+        // protocol the client asked for is the only sensible answer, which is
+        // the rule the hyper engine's `relay` applies.
+        let echoed = headers::upgrade_protocol(&conn.up_head, &conn.up_inbox).map(<[u8]>::to_vec);
+        let protocol = echoed.unwrap_or(protocol);
+
+        {
+            let up_inbox = std::mem::take(&mut conn.up_inbox);
+            let mut out = std::mem::take(&mut conn.outbox);
+            headers::write_downstream_response(
+                &mut out,
+                &conn.up_head,
+                &up_inbox,
+                Framing::Empty,
+                false,
+                Some(&protocol),
+            );
+            conn.outbox = out;
+            conn.up_inbox = up_inbox;
+        }
+        let consumed = conn.up_head.len;
+        conn.up_inbox.drain(..consumed);
+
+        // Anything the upstream sent past its 101 in the same read is already
+        // tunnel traffic. A server that speaks first — which a WebSocket
+        // server may — would otherwise have its first frame dropped.
+        let carried = std::mem::take(&mut conn.up_inbox);
+        conn.outbox.extend_from_slice(&carried);
+        conn.up_inbox = carried;
+        conn.up_inbox.clear();
+
+        // The same for the client: bytes pipelined behind the handshake.
+        let pipelined = std::mem::take(&mut conn.inbox);
+        conn.up_outbox.extend_from_slice(&pipelined);
+        conn.inbox = pipelined;
+        conn.inbox.clear();
+
+        conn.response_head_seen = true;
+        conn.committed = true;
+        conn.phase = Phase::Tunnel;
+        // A tunnel has no response deadline. The bound it lives under is the
+        // client's idle timeout, and an idle WebSocket is a working WebSocket.
+        conn.deadline = None;
+        // An upgraded connection is never pooled: it is not HTTP any more.
+        conn.upstream_keep_alive = false;
+        if let Some(started) = conn.dispatched_at.take() {
+            self.metrics
+                .core(self.core)
+                .upstream_latency(started.elapsed());
+        }
+        if !conn.counted {
+            self.metrics.core(self.core).response(101);
+            conn.counted = true;
+        }
+
+        *self.slot(fd) = Slot::Client(conn);
+        Ok(())
+    }
+
+    /// Move bytes both ways through an established tunnel.
+    ///
+    /// Returns whether anything moved. There is no parsing: whatever arrived on
+    /// one side is queued for the other exactly as it came.
+    fn pump_tunnel(&mut self, fd: RawFd) -> io::Result<bool> {
+        let Slot::Client(mut conn) = std::mem::replace(self.slot(fd), Slot::Taken) else {
+            *self.slot(fd) = Slot::Empty;
+            return Ok(false);
+        };
+        let mut moved = false;
+
+        if !conn.inbox.is_empty() {
+            let inbox = std::mem::take(&mut conn.inbox);
+            conn.up_outbox.extend_from_slice(&inbox);
+            conn.inbox = inbox;
+            conn.inbox.clear();
+            moved = true;
+        }
+        if !conn.up_inbox.is_empty() {
+            let up_inbox = std::mem::take(&mut conn.up_inbox);
+            conn.outbox.extend_from_slice(&up_inbox);
+            conn.up_inbox = up_inbox;
+            conn.up_inbox.clear();
+            moved = true;
+        }
+
+        // A half-close is forwarded rather than escalated to a full close.
+        // Closing both directions when one ends would throw away the other
+        // side's remaining bytes — for a WebSocket, the close frame that says
+        // why the connection is ending.
+        if conn.client_eof && conn.up_outbox.is_empty() && !conn.up_writing {
+            if let Some(up) = conn.upstream {
+                sys::shutdown_write(up);
+            }
+        }
+        if conn.upstream_eof && conn.outbox.is_empty() && !conn.writing {
+            match conn.tls.as_mut() {
+                // TLS has no half-close: the record layer's end-of-stream is
+                // `close_notify`, and a session that has sent one cannot send
+                // anything else. So the client is told the stream ended and
+                // the connection goes, rather than being held half-open for a
+                // direction that can no longer carry anything.
+                Some(session) => {
+                    session.send_close_notify();
+                    conn.phase = Phase::Closing;
+                }
+                None if conn.client_eof => conn.phase = Phase::Closing,
+                None => sys::shutdown_write(fd),
+            }
+        }
+
+        *self.slot(fd) = Slot::Client(conn);
         Ok(moved)
     }
 
@@ -1967,8 +2157,10 @@ impl Worker {
                 }
                 // A response that is still streaming is making progress; the
                 // deadline bounds how long the *headers* take, not how long a
-                // large download is allowed to be.
-                Phase::Relaying | Phase::Closing => {
+                // large download is allowed to be. A tunnel is on no clock at
+                // all — an idle WebSocket is a working WebSocket — and reaches
+                // here only if something set a deadline it should not have.
+                Phase::Relaying | Phase::Closing | Phase::Tunnel => {
                     let extended = now + self.config.response_timeout;
                     if let Slot::Client(conn) = self.slot(fd) {
                         conn.deadline = Some(extended);

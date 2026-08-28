@@ -367,6 +367,17 @@ pub fn peer_addr(fd: RawFd) -> io::Result<SocketAddr> {
     }
 }
 
+/// Close the writing half of a socket, sending a FIN and leaving reads open.
+///
+/// What a tunnel needs when one side stops talking. Closing the whole
+/// descriptor instead would throw away whatever the *other* side still has to
+/// send, which for a WebSocket is the close frame that says why. A failure here
+/// means the peer had already gone, which is not news worth acting on.
+pub fn shutdown_write(fd: RawFd) {
+    // SAFETY: shutdown takes two scalars and touches no memory of ours.
+    unsafe { libc::shutdown(fd, libc::SHUT_WR) };
+}
+
 /// Apply `TCP_NODELAY` to an accepted socket.
 pub fn set_nodelay(fd: RawFd) -> io::Result<()> {
     set_flag(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, true)

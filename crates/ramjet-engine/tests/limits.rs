@@ -1,16 +1,24 @@
 //! What this engine refuses, and how loudly.
 //!
-//! The v1 gaps — TLS, HTTP/2, upgrades — are refused with a status and an
+//! The gap that is left — HTTP/2 in any form — is refused with a status and an
 //! explanation naming the other engine, never by quietly doing something else.
 //! A silent gap is worse than a missing feature, because it looks like a bug in
 //! whatever is on the other end.
+//!
+//! Upgrades and TLS used to be listed here. They are carried now, and the tests
+//! that pinned their refusals were replaced with the ones in `websocket.rs` and
+//! `tls.rs` rather than deleted: a closed gap needs a test saying it is closed,
+//! or the next person to read `limits.rs` has no way to tell.
 
 mod common;
 
 use common::{echo, get_with, table_for, Client, Proxy};
 
 #[test]
-fn an_upgrade_request_is_refused_with_a_pointer_to_the_other_engine() {
+fn an_upgrade_request_is_forwarded_rather_than_refused() {
+    // The gap that closed. An upgrade reaches the backend, and what the backend
+    // says about it is what the client gets — here a plain 200, because the
+    // echo upstream does not speak WebSocket. `websocket.rs` covers the 101.
     let upstream = echo();
     let proxy = Proxy::start(table_for("app.example.com", &[upstream.addr]));
 
@@ -26,13 +34,12 @@ fn an_upgrade_request_is_refused_with_a_pointer_to_the_other_engine() {
         ],
     );
 
-    assert_eq!(response.status, 502);
-    assert!(
-        response.text().contains("--engine hyper"),
-        "the refusal must say where upgrades do work: {}",
-        response.text()
-    );
-    assert_eq!(upstream.seen.requests(), 0, "nothing was forwarded");
+    assert_eq!(response.status, 200);
+    assert_eq!(upstream.seen.requests(), 1, "the upgrade was forwarded");
+    // The headers the origin needs in order to answer 101 at all, restated for
+    // the hop this proxy opened.
+    assert_eq!(response.header("echo-upgrade"), Some("websocket"));
+    assert_eq!(response.header("echo-connection"), Some("upgrade"));
 }
 
 #[test]
