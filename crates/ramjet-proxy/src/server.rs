@@ -130,6 +130,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_rustls::TlsAcceptor;
 
 use crate::admin::{self, AdminState, ReadinessFlag};
+use crate::body::ProxyBody;
 use crate::forward::{self, ConnInfo, ProxyState, Scheme};
 use crate::history::{GenerationHistory, DEFAULT_HISTORY_SIZE};
 use crate::listener::{Listener, ListenerConfig};
@@ -800,6 +801,11 @@ where
     let state = Arc::clone(&lane.state);
     let service = service_fn(move |request| {
         let state = Arc::clone(&state);
+        // `map` is the whole conversion: `ProxyBody::Stream` delegates every
+        // poll straight to `Incoming`, so naming the crate's own body type on
+        // the way in costs this path nothing and is what lets a request that
+        // never came from hyper — an HTTP/3 one — reach the same function.
+        let request = request.map(ProxyBody::stream);
         // Boxed, and it is worth the allocation. hyper's HTTP/1 dispatcher
         // keeps the in-flight response future in a `Pin<Box<Option<S::Future>>>`
         // that it allocates when the connection is created and holds for the

@@ -15,6 +15,17 @@
 //! 3. **No buffering.** Bodies stream in both directions; see
 //!    [`ProxyBody`](crate::body::ProxyBody).
 //!
+//! # The request body is the proxy's own type, not hyper's
+//!
+//! [`handle`] takes a `Request<ProxyBody>` rather than the `Request<Incoming>`
+//! a hyper service hands it, and the caller does the one-line conversion. That
+//! is not tidiness: `hyper::body::Incoming` has no public constructor, so a
+//! request that did not arrive on a hyper connection cannot be expressed as
+//! one — and HTTP/3 requests do not. Naming the crate's own body here is what
+//! lets the `http3` module reach this function instead of forking it, and it
+//! costs the HTTP/1.1 and HTTP/2 paths nothing: `ProxyBody::Stream` is a
+//! straight delegation to `Incoming`.
+//!
 //! # Retrying, and why it is narrower than you might expect
 //!
 //! A connect failure means nothing was written to the endpoint, so the request
@@ -141,7 +152,7 @@ pub struct ConnInfo {
 pub async fn handle(
     state: Arc<ProxyState>,
     conn: ConnInfo,
-    request: Request<Incoming>,
+    request: Request<ProxyBody>,
 ) -> Response<ProxyBody> {
     let response = forward(&state, conn, request).await;
     state.metrics.record_response(response.status().as_u16());
@@ -151,7 +162,7 @@ pub async fn handle(
 async fn forward(
     state: &ProxyState,
     conn: ConnInfo,
-    request: Request<Incoming>,
+    request: Request<ProxyBody>,
 ) -> Response<ProxyBody> {
     // The one and only snapshot load. Everything below borrows from it.
     let snapshot = state.routes.load_full();
@@ -189,7 +200,7 @@ async fn forward(
 async fn dispatch(
     state: &ProxyState,
     conn: ConnInfo,
-    request: Request<Incoming>,
+    request: Request<ProxyBody>,
     snapshot: &RouteTable,
     backend: &Backend,
     route: Option<&RouteCounters>,
@@ -236,7 +247,6 @@ async fn dispatch(
     parts.version = Version::HTTP_11;
 
     let path_and_query = parts.uri.path_and_query().cloned();
-    let body = ProxyBody::stream(body);
 
     // See the module docs: only a body we can reproduce may be re-dispatched.
     let retryable = body.is_known_empty();
@@ -344,7 +354,7 @@ struct Matched<'t> {
 /// numbers in two the moment somebody starts a canary would break the graph an
 /// operator is watching precisely then. Which share went to the canary is a
 /// property of the rule, and `/admin/routes` reports it as one.
-fn select_backend<'t>(table: &'t RouteTable, request: &Request<Incoming>) -> Option<Matched<'t>> {
+fn select_backend<'t>(table: &'t RouteTable, request: &Request<ProxyBody>) -> Option<Matched<'t>> {
     let matched = table.match_request(request_authority(request), request.uri().path())?;
     let route = matched.rule().map(|rule| rule.stats_index());
 
@@ -382,7 +392,7 @@ fn select_backend<'t>(table: &'t RouteTable, request: &Request<Incoming>) -> Opt
 /// HTTP/1.1 puts it in `Host`, except in the absolute-form request target,
 /// where RFC 7230 §5.4 says the target wins. Checking the URI first gets all
 /// three right.
-fn request_authority(request: &Request<Incoming>) -> &str {
+fn request_authority(request: &Request<ProxyBody>) -> &str {
     if let Some(authority) = request.uri().authority() {
         return authority.as_str();
     }
@@ -397,7 +407,7 @@ fn request_authority(request: &Request<Incoming>) -> &str {
 ///
 /// Kept separate so the HTTP/1.1 path clones a `HeaderValue` — a refcount bump
 /// on the underlying `Bytes` — instead of re-parsing a `&str` into one.
-fn client_host(request: &Request<Incoming>) -> Option<HeaderValue> {
+fn client_host(request: &Request<ProxyBody>) -> Option<HeaderValue> {
     match request.uri().authority() {
         Some(authority) => HeaderValue::from_str(authority.as_str()).ok(),
         None => request.headers().get(header::HOST).cloned(),
