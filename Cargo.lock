@@ -1563,6 +1563,7 @@ version = "0.1.0"
 dependencies = [
  "kube",
  "ramjet-controller",
+ "ramjet-engine",
  "ramjet-proxy",
  "ramjet-router",
  "rcgen",
