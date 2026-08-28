@@ -59,7 +59,28 @@ set -euo pipefail
 
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${BENCH_DIR}/../.." && pwd)"
-RESULTS_DIR="${BENCH_DIR}/results"
+
+# Only an unmodified, committed-protocol run may write where the committed
+# measurement lives. Anything with a knob turned goes to results/scratch/.
+#
+# The failure this prevents is not losing files, which git makes recoverable.
+# It is a *plausible* wrong number: a short run leaves partial output where the
+# real one was, `report.py` renders it, and the result reads as a modest
+# regression rather than as obvious corruption. An obviously-broken figure gets
+# caught; a believable one gets quoted and sends somebody hunting a code change
+# that never happened. Checked before the defaults below are applied, because
+# afterwards there is no way to tell an override from a default.
+OVERRIDDEN=""
+for knob in WARMUP DURATION COOLDOWN ROUNDS CONC_MAIN CONC_HIGH; do
+    [ -n "${!knob:-}" ] && OVERRIDDEN="${OVERRIDDEN}${knob} "
+done
+[ "${SMOKE:-0}" = "1" ] && OVERRIDDEN="${OVERRIDDEN}SMOKE "
+
+if [ -n "${OVERRIDDEN}" ]; then
+    RESULTS_DIR="${BENCH_DIR}/results/scratch"
+else
+    RESULTS_DIR="${BENCH_DIR}/results"
+fi
 
 # A prefix of its own, so this can never collide with bench/run.sh's
 # `ramjet-bench-*` or the Kubernetes suite's `ramjet-thesis-*` on a shared
@@ -440,6 +461,10 @@ syscall_evidence() {
 }
 
 main() {
+    if [ -n "${OVERRIDDEN}" ]; then
+        warn "non-default settings (${OVERRIDDEN}) — writing to results/scratch/, not the committed results"
+        warn "these numbers validate the harness; they are not a measurement"
+    fi
     preflight
     build_images
     start_topology
@@ -451,7 +476,7 @@ main() {
     diagnostics
     syscall_evidence
     log "rendering the table"
-    python3 "${BENCH_DIR}/report.py" | tee "${RESULTS_DIR}/table.md"
+    python3 "${BENCH_DIR}/report.py" "${RESULTS_DIR}" | tee "${RESULTS_DIR}/table.md"
     log "raw JSON in ${RESULTS_DIR}; write the reading into RESULTS.md"
 }
 

@@ -18,7 +18,9 @@ import pathlib
 import statistics
 import sys
 
-RESULTS = pathlib.Path(__file__).parent / "results"
+# The directory to read, so a scratch run renders its own numbers instead of
+# appearing to restate the committed ones.
+RESULTS = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).parent / "results"
 
 # Display name -> filename stem. Order here is the order of the table rows.
 CONTENDERS = [
@@ -112,7 +114,7 @@ def main():
 
     levels = concurrencies()
     if not levels:
-        sys.exit("no results found; run ./run.sh first")
+        sys.exit(f"no results found in {RESULTS}; run ./run.sh first")
 
     main_level = max(levels, key=lambda c: len(runs_for(CONTENDERS[0][1], c)))
 

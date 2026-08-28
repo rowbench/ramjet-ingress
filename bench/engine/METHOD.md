@@ -144,6 +144,25 @@ can resolve. A gap smaller than the spread of either side is reported as
 are equal, it means **this benchmark cannot tell them apart**, and the honest
 statement is "the same".
 
+## A smoke run cannot overwrite a measurement
+
+`run_all` starts by clearing the results directory, so a short run used to be
+able to leave partial output where the committed measurement lived. That is not
+a file-loss problem — git makes those recoverable — it is a *plausible wrong
+number* problem. A one-round smoke leaves three files where thirty belong,
+`report.py` renders them, and the result reads as a modest regression rather
+than as obvious corruption. An obviously-broken figure gets caught; a believable
+one gets quoted, and somebody goes hunting for the code change that caused it.
+
+So overriding any of `WARMUP`, `DURATION`, `COOLDOWN`, `ROUNDS`, `CONC_MAIN` or
+`CONC_HIGH` — or passing `SMOKE=1` — redirects output to `results/scratch/`,
+which is gitignored. Only an unmodified committed-protocol run can write where
+the committed numbers are. `report.py` takes the directory as an argument, so a
+scratch run renders its own table instead of appearing to restate the real one.
+
+The check runs before the defaults are applied, because afterwards there is no
+way to tell an override from a default.
+
 ## Reproducing
 
 ```sh
