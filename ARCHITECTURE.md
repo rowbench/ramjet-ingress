@@ -14,6 +14,7 @@ changes nothing else about the serving path.
 |---|---|
 | `ramjet-router` — route table, matcher, load balancing | working, tested, benchmarked |
 | `ramjet-proxy` — listeners, TLS, HTTP/1.1, HTTP/2, upstreams | working, tested against real sockets |
+| `ramjet-proxy` — HTTP/3 over QUIC | experimental, off by default, tested against real UDP sockets |
 | `ramjet-controller` — Kubernetes watch, translate, status | working, tested against in-memory objects |
 | `ramjet-ingressd` — the daemon | Kubernetes mode and dev mode |
 
@@ -59,7 +60,7 @@ Three properties follow, and they are the point of the design:
 ```
 crates/
   ramjet-router/      sans-io: route table, matcher, LB selection
-  ramjet-proxy/       sockets, rustls, HTTP/1.1 + HTTP/2, upstream pools
+  ramjet-proxy/       sockets, rustls, HTTP/1.1 + HTTP/2 + HTTP/3, upstream pools
   ramjet-controller/  Kubernetes informers, annotation translation, status
   ramjet-ingressd/    the daemon binary
 ```
@@ -589,6 +590,103 @@ The handle is deliberately opaque. Real `rustls::sign::CertifiedKey` values live
 in `ramjet-proxy`, indexed by the handle's id. Keeping rustls out of the router
 is what lets the matcher be tested without a key, a socket, or a clock.
 
+## HTTP/3 (experimental)
+
+`--http3` adds a QUIC listener on the TLS listener's port number, in UDP, and
+advertises it on every HTTPS response with
+`alt-svc: h3=":<port>"; ma=86400`. Off — the default — there is no UDP socket,
+no thread, and no header; nothing about the TCP path changes either way.
+
+It is a second **way in**, not a second proxy. A request that arrives over QUIC
+is turned into the same `http` crate types the TCP listeners produce and handed
+to `forward::handle`, so routing, canary arithmetic, load balancing, header
+rewriting, retries, per-route counters, mirroring and the upstream pool are the
+ones already in use and cannot drift from them. What the `http3` module owns is
+how bytes get on and off the wire, and nothing else.
+
+Two consequences of that reuse are worth stating because they are load-bearing:
+
+- **The certificates are the TLS listener's.** The QUIC crypto configuration is
+  built over the *same* `SniResolver` — the same `SniMap` in the same route
+  table, the same `CertStore` — so a name resolves to the same certificate over
+  UDP as over TCP, and a rotation reaches both at the same instant because it is
+  the same two `ArcSwap`s in the same order. A handshake that picked differently
+  depending on transport would be a spectacular way to fail.
+- **The request body could not reach `forward::handle` as hyper's type.**
+  `hyper::body::Incoming` has no public constructor, so `handle` takes the
+  crate's own `ProxyBody` and the TCP path converts at the call site. That is
+  the whole reason the signature is what it is.
+
+### Deciding whether an HTTP/3 request has a body
+
+HTTP/3 has no `Transfer-Encoding` and no framing outside the stream: a request
+has a body if and only if DATA frames arrive before the client finishes the
+stream. `content-length` answers it when a client sent one. When none did — and
+no `GET` does — the alternative to guessing is one **non-blocking** poll of the
+request stream. A client that has already finished it, which is every ordinary
+`GET` by the time its packets arrive, is recognised immediately: the body is
+known-empty, the request is retryable across endpoints, and the origin sees an
+ordinary `GET` rather than one carrying `Transfer-Encoding: chunked`. A client
+that has not is not waited for — the poll returns `Pending`, the body streams,
+and the first DATA frame goes upstream when it arrives.
+
+### One endpoint, on one runtime
+
+The TCP data plane is one runtime per core with `SO_REUSEPORT` spreading
+accepts. The obvious transliteration — N UDP sockets on one port, one quinn
+endpoint each — is wrong, and quietly.
+
+The kernel chooses which `SO_REUSEPORT` socket receives a datagram by hashing
+its **4-tuple**. A QUIC connection is not identified by its 4-tuple; it is
+identified by a connection ID, precisely so it can survive the client's address
+changing — a phone moving from wifi to cellular, any NAT rebinding. Under
+4-tuple hashing, the moment a client's address changes its packets land on a
+socket whose endpoint has never heard of that connection, and the connection
+dies. Migration is one of the few things QUIC has that TCP does not, and
+sharding this way trades it away.
+
+Doing it properly needs the kernel to steer by connection ID — on Linux, an eBPF
+`SO_REUSEPORT` program. So for now there is **one endpoint on one dedicated
+thread**, with an upstream pool of its own, and the ceiling that sets is one
+core's worth of QUIC crypto, packet handling and proxying. That is stated rather
+than measured, and it is the honest reason this is experimental.
+
+### Draining
+
+`SIGTERM` stops the endpoint accepting, and each live connection sends GOAWAY
+and then finishes the requests already on it, inside the same grace period the
+TCP listeners get.
+
+The in-flight requests are counted here rather than left to h3's own
+bookkeeping, and that is not redundancy. `h3::server::Connection::accept` yields
+`None` once every request is complete *and* a GOAWAY has been received — the
+peer's, not ours. A server that sent GOAWAY and then waited for `None` would be
+waiting for the client to hang up, and after a GOAWAY every client is idle by
+definition. Every shutdown with an open HTTP/3 connection would burn the whole
+grace period and then report a timeout.
+
+### What is not supported
+
+- **No 0-RTT.** `max_early_data_size` is zero, explicitly. Early data is
+  replayable by anyone who captured it, and which requests are safe to replay is
+  an application's judgement, not an ingress's.
+- **No QUIC upstream.** Upstream is HTTP/1.1, as it is for every other
+  downstream protocol here.
+- **No PROXY protocol**, which is a TCP-stream preamble with no UDP form. The
+  client address is the QUIC peer's, from the IP header. `deploy/README.md` has
+  what that means behind a balancer that SNATs.
+- **No protocol upgrades.** WebSockets over HTTP/3 are RFC 9220 extended
+  `CONNECT`, a different mechanism from a `101`; an upstream that answers `101`
+  to a request that arrived over QUIC gets the same 502 any half-completable
+  upgrade gets.
+- **No h3 datagrams, no WebTransport, no server push.**
+- **`--engine uring` refuses it**, at startup, because that engine has neither
+  TLS nor QUIC.
+
+`ramjet_h3_connections_total`, `ramjet_h3_requests_total` and
+`ramjet_h3_handshake_failures_total` are the three series; an HTTP/3 request is
+also counted in `ramjet_requests_total` like any other, because it is one.
+
 ## Behind an L4 load balancer: the PROXY protocol
 
 A cloud L4 load balancer — AWS NLB, DigitalOcean, Scaleway, GCP passthrough —
@@ -813,6 +911,14 @@ a certificate's SANs to work out which names it covers — that would mean parsi
 X.509 in the control plane, which is exactly the dependency the layering split
 exists to avoid. `--default-tls-secret` is the supported way to serve a fallback
 certificate.
+
+**HTTP/3 is experimental and off by default.** One QUIC endpoint on one
+runtime rather than one per core, no 0-RTT, no QUIC upstream, no upgrades, and
+no PROXY protocol. Each of those has a reason rather than a TODO; they are in
+[HTTP/3 (experimental)](#http3-experimental). The deployment-side constraint is
+separate and larger: `alt-svc` advertises the TCP port number, so that port has
+to answer UDP through whatever is in front of the pod, and most cloud load
+balancers cannot do that. `deploy/README.md` has the per-provider answer.
 
 **No Gateway API.** The target is parity with `kubernetes/ingress-nginx` on the
 `networking.k8s.io/v1` Ingress resource.

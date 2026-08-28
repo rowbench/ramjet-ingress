@@ -10,7 +10,7 @@ file is about running it.
 | Crate | What it is |
 |---|---|
 | `ramjet-router` | Route table, host/path matcher, load balancing, canary |
-| `ramjet-proxy` | Listeners, TLS termination, HTTP/1.1 and HTTP/2, upstreams |
+| `ramjet-proxy` | Listeners, TLS termination, HTTP/1.1 and HTTP/2, HTTP/3, upstreams |
 | `ramjet-controller` | Kubernetes watches, translation, status writeback |
 | `ramjet-engine` | An experimental second data plane on a completion-based reactor |
 | `ramjet-ingressd` | The daemon that wires them together |
@@ -49,6 +49,7 @@ either way.
 | TLS termination | yes | no (502) |
 | HTTP/2, gRPC upstreams | h2 downstream | no (502) |
 | WebSocket and upgrades | yes | no (502) |
+| HTTP/3 over QUIC (`--http3`) | experimental, off by default | no; refused at startup |
 | PROXY protocol (`--proxy-protocol`) | v1 and v2 | no; refused at startup |
 | Kubernetes mode | yes | no; static routes only |
 | Status | measured against nginx | experimental |
@@ -65,6 +66,33 @@ once for a batch of them. The result is in
 Everything it refuses, it refuses with a status code and an explanation naming
 the other engine, and it prints the same list at startup. A gap that behaves
 like a bug in whatever is on the other end is worse than a missing feature.
+
+## HTTP/3
+
+`--http3` serves HTTP/3 over QUIC on the `--https` port number in UDP, and
+advertises it on every HTTPS response with `alt-svc: h3=":<port>"; ma=86400`.
+It shares the TLS listener's certificates exactly — the same SNI resolution,
+the same store, the same rotation — and a request that arrives over QUIC goes
+through the same forwarding path as any other, so routing, canaries, retries
+and per-route counters are the ones already in use.
+
+It is experimental and off by default, and the two things to know before
+turning it on are that the QUIC endpoint runs on **one** dedicated runtime
+rather than one per core, and that the `alt-svc` advertisement only works where
+the same port number is reachable over UDP — which most cloud load balancers
+cannot do. [ARCHITECTURE.md](ARCHITECTURE.md#http3-experimental) has the first,
+[deploy/README.md](deploy/README.md#http3-and-which-load-balancers-can-carry-it)
+has the second. No 0-RTT, no QUIC upstream, no upgrades.
+
+```console
+$ ramjet-ingressd --static-routes routes.yaml --http3
+ramjet-ingressd 0.1.0 — 1 backend(s), 1 endpoint(s), 1 route(s), 1 certificate(s)
+  config   routes.yaml
+  http     0.0.0.0:8080
+  https    0.0.0.0:8443
+  http3    0.0.0.0:8443
+  admin    0.0.0.0:10254
+```
 
 ## Running it without a cluster
 
