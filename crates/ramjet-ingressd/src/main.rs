@@ -313,6 +313,7 @@ fn proxy_config(args: &Args, https: Option<SocketAddr>) -> ProxyConfig {
         },
         shutdown_grace: args.shutdown_grace,
         worker_threads: args.worker_threads,
+        max_buf_size: args.max_buf_size,
     }
 }
 

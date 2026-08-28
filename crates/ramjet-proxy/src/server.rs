@@ -70,6 +70,34 @@
 //!
 //! The admin listener is deliberately left on the caller's runtime: a scrape
 //! every fifteen seconds has no business taking a slot on a serving core.
+//!
+//! # What an idle connection costs, and where it goes
+//!
+//! `bench/thesis/RESULTS.md`'s benchmark 4 is the one ingress-nginx won, so it
+//! is worth writing down exactly where the memory goes rather than leaving the
+//! next reader to rediscover it.
+//!
+//! A connection that has been accepted but has not sent a byte costs about
+//! 1.7 KiB of RSS: the spawned task, and hyper-util's version sniffer sitting
+//! on a 24-byte buffer waiting to tell HTTP/1 from an HTTP/2 preface. The first
+//! request is what makes it expensive. Building the HTTP/1 connection allocates
+//! two buffers of `INIT_BUFFER_SIZE` — 8 KiB to read into, 8 KiB to write
+//! response heads from — and hyper never shrinks or drops either one while the
+//! connection lives. Measured by patching that constant down to 1 KiB, those
+//! two buffers are 14 KiB of the ~17 KiB an idle keep-alive connection holds.
+//!
+//! There is no public API that lowers it: `max_buf_size` is a ceiling on how
+//! far the read buffer may *grow* and hyper refuses to set it below
+//! `INIT_BUFFER_SIZE` — see [`MIN_MAX_BUF_SIZE`]. So 16 KiB per idle
+//! keep-alive connection is this engine's floor until hyper's initial
+//! allocation follows its configured maximum. nginx is cheaper here for a
+//! structural reason and not an accidental one: it hands a connection's request
+//! buffers back to its pool when the connection goes idle, and keeps only the
+//! connection object.
+//!
+//! What was in this crate's control has been taken out. The response future no
+//! longer sits inside the connection (see `serve_proxy`), which was 2.9 KiB per
+//! connection held whether or not a request was in flight.
 
 use std::convert::Infallible;
 use std::io;
@@ -100,6 +128,30 @@ pub const DEFAULT_HTTPS_PORT: u16 = 8443;
 /// Default admin port, matching the ingress-nginx convention.
 pub const DEFAULT_ADMIN_PORT: u16 = 10254;
 
+/// Ceiling on the HTTP/1 read and write buffers of one client connection.
+///
+/// hyper's own default is 408 KiB, and the buffer never shrinks again for the
+/// life of the connection: one client that sends a 400 KiB header block pins
+/// 400 KiB until it disconnects, and ten thousand of them pin four gigabytes.
+/// nginx bounds the same thing at 32 KiB (`large_client_header_buffers 4 8k`),
+/// so 64 KiB accepts every request nginx would and still bounds the worst case
+/// at a sixth of hyper's.
+///
+/// This does **not** move the idle-connection footprint. hyper allocates its
+/// first buffer at a fixed 8 KiB regardless of this number — see
+/// [`MIN_MAX_BUF_SIZE`] — so a connection carrying ordinary requests costs the
+/// same either way. What this bounds is the tail.
+pub const DEFAULT_MAX_BUF_SIZE: usize = 64 * 1024;
+
+/// The smallest ceiling hyper accepts, and the size it allocates up front.
+///
+/// hyper panics below this, because it is also `INIT_BUFFER_SIZE`: the first
+/// read reserves 8 KiB and the write buffer is built with 8 KiB of capacity
+/// before a byte has arrived. Two of those are 16 KiB, and they are what an
+/// idle keep-alive connection actually costs — the floor this crate cannot get
+/// under without a change to hyper.
+pub const MIN_MAX_BUF_SIZE: usize = 8 * 1024;
+
 /// How long to pause after an accept error before trying again.
 ///
 /// Running out of file descriptors makes `accept` fail immediately and forever,
@@ -126,6 +178,10 @@ pub struct ProxyConfig {
     /// treated as one: a data plane with nowhere to serve is not a
     /// configuration, it is a hang.
     pub worker_threads: Option<usize>,
+    /// Ceiling on one connection's HTTP/1 buffers; see [`DEFAULT_MAX_BUF_SIZE`].
+    ///
+    /// Clamped up to [`MIN_MAX_BUF_SIZE`], which is the smallest hyper accepts.
+    pub max_buf_size: usize,
 }
 
 impl Default for ProxyConfig {
@@ -141,8 +197,22 @@ impl Default for ProxyConfig {
             // would be a lie told to whoever set it.
             shutdown_grace: Duration::from_secs(30),
             worker_threads: None,
+            max_buf_size: DEFAULT_MAX_BUF_SIZE,
         }
     }
+}
+
+/// One `auto::Builder`, configured the way every listener in this process
+/// wants it.
+///
+/// Built once per runtime and shared by every connection on it: the builder is
+/// read-only after this and holds no per-connection state.
+fn connection_builder(max_buf_size: usize) -> Arc<auto::Builder<TokioExecutor>> {
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .max_buf_size(max_buf_size.max(MIN_MAX_BUF_SIZE));
+    Arc::new(builder)
 }
 
 /// Bound listeners, ready to serve.
@@ -164,6 +234,7 @@ pub struct Server {
     metrics: Arc<Metrics>,
     readiness: ReadinessFlag,
     grace: Duration,
+    max_buf_size: usize,
 }
 
 impl Server {
@@ -226,6 +297,7 @@ impl Server {
             metrics,
             readiness,
             grace: config.shutdown_grace,
+            max_buf_size: config.max_buf_size,
         })
     }
 
@@ -273,22 +345,26 @@ impl Server {
             tls,
             metrics,
             grace,
+            max_buf_size,
             ..
         } = self;
 
         let acceptor = tls.map(TlsAcceptor::from);
         let mut workers = Workers::start(
             worker_threads,
-            &routes,
-            &metrics,
-            upstream,
-            acceptor.clone(),
-            grace,
+            &LaneConfig {
+                routes: Arc::clone(&routes),
+                metrics: Arc::clone(&metrics),
+                upstream,
+                acceptor: acceptor.clone(),
+                grace,
+                max_buf_size,
+            },
         )?;
 
         // Admin lives on the caller's runtime; see the module docs.
         let graceful = GracefulShutdown::new();
-        let builder = Arc::new(auto::Builder::new(TokioExecutor::new()));
+        let builder = connection_builder(max_buf_size);
 
         loop {
             tokio::select! {
@@ -376,6 +452,21 @@ struct Job {
     conn: ConnInfo,
 }
 
+/// Everything one serving runtime is configured with.
+///
+/// A struct rather than a parameter list: every field is handed to every lane
+/// unchanged, and threading six of them positionally through both `start` and
+/// `serve_lane` was one transposition away from a bug no compiler would catch.
+#[derive(Clone)]
+struct LaneConfig {
+    routes: Arc<SharedRouteTable>,
+    metrics: Arc<Metrics>,
+    upstream: UpstreamConfig,
+    acceptor: Option<TlsAcceptor>,
+    grace: Duration,
+    max_buf_size: usize,
+}
+
 /// The serving runtimes and the round-robin over them.
 struct Workers {
     lanes: Vec<mpsc::UnboundedSender<Job>>,
@@ -384,23 +475,14 @@ struct Workers {
 }
 
 impl Workers {
-    fn start(
-        count: usize,
-        routes: &Arc<SharedRouteTable>,
-        metrics: &Arc<Metrics>,
-        upstream: UpstreamConfig,
-        acceptor: Option<TlsAcceptor>,
-        grace: Duration,
-    ) -> io::Result<Workers> {
+    fn start(count: usize, config: &LaneConfig) -> io::Result<Workers> {
         let mut lanes = Vec::with_capacity(count);
         let mut done = Vec::with_capacity(count);
 
         for index in 0..count {
             let (jobs_tx, jobs_rx) = mpsc::unbounded_channel();
             let (done_tx, done_rx) = oneshot::channel();
-            let routes = Arc::clone(routes);
-            let metrics = Arc::clone(metrics);
-            let acceptor = acceptor.clone();
+            let config = config.clone();
 
             // Built here rather than on the new thread, and moved into it. A
             // runtime that cannot be created is a startup failure the caller
@@ -415,8 +497,7 @@ impl Workers {
             std::thread::Builder::new()
                 .name(format!("ramjet-serve-{index}"))
                 .spawn(move || {
-                    let drained =
-                        serve_lane(runtime, routes, metrics, upstream, acceptor, grace, jobs_rx);
+                    let drained = serve_lane(runtime, config, jobs_rx);
                     // A receiver that has gone away means `run` already
                     // returned, which is not this thread's problem.
                     let _ = done_tx.send(drained);
@@ -476,13 +557,17 @@ impl Workers {
 /// then drains. Returns whether the drain finished inside `grace`.
 fn serve_lane(
     runtime: tokio::runtime::Runtime,
-    routes: Arc<SharedRouteTable>,
-    metrics: Arc<Metrics>,
-    upstream: UpstreamConfig,
-    acceptor: Option<TlsAcceptor>,
-    grace: Duration,
+    config: LaneConfig,
     mut jobs: mpsc::UnboundedReceiver<Job>,
 ) -> bool {
+    let LaneConfig {
+        routes,
+        metrics,
+        upstream,
+        acceptor,
+        grace,
+        max_buf_size,
+    } = config;
     runtime.block_on(async move {
         // Built inside the runtime, and one per lane: this is the pool the
         // module docs are about.
@@ -492,7 +577,7 @@ fn serve_lane(
             metrics,
         });
         let graceful = GracefulShutdown::new();
-        let builder = Arc::new(auto::Builder::new(TokioExecutor::new()));
+        let builder = connection_builder(max_buf_size);
 
         while let Some(job) = jobs.recv().await {
             let Ok(stream) = TcpStream::from_std(job.stream) else {
@@ -570,7 +655,17 @@ fn serve_proxy(
         let _guard = guard;
         let service = service_fn(move |request| {
             let state = Arc::clone(&state);
-            async move { Ok::<_, Infallible>(forward::handle(state, conn, request).await) }
+            // Boxed, and it is worth the allocation. hyper's HTTP/1 dispatcher
+            // keeps the in-flight response future in a
+            // `Pin<Box<Option<S::Future>>>` that it allocates when the
+            // connection is created and holds for the connection's whole life.
+            // Unboxed, that is `forward::handle`'s whole state machine — 2.9
+            // KiB — charged to every idle keep-alive connection that is not
+            // serving anything. Boxing moves it to one allocation per request,
+            // paid by traffic instead of by silence.
+            Box::pin(
+                async move { Ok::<_, Infallible>(forward::handle(state, conn, request).await) },
+            )
         });
         let connection = builder
             .serve_connection_with_upgrades(TokioIo::new(stream), service)
@@ -614,7 +709,10 @@ fn serve_tls(
         };
         let service = service_fn(move |request| {
             let state = Arc::clone(&state);
-            async move { Ok::<_, Infallible>(forward::handle(state, conn, request).await) }
+            // Boxed for the reason `serve_proxy` gives.
+            Box::pin(
+                async move { Ok::<_, Infallible>(forward::handle(state, conn, request).await) },
+            )
         });
         let connection = builder
             .serve_connection_with_upgrades(TokioIo::new(stream), service)
@@ -751,6 +849,25 @@ mod tests {
         assert_eq!(config.http.map(|l| l.addr.port()), Some(8080));
         assert_eq!(config.https.map(|l| l.addr.port()), Some(8443));
         assert_eq!(config.admin.map(|l| l.addr.port()), Some(10254));
+    }
+
+    #[test]
+    fn the_buffer_ceiling_defaults_below_hypers_and_above_nginxs() {
+        // hyper's own default is 408 KiB and nginx's effective limit is 32 KiB.
+        // Sitting between them is the whole point: nothing nginx would serve is
+        // refused, and the worst case a single connection can pin is bounded.
+        assert_eq!(ProxyConfig::default().max_buf_size, DEFAULT_MAX_BUF_SIZE);
+        const { assert!(DEFAULT_MAX_BUF_SIZE > 32 * 1024) };
+        const { assert!(DEFAULT_MAX_BUF_SIZE < 408 * 1024) };
+    }
+
+    #[test]
+    fn a_ceiling_under_hypers_minimum_does_not_abort_the_process() {
+        // `http1().max_buf_size` panics below `MIN_MAX_BUF_SIZE`, and this
+        // builder is constructed on a serving thread — a panic there is a
+        // worker that never accepts anything, not an error anybody sees.
+        let _ = connection_builder(0);
+        let _ = connection_builder(MIN_MAX_BUF_SIZE - 1);
     }
 
     #[test]

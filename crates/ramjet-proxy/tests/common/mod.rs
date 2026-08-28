@@ -249,6 +249,7 @@ impl TestProxy {
             upstream: options.upstream,
             shutdown_grace: options.grace,
             worker_threads: options.workers,
+            ..ProxyConfig::default()
         };
 
         let readiness = ReadinessFlag::new();

@@ -161,3 +161,31 @@ async fn a_grpc_request_is_refused_with_an_explanation() {
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
     assert!(reply.text().contains("HTTP/2"), "{}", reply.text());
 }
+
+#[tokio::test]
+async fn a_header_block_over_the_ceiling_is_refused_rather_than_buffered() {
+    // hyper's own ceiling is 408 KiB and the buffer it grows to serve one
+    // oversized head is never given back while the connection lives — so
+    // without a lower bound, ten thousand connections that each sent one huge
+    // request would pin gigabytes for as long as they stayed open. The default
+    // is 64 KiB, which is twice what nginx accepts.
+    let app = spawn_echo("app").await;
+    let proxy = TestProxy::start(single_route("app.example.com", "/", &[app])).await;
+
+    let mut stream = tokio::net::TcpStream::connect(proxy.http)
+        .await
+        .expect("connect");
+    let mut request = String::from("GET / HTTP/1.1\r\nHost: app.example.com\r\n");
+    for i in 0..96 {
+        request.push_str(&format!("X-Pad-{i}: {}\r\n", "p".repeat(1024)));
+    }
+    request.push_str("\r\n");
+
+    let response = write_then_read(&mut stream, request.as_bytes(), 4096).await;
+    let head = String::from_utf8_lossy(&response);
+    assert!(
+        head.starts_with("HTTP/1.1 431"),
+        "a 98 KiB header block should be refused, got: {}",
+        head.lines().next().unwrap_or("<nothing>")
+    );
+}

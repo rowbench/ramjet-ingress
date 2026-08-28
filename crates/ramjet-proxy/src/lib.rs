@@ -100,7 +100,7 @@ pub use listener::{Listener, ListenerConfig};
 pub use metrics::Metrics;
 pub use server::{
     serve, ProxyConfig, Server, Shutdown, ShutdownHandle, DEFAULT_ADMIN_PORT, DEFAULT_HTTP_PORT,
-    DEFAULT_HTTPS_PORT,
+    DEFAULT_HTTPS_PORT, DEFAULT_MAX_BUF_SIZE, MIN_MAX_BUF_SIZE,
 };
 pub use tls::{CertStore, SniResolver};
 pub use upstream::{

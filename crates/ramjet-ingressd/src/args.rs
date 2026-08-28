@@ -18,7 +18,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ramjet_controller::ServiceRef;
-use ramjet_proxy::{DEFAULT_ADMIN_PORT, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT};
+use ramjet_proxy::{
+    DEFAULT_ADMIN_PORT, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT, DEFAULT_MAX_BUF_SIZE,
+    MIN_MAX_BUF_SIZE,
+};
 
 /// Why the command line could not be understood.
 #[derive(Debug, thiserror::Error)]
@@ -128,6 +131,8 @@ pub struct Args {
     pub max_connect_attempts: usize,
     /// Idle upstream connections kept per endpoint.
     pub upstream_pool_idle: usize,
+    /// Ceiling on one client connection's HTTP/1 read and write buffers.
+    pub max_buf_size: usize,
     /// Serving runtimes to start, or `None` for one per available core.
     pub worker_threads: Option<usize>,
     /// Which data plane serves traffic.
@@ -157,6 +162,7 @@ impl Default for Args {
             shutdown_grace: Duration::from_secs(30),
             max_connect_attempts: 3,
             upstream_pool_idle: ramjet_proxy::DEFAULT_POOL_MAX_IDLE_PER_HOST,
+            max_buf_size: DEFAULT_MAX_BUF_SIZE,
             worker_threads: None,
             engine: Engine::Hyper,
         }
@@ -225,6 +231,9 @@ SERVING:
     --engine <NAME>           Data plane: hyper or uring     [default: hyper]
     --worker-threads <N>      Serving runtimes, one per thread
                                               [default: one per available core]
+    --max-buf-size <BYTES>    Ceiling on one client connection's HTTP/1 read and
+                              write buffers, and so on the request head this
+                              replica will accept    [default: 65536, min 8192]
 
     `uring` is experimental. It serves HTTP/1.1 plaintext on the ramjet reactor
     — io_uring on Linux, kqueue elsewhere — to find out whether batched
@@ -239,6 +248,13 @@ SERVING:
     the cores the process can actually use makes them compete; setting it to 1
     serves everything on one thread.
 
+    --max-buf-size bounds the tail, not the common case. hyper allocates the
+    first 8 KiB of each buffer whatever this is set to, and never shrinks one
+    again while the connection lives — so a client that sends a 400 KiB header
+    block would pin 400 KiB until it disconnects. 64 KiB accepts every request
+    nginx's own 32 KiB limit would and bounds the worst case at a sixth of
+    hyper's default. Requests over the ceiling are answered 431.
+
 SHUTDOWN:
     --shutdown-grace <SECS>   In-flight requests get this long after SIGTERM
                                                              [default: 30]
@@ -252,7 +268,8 @@ RAMJET_WATCH_NAMESPACE, RAMJET_DEFAULT_BACKEND, RAMJET_DEFAULT_TLS_SECRET,
 RAMJET_PUBLISH_ADDRESS, RAMJET_PUBLISH_SERVICE, RAMJET_UPDATE_STATUS,
 RAMJET_HTTP, RAMJET_HTTPS, RAMJET_ADMIN, RAMJET_CONNECT_TIMEOUT,
 RAMJET_RESPONSE_TIMEOUT, RAMJET_MAX_CONNECT_ATTEMPTS, RAMJET_UPSTREAM_POOL_IDLE,
-RAMJET_WORKER_THREADS, RAMJET_SHUTDOWN_GRACE, RAMJET_ENGINE).
+RAMJET_MAX_BUF_SIZE, RAMJET_WORKER_THREADS, RAMJET_SHUTDOWN_GRACE,
+RAMJET_ENGINE).
 A flag always beats the environment. RUST_LOG sets the log filter.
 
 ADMIN ENDPOINTS:
@@ -336,6 +353,9 @@ impl Args {
                 "--upstream-pool-idle" => {
                     args.upstream_pool_idle = number(&name, &value()?)?;
                 }
+                "--max-buf-size" => {
+                    args.max_buf_size = number(&name, &value()?)?.max(MIN_MAX_BUF_SIZE);
+                }
                 "--worker-threads" => {
                     args.worker_threads = Some(number(&name, &value()?)?.max(1));
                 }
@@ -403,6 +423,9 @@ impl Args {
         }
         if let Some(value) = env("RAMJET_UPSTREAM_POOL_IDLE") {
             args.upstream_pool_idle = number("RAMJET_UPSTREAM_POOL_IDLE", &value)?;
+        }
+        if let Some(value) = env("RAMJET_MAX_BUF_SIZE") {
+            args.max_buf_size = number("RAMJET_MAX_BUF_SIZE", &value)?.max(MIN_MAX_BUF_SIZE);
         }
         if let Some(value) = env("RAMJET_ENGINE") {
             args.engine = engine("RAMJET_ENGINE", &value)?;
@@ -536,6 +559,35 @@ mod tests {
         // A data plane with nowhere to serve is not a configuration, it is a
         // hang, and `--worker-threads 0` is a typo rather than an intent.
         assert_eq!(parse(&["--worker-threads", "0"]).expect("valid").worker_threads, Some(1));
+    }
+
+    #[test]
+    fn the_buffer_ceiling_takes_a_flag_and_an_environment_twin() {
+        assert_eq!(
+            parse(&[]).expect("valid").max_buf_size,
+            DEFAULT_MAX_BUF_SIZE
+        );
+        assert_eq!(
+            parse(&["--max-buf-size", "131072"]).expect("valid").max_buf_size,
+            131_072
+        );
+
+        let env = |name: &str| match name {
+            "RAMJET_MAX_BUF_SIZE" => Some("32768".to_owned()),
+            _ => None,
+        };
+        let args = Args::parse(Vec::<String>::new(), env).expect("valid");
+        assert_eq!(args.max_buf_size, 32_768);
+    }
+
+    #[test]
+    fn a_buffer_ceiling_under_hypers_minimum_is_raised_to_it() {
+        // hyper panics on anything smaller, and a data plane that aborts on a
+        // number an operator typed is the worst of the available answers.
+        assert_eq!(
+            parse(&["--max-buf-size", "1024"]).expect("valid").max_buf_size,
+            MIN_MAX_BUF_SIZE
+        );
     }
 
     #[test]
@@ -791,6 +843,7 @@ mod tests {
             "--response-timeout",
             "--shutdown-grace",
             "--max-connect-attempts",
+            "--max-buf-size",
             "--engine",
         ] {
             assert!(USAGE.contains(option), "{option} is undocumented");
