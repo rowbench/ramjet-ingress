@@ -85,8 +85,12 @@ Multi-stage: a full Rust toolchain compiles, and
 shell and no package manager, and the process runs as uid 65532. TLS is rustls
 over ring, so the image needs no OpenSSL and no CA bundle.
 
+The build context is the parent directory, for the reason given above — the
+Dockerfile copies both this tree and the `enhance-socket` sibling, and a context
+rooted here cannot see the second one:
+
 ```sh
-docker build -t ramjet-ingress:0.1.0 .
+docker build -f Dockerfile -t ramjet-ingress:0.1.0 ..
 ```
 
 The builder uses BuildKit cache mounts for Cargo's registry and the target

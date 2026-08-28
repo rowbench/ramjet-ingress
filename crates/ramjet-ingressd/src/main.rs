@@ -275,6 +275,14 @@ async fn uring_mode(
     let Some(http) = args.http else {
         return Err("--engine uring needs a plaintext listener; --no-http leaves it nothing to serve".into());
     };
+    // Refused for the same reason as TLS: ignoring it would attribute every
+    // request to the load balancer's address, silently, and an operator who
+    // asked for the real client IP would have no way to tell it had not worked.
+    if args.proxy_protocol {
+        return Err(
+            "--proxy-protocol is not implemented on --engine uring; use --engine hyper".into(),
+        );
+    }
 
     let routes = Arc::new(SharedRouteTable::new(loaded.table));
     let readiness = Arc::new(AtomicBool::new(false));
@@ -364,6 +372,9 @@ fn proxy_config(args: &Args, https: Option<SocketAddr>) -> ProxyConfig {
         shutdown_grace: args.shutdown_grace,
         worker_threads: args.worker_threads,
         max_buf_size: args.max_buf_size,
+        proxy_protocol: args
+            .proxy_protocol
+            .then_some(args.proxy_protocol_timeout),
     }
 }
 

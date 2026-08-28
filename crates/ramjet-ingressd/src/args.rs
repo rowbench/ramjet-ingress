@@ -137,6 +137,14 @@ pub struct Args {
     pub worker_threads: Option<usize>,
     /// Which data plane serves traffic.
     pub engine: Engine,
+    /// Require a PROXY protocol header on the traffic listeners.
+    ///
+    /// Only safe behind a load balancer that always sends one: the header names
+    /// the client, so a listener reachable from anywhere else is a listener
+    /// whose clients can pick their own address.
+    pub proxy_protocol: bool,
+    /// How long a sender gets to deliver a complete PROXY header.
+    pub proxy_protocol_timeout: Duration,
 }
 
 impl Default for Args {
@@ -165,6 +173,13 @@ impl Default for Args {
             max_buf_size: DEFAULT_MAX_BUF_SIZE,
             worker_threads: None,
             engine: Engine::Hyper,
+            proxy_protocol: false,
+            // Long enough that a load balancer under load still fits, short
+            // enough that holding the connection is not a cheap way to occupy
+            // a task and a file descriptor. The header is the first thing a
+            // sender writes, so a sender that has not finished it in five
+            // seconds is not going to.
+            proxy_protocol_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -212,6 +227,27 @@ LISTENERS:
     an explicit --https or --no-https, the TLS listener is skipped when the
     configuration declares no certificates. In Kubernetes mode it always binds:
     the certificates arrive over a watch, after the socket.
+
+BEHIND A LOAD BALANCER:
+    --proxy-protocol          Require a PROXY protocol header (v1 or v2) on the
+                              --http and --https listeners, and take the client
+                              address from it.
+    --proxy-protocol-timeout <SECS>
+                              Time a sender gets to deliver a complete header
+                              before the connection is dropped   [default: 5]
+
+    A cloud L4 load balancer — AWS NLB, DigitalOcean, Scaleway, GCP passthrough
+    — forwards TCP without touching the payload, so without this every request
+    is attributed to the balancer. Turn it on where the balancer is configured
+    to send the header, and set the same option on both sides.
+
+    SECURITY: the header *is* the client identity. Anything that can reach the
+    listener can claim to be any address, and X-Forwarded-For, X-Real-IP and
+    every application decision made from them follow. Enable it only on a
+    listener nothing but the load balancer can reach. The header is required,
+    not optional: a connection without a valid one is dropped and counted in
+    ramjet_proxy_protocol_errors_total. The --admin listener never reads one,
+    because Prometheus and the kubelet do not send one.
 
 UPSTREAMS:
     --connect-timeout <SECS>      TCP connect bound          [default: 5]
@@ -269,7 +305,7 @@ RAMJET_PUBLISH_ADDRESS, RAMJET_PUBLISH_SERVICE, RAMJET_UPDATE_STATUS,
 RAMJET_HTTP, RAMJET_HTTPS, RAMJET_ADMIN, RAMJET_CONNECT_TIMEOUT,
 RAMJET_RESPONSE_TIMEOUT, RAMJET_MAX_CONNECT_ATTEMPTS, RAMJET_UPSTREAM_POOL_IDLE,
 RAMJET_MAX_BUF_SIZE, RAMJET_WORKER_THREADS, RAMJET_SHUTDOWN_GRACE,
-RAMJET_ENGINE).
+RAMJET_ENGINE, RAMJET_PROXY_PROTOCOL, RAMJET_PROXY_PROTOCOL_TIMEOUT).
 A flag always beats the environment. RUST_LOG sets the log filter.
 
 ADMIN ENDPOINTS:
@@ -360,6 +396,10 @@ impl Args {
                     args.worker_threads = Some(number(&name, &value()?)?.max(1));
                 }
                 "--engine" => args.engine = engine(&name, &value()?)?,
+                "--proxy-protocol" => args.proxy_protocol = true,
+                "--proxy-protocol-timeout" => {
+                    args.proxy_protocol_timeout = seconds(&name, &value()?)?;
+                }
                 other if other.starts_with('-') => {
                     return Err(ArgError::Unknown(other.to_owned()))
                 }
@@ -429,6 +469,12 @@ impl Args {
         }
         if let Some(value) = env("RAMJET_ENGINE") {
             args.engine = engine("RAMJET_ENGINE", &value)?;
+        }
+        if let Some(value) = env("RAMJET_PROXY_PROTOCOL") {
+            args.proxy_protocol = boolean("RAMJET_PROXY_PROTOCOL", &value)?;
+        }
+        if let Some(value) = env("RAMJET_PROXY_PROTOCOL_TIMEOUT") {
+            args.proxy_protocol_timeout = seconds("RAMJET_PROXY_PROTOCOL_TIMEOUT", &value)?;
         }
         if let Some(value) = env("RAMJET_WORKER_THREADS") {
             args.worker_threads = Some(number("RAMJET_WORKER_THREADS", &value)?.max(1));
@@ -845,8 +891,53 @@ mod tests {
             "--max-connect-attempts",
             "--max-buf-size",
             "--engine",
+            "--proxy-protocol",
+            "--proxy-protocol-timeout",
         ] {
             assert!(USAGE.contains(option), "{option} is undocumented");
         }
+    }
+
+    #[test]
+    fn the_proxy_protocol_is_off_unless_asked_for() {
+        // On by default would mean a fresh deployment refuses every connection
+        // that does not carry a header, which is every connection.
+        let args = parse(&[]).expect("valid");
+        assert!(!args.proxy_protocol);
+        assert_eq!(args.proxy_protocol_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_proxy_protocol_takes_a_flag_and_an_environment_twin() {
+        let args = parse(&["--proxy-protocol", "--proxy-protocol-timeout", "2"])
+            .expect("valid");
+        assert!(args.proxy_protocol);
+        assert_eq!(args.proxy_protocol_timeout, Duration::from_secs(2));
+
+        let env = |name: &str| match name {
+            "RAMJET_PROXY_PROTOCOL" => Some("true".to_owned()),
+            "RAMJET_PROXY_PROTOCOL_TIMEOUT" => Some("9".to_owned()),
+            _ => None,
+        };
+        let args = Args::parse(Vec::<String>::new(), env).expect("valid");
+        assert!(args.proxy_protocol);
+        assert_eq!(args.proxy_protocol_timeout, Duration::from_secs(9));
+    }
+
+    #[test]
+    fn a_bad_proxy_protocol_value_is_named_precisely() {
+        assert!(matches!(
+            parse(&["--proxy-protocol-timeout", "never"]),
+            Err(ArgError::BadValue { ref option, .. }) if option == "--proxy-protocol-timeout"
+        ));
+
+        let bad = |name: &str| match name {
+            "RAMJET_PROXY_PROTOCOL" => Some("perhaps".to_owned()),
+            _ => None,
+        };
+        assert!(matches!(
+            Args::parse(Vec::<String>::new(), bad),
+            Err(ArgError::BadValue { kind: "boolean", .. })
+        ));
     }
 }
