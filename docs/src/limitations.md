@@ -97,7 +97,7 @@ the dependency the layering split exists to avoid.
 
 `--engine uring` reached parity with the hyper engine on TLS, WebSocket
 upgrades, the PROXY protocol, mirroring, per-route counters, Kubernetes mode and
-graceful drain. What is left is one thing.
+graceful drain. What is left is HTTP/2, at both ends of the hop.
 
 **It speaks HTTP/1.1.** HTTP/2 is served by handing those connections to a hyper
 engine in the same process — the ClientHello is read before a configuration is
