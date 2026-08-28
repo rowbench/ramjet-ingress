@@ -216,14 +216,44 @@ def main():
         )
     lines.append("")
 
+    # Machine-state gate. The baseline is a plain nginx serving a static body
+    # with no proxy hop at all: it has no moving parts and nothing under test.
+    # If *it* moves between rounds, the machine moved, and every other number
+    # here is measuring the machine rather than the contenders. On a laptop the
+    # usual cause is the package heating up over a long run.
+    base_runs = table.get((BASELINE, main_level, "rps_all"))
+    if base_runs and len(base_runs) > 1:
+        drift = (max(base_runs) - min(base_runs)) / statistics.mean(base_runs)
+        lines.append("### Was the machine steady?\n")
+        lines.append(
+            f"Baseline (no proxy) across the {len(base_runs)} rounds: "
+            + ", ".join(fmt(v) for v in base_runs)
+            + f" rps — {drift:.1%} spread.\n"
+        )
+        if drift > 0.15:
+            lines.append(
+                "**The baseline moved by more than 15%, so this run measured the "
+                "machine as much as the contenders.** Treat every number above as "
+                "indicative only; a difference smaller than this drift cannot be "
+                "attributed to anything under test.\n"
+            )
+            problems.append(
+                f"baseline drift {drift:.1%} across rounds: {base_runs}"
+            )
+        else:
+            lines.append(
+                "Under 15%, so the contenders were measured against a stable "
+                "machine.\n"
+            )
+
     out = "\n".join(lines)
     print(out)
 
     if problems:
-        print("\n<!-- RUNS EXCEEDING THE 0.1% ERROR BUDGET -->")
+        print("\n<!-- THIS RUN FAILED A TRUST CHECK -->")
         for p in problems:
             print(f"<!-- {p} -->")
-        sys.stderr.write("\nERROR BUDGET EXCEEDED:\n" + "\n".join(problems) + "\n")
+        sys.stderr.write("\nRUN NOT TRUSTWORTHY:\n" + "\n".join(problems) + "\n")
         return 1
     return 0
 

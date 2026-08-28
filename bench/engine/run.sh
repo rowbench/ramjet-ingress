@@ -87,6 +87,11 @@ DURATION="${DURATION:-30s}"
 ROUNDS="${ROUNDS:-3}"
 CONC_MAIN="${CONC_MAIN:-64}"
 CONC_HIGH="${CONC_HIGH:-256}"
+# Idle gap before each measured run. This machine is a laptop, and a laptop
+# under sustained full load gets slower: the first measurement of a run is
+# taken on a cold package and the last on a hot one. Left alone that is not
+# noise, it is a *bias*, and it lands on whichever contender is measured last.
+COOLDOWN="${COOLDOWN:-15}"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
@@ -303,6 +308,7 @@ target_ip() {
 measure() {
     local who="$1" conc="$2" run="$3" ip out rps
     ip="$(target_ip "${who}")"
+    sleep "${COOLDOWN}"                                   # let the machine settle
     oha "${ip}" "${conc}" "${WARMUP}" >/dev/null          # discarded warmup
     out="${RESULTS_DIR}/${who}-c${conc}-r${run}.json"
     oha "${ip}" "${conc}" "${DURATION}" > "${out}"
@@ -310,18 +316,35 @@ measure() {
     printf '    %-14s c%-4s run %s  %12s rps\n' "${who}" "${conc}" "${run}" "${rps}"
 }
 
+# Every contender, starting from a different one each round.
+#
+# Interleaving alone is not enough when the machine drifts within a round.
+# Whoever goes first is measured on the coolest package and whoever goes last on
+# the hottest, so a fixed order hands one contender a systematic advantage that
+# no number of rounds averages away. Rotating the starting position spreads that
+# position evenly across contenders instead.
+CONTENDERS=(ramjet-hyper ramjet-uring nginx baseline)
+
+rotated() {
+    local offset="$1" i n
+    n="${#CONTENDERS[@]}"
+    for i in $(seq 0 $((n - 1))); do
+        printf '%s\n' "${CONTENDERS[$(( (i + offset) % n ))]}"
+    done
+}
+
 run_all() {
     mkdir -p "${RESULTS_DIR}"
     rm -f "${RESULTS_DIR}"/*.json
-    log "c${CONC_MAIN}: ${ROUNDS} interleaved rounds of ${DURATION} (after ${WARMUP} warmup each)"
+    log "c${CONC_MAIN}: ${ROUNDS} rotated rounds of ${DURATION} (${WARMUP} warmup, ${COOLDOWN}s cooldown each)"
     for round in $(seq 1 "${ROUNDS}"); do
-        echo "  round ${round}/${ROUNDS}"
-        for who in ramjet-hyper ramjet-uring nginx baseline; do
+        echo "  round ${round}/${ROUNDS} (starting with $(rotated $((round - 1)) | head -1))"
+        for who in $(rotated $((round - 1))); do
             measure "${who}" "${CONC_MAIN}" "${round}"
         done
     done
     log "c${CONC_HIGH}: one round"
-    for who in ramjet-hyper ramjet-uring nginx baseline; do
+    for who in $(rotated 0); do
         measure "${who}" "${CONC_HIGH}" 1
     done
 }
@@ -359,16 +382,24 @@ print(sum(d['summary'].get('statusCodeDistribution', {}).values()) or int(d['sum
         read -r cpu mem < <(docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' "${container}" | head -1)
         wait "${load_pid}" 2>/dev/null || true
 
-        local per_conn="n/a"
+        local per_conn="all reused"
         [ "${conns}" -gt 0 ] && per_conn=$(( requests / conns ))
         printf '%s: cpu=%s mem=%s upstream_conns_opened=%s requests=%s reqs_per_conn=%s\n' \
             "${who}" "${cpu}" "${mem}" "${conns}" "${requests}" "${per_conn}" \
             | tee -a "${RESULTS_DIR}/diagnostics.txt"
     done
 
-    printf 'upstream headroom: %s\n' \
+    # Sampled *while a load is running*. Taken after one, as it was at first,
+    # this only ever reported 0.00% — which says the upstreams were idle,
+    # not that they had headroom, and the whole point of the number is to show
+    # the proxy was the bottleneck rather than them.
+    oha "$(target_ip ramjet-uring)" "${CONC_MAIN}" 12s >/dev/null &
+    local headroom_load=$!
+    sleep 6
+    printf 'upstream load while the proxy is saturated: %s\n' \
         "$(docker stats --no-stream --format '{{.Name}}={{.CPUPerc}}' "${PREFIX}-up1" "${PREFIX}-up2" | tr '\n' ' ')" \
         | tee -a "${RESULTS_DIR}/diagnostics.txt"
+    wait "${headroom_load}" 2>/dev/null || true
 }
 
 # The thesis, measured directly: how many times the kernel is entered per

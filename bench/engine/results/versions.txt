@@ -1,0 +1,9 @@
+date:      2026-08-27T23:45:01Z
+host:      Darwin 25.5.0 arm64, 12 host CPUs
+docker:    29.7.2
+docker VM: 8 CPUs, 7.0.12-linuxkit
+seccomp:   seccomp-uring.json (moby v24.0.7 default + io_uring_{setup,enter,register})
+nginx:     nginx:1-alpine -> nginx version: nginx/1.31.4
+oha:       ghcr.io/hatoo/oha:latest -> oha 1.16.0
+rustc:     rustc 1.98.0 (88d9e12ae 2026-08-18)
+ramjet:    ramjet-ingressd 0.1.0

@@ -1,0 +1,29 @@
+ramjet-hyper: cpu=178.22% mem=29.6MiB / 3.825GiB upstream_conns_opened=128 requests=652530 reqs_per_conn=5097
+ramjet-uring: cpu=198.54% mem=14.76MiB / 3.825GiB upstream_conns_opened=128 requests=534263 reqs_per_conn=4173
+nginx: cpu=136.50% mem=13.22MiB / 3.825GiB upstream_conns_opened=185 requests=728401 reqs_per_conn=3937
+upstream headroom: ramjet-engine-up1=0.00% ramjet-engine-up2=0.00% 
+--- RAMJET_URING_STATS during a 10s c64 run ---
+ramjet-ingressd 0.1.0 — engine uring, 1 backend(s), 2 endpoint(s), 1 route(s)
+  config   /etc/ramjet/routes.yaml
+  http     0.0.0.0:8080
+  admin    0.0.0.0:10254
+  probes   http://0.0.0.0:10254/healthz  http://0.0.0.0:10254/readyz  http://0.0.0.0:10254/metrics
+  cores    2
+  the uring engine is experimental and serves a subset of the hyper engine:
+    - HTTP/1.1 plaintext only; no TLS termination and no HTTP/2 (502)
+    - no WebSocket or other protocol upgrades (502)
+    - static routes only; --engine uring cannot run in Kubernetes mode
+    - gRPC is refused, as it is on the hyper engine (502)
+uring: ops.live=2 live_arms=0 to_submit=0 ready=1 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=20 submitting=0) cqes=20 cqes_per_waiting_enter=1.00 waits_early=0 cpu_ns(enter=413623 wait=461540 thread_total=756622) enter_share_of_thread_cpu=0.5465
+uring: ops.live=1 live_arms=0 to_submit=0 ready=1 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=21 submitting=0) cqes=21 cqes_per_waiting_enter=1.00 waits_early=0 cpu_ns(enter=350664 wait=404874 thread_total=661457) enter_share_of_thread_cpu=0.5299
+uring: ops.live=81 live_arms=0 to_submit=0 ready=1 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=1497 submitting=0) cqes=19132 cqes_per_waiting_enter=12.78 waits_early=0 cpu_ns(enter=151903627 wait=158819025 thread_total=214269538) enter_share_of_thread_cpu=0.7089
+uring: ops.live=43 live_arms=0 to_submit=0 ready=61 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=2795 submitting=0) cqes=23119 cqes_per_waiting_enter=8.27 waits_early=0 cpu_ns(enter=158749939 wait=170503783 thread_total=219299460) enter_share_of_thread_cpu=0.7239
+uring: ops.live=55 live_arms=0 to_submit=0 ready=63 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=14438 submitting=0) cqes=261842 cqes_per_waiting_enter=18.14 waits_early=0 cpu_ns(enter=1311454176 wait=1370908078 thread_total=1681628257) enter_share_of_thread_cpu=0.7799
+uring: ops.live=52 live_arms=0 to_submit=0 ready=57 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=17147 submitting=0) cqes=271645 cqes_per_waiting_enter=15.84 waits_early=0 cpu_ns(enter=1239422016 wait=1299170084 thread_total=1580557717) enter_share_of_thread_cpu=0.7842
+uring: ops.live=56 live_arms=0 to_submit=0 ready=69 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=31198 submitting=0) cqes=610222 cqes_per_waiting_enter=19.56 waits_early=0 cpu_ns(enter=2500205267 wait=2611690050 thread_total=3170448184) enter_share_of_thread_cpu=0.7886
+uring: ops.live=75 live_arms=0 to_submit=0 ready=5 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=37316 submitting=0) cqes=639502 cqes_per_waiting_enter=17.14 waits_early=0 cpu_ns(enter=2566797804 wait=2688520300 thread_total=3237081698) enter_share_of_thread_cpu=0.7929
+uring: ops.live=62 live_arms=0 to_submit=0 ready=57 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=45734 submitting=0) cqes=910256 cqes_per_waiting_enter=19.90 waits_early=0 cpu_ns(enter=3574462986 wait=3740423229 thread_total=4523054372) enter_share_of_thread_cpu=0.7903
+uring: ops.live=50 live_arms=0 to_submit=0 ready=51 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=56435 submitting=0) cqes=1002573 cqes_per_waiting_enter=17.77 waits_early=0 cpu_ns(enter=3884992791 wait=4066633655 thread_total=4882433790) enter_share_of_thread_cpu=0.7957
+uring: ops.live=101 live_arms=0 to_submit=0 ready=3 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=59032 submitting=0) cqes=1260088 cqes_per_waiting_enter=21.35 waits_early=0 cpu_ns(enter=4720606782 wait=4930674358 thread_total=5945628921) enter_share_of_thread_cpu=0.7940
+uring: ops.live=54 live_arms=0 to_submit=0 ready=60 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=72306 submitting=0) cqes=1320667 cqes_per_waiting_enter=18.26 waits_early=0 cpu_ns(enter=5023598177 wait=5255360486 thread_total=6303195122) enter_share_of_thread_cpu=0.7970
+uring: ops.live=70 live_arms=0 to_submit=0 ready=1 pool=0 recv_arms=0 accept_arms=0 ring_consumed=0 ring_reclaimed=0 enobufs=0 enters(waiting=70485 submitting=34) cqes=1530080 cqes_per_waiting_enter=21.71 waits_early=0 cpu_ns(enter=5710162496 wait=5965050075 thread_total=7187312094) enter_share_of_thread_cpu=0.7945

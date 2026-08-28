@@ -84,6 +84,12 @@ pub enum Behaviour {
     BlackHole,
     /// Read the request, then close without answering.
     HangUp,
+    /// Answer the first request, then close on the next one without answering.
+    ///
+    /// This is the pooled-connection race made deterministic: the connection is
+    /// alive when it goes into the pool and dead by the time the next request
+    /// lands on it.
+    EchoThenDieOnNext { body: Vec<u8> },
     /// Answer with a chunked body made of these pieces.
     Chunked(Vec<Vec<u8>>),
 }
@@ -153,6 +159,7 @@ fn serve(mut stream: TcpStream, behaviour: Behaviour, seen: Arc<Seen>, stop: Arc
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut served = 0usize;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -228,6 +235,14 @@ fn serve(mut stream: TcpStream, behaviour: Behaviour, seen: Arc<Seen>, stop: Arc
                 echo_response(&head, &body, reply)
             }
             Behaviour::Echo { body: reply } => echo_response(&head, &body, reply),
+            Behaviour::EchoThenDieOnNext { body: reply } => {
+                if served == 0 {
+                    echo_response(&head, &body, reply)
+                } else {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return;
+                }
+            }
             Behaviour::Chunked(pieces) => {
                 let mut out = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
                 for piece in pieces {
@@ -244,6 +259,7 @@ fn serve(mut stream: TcpStream, behaviour: Behaviour, seen: Arc<Seen>, stop: Arc
             return;
         }
         let _ = stream.flush();
+        served += 1;
         if header_of(&head, "connection").is_some_and(|v| v.eq_ignore_ascii_case("close")) {
             return;
         }

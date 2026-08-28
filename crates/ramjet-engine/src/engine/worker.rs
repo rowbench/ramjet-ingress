@@ -217,9 +217,25 @@ struct Conn {
     snapshot: Option<Arc<RouteTable>>,
     stats_index: u32,
     endpoint_index: usize,
+    /// How many endpoints the backend has.
+    ///
+    /// Not the same as `targets.len()`, which is capped at the attempt limit.
+    /// The in-flight counters are indexed by position in the backend, so using
+    /// the shorter length would attribute a request to the wrong endpoint
+    /// whenever a backend has more endpoints than a request may try.
+    endpoint_count: usize,
     inflight_held: bool,
     targets: Vec<SocketAddr>,
     attempt: usize,
+    /// Whether this request can be sent again at all.
+    ///
+    /// True only when it has no body. A request with bytes to send cannot be
+    /// replayed: the first attempt may already have written some of them, and
+    /// nothing buffers them for a second try. The endpoint-failover path gets
+    /// this for free — `attempts()` gives a body-carrying request exactly one
+    /// target — but the pooled-connection retry below bypasses that count, so
+    /// it has to ask directly.
+    replayable: bool,
     /// The current upstream came out of the pool, so losing it before the
     /// response starts is a race rather than an endpoint failure.
     from_pool: bool,
@@ -269,9 +285,11 @@ impl Conn {
             snapshot: None,
             stats_index: 0,
             endpoint_index: 0,
+            endpoint_count: 0,
             inflight_held: false,
             targets: Vec::new(),
             attempt: 0,
+            replayable: false,
             from_pool: false,
             pool_retry_used: false,
             committed: false,
@@ -297,6 +315,7 @@ impl Conn {
         self.snapshot = None;
         self.targets.clear();
         self.attempt = 0;
+        self.replayable = false;
         self.from_pool = false;
         self.pool_retry_used = false;
         self.committed = false;
@@ -997,6 +1016,8 @@ impl Worker {
         }
         conn.stats_index = backend.stats_index();
         conn.endpoint_index = first.index;
+        conn.endpoint_count = backend.endpoints().len();
+        conn.replayable = framing == Framing::Empty;
         conn.attempt = 0;
 
         // The head is rewritten before the inbox is drained, because the parsed
@@ -1506,7 +1527,8 @@ impl Worker {
         // connection, and it is not counted as a retry or a connect failure —
         // nothing about the endpoint has been learned. hyper's client calls
         // this `retry_canceled_requests`, and it is on by default there.
-        let pooled_race = conn.from_pool && !conn.pool_retry_used && !conn.committed;
+        let pooled_race =
+            conn.from_pool && !conn.pool_retry_used && !conn.committed && conn.replayable;
         if pooled_race {
             conn.from_pool = false;
             conn.pool_retry_used = true;
@@ -1552,7 +1574,7 @@ impl Worker {
         let Some(table) = conn.snapshot.as_ref() else {
             return;
         };
-        let index = (conn.endpoint_index + conn.attempt) % conn.targets.len().max(1);
+        let index = (conn.endpoint_index + conn.attempt) % conn.endpoint_count.max(1);
         if let Some(slot) = table.stats().slot(conn.stats_index) {
             if let Some(counter) = slot.inflight(index) {
                 counter.fetch_add(1, Ordering::Relaxed);
@@ -1569,7 +1591,7 @@ impl Worker {
         let Some(table) = conn.snapshot.as_ref() else {
             return;
         };
-        let index = (conn.endpoint_index + conn.attempt) % conn.targets.len().max(1);
+        let index = (conn.endpoint_index + conn.attempt) % conn.endpoint_count.max(1);
         if let Some(slot) = table.stats().slot(conn.stats_index) {
             if let Some(counter) = slot.inflight(index) {
                 counter.fetch_sub(1, Ordering::Relaxed);

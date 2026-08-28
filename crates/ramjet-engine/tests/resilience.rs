@@ -250,3 +250,66 @@ fn an_upstream_that_dies_between_requests_is_retried_transparently() {
         assert_eq!(response.status, 200, "request {i}: {}", response.text());
     }
 }
+
+#[test]
+fn a_request_with_a_body_is_not_replayed_onto_a_fresh_connection() {
+    // The pooled-connection race, but for a request that cannot be replayed.
+    // The free retry a pooled connection is owed exists because losing one is
+    // not the endpoint's fault — but it is only safe for a request with no
+    // body. Replaying one whose bytes have already gone out would send a head
+    // announcing a body that no longer exists to send, and the upstream would
+    // wait for it for ever.
+    let upstream = spawn(Behaviour::EchoThenDieOnNext {
+        body: vec![b'u'; 16],
+    });
+    let proxy = Proxy::with_config(table_of(&[upstream.addr]), |config| {
+        // Short, so a hang shows up as a failed assertion rather than a timeout
+        // in the harness.
+        config.response_timeout = Duration::from_millis(500);
+        config.tick = Duration::from_millis(10);
+    });
+    let mut client = Client::connect(proxy.addr);
+
+    // First request warms the pool.
+    assert_eq!(
+        client
+            .send(b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n")
+            .status,
+        200
+    );
+
+    // Second takes the pooled connection, which is now dead, and carries a body.
+    let response = client.send(
+        b"POST /upload HTTP/1.1\r\nHost: app.example.com\r\nContent-Length: 5\r\n\r\nhello",
+    );
+
+    assert_eq!(
+        response.status, 502,
+        "a body-carrying request must fail rather than be replayed: {}",
+        response.text()
+    );
+}
+
+#[test]
+fn a_body_free_request_is_replayed_onto_a_fresh_connection() {
+    // The other half of the same rule: with no body there is nothing that
+    // cannot be sent again, so the client should never see the race at all.
+    let upstream = spawn(Behaviour::EchoThenDieOnNext {
+        body: vec![b'u'; 16],
+    });
+    let proxy = Proxy::start(table_of(&[upstream.addr]));
+    let mut client = Client::connect(proxy.addr);
+
+    assert_eq!(
+        client
+            .send(b"GET /one HTTP/1.1\r\nHost: app.example.com\r\n\r\n")
+            .status,
+        200
+    );
+    let second = client.send(b"GET /two HTTP/1.1\r\nHost: app.example.com\r\n\r\n");
+    assert_eq!(
+        second.status, 200,
+        "the retry should have hidden the race: {}",
+        second.text()
+    );
+}
