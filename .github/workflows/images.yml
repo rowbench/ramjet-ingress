@@ -1,0 +1,241 @@
+name: images
+
+# Multi-architecture container images on Docker Hub.
+#
+# Path filters below cover branch pushes only — GitHub does not evaluate them
+# for tag pushes — so a `v*` tag always builds, even when the commit it names
+# touched nothing but documentation. That asymmetry is the one we want: a
+# release must never be silently skipped, and a docs-only push to main must
+# never spend two Rust release builds proving nothing changed.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'bench/**'
+      - '**/*.md'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      runtime_ref:
+        description: 'Ref of the ramjet runtime repository to build against'
+        default: main
+
+# Read this repository and the public sibling. Nothing here writes to either;
+# the only credential that matters is the Docker Hub token, which is a secret
+# rather than a permission.
+permissions:
+  contents: read
+
+# Cancelled rather than queued, which is the opposite of the docs workflow's
+# choice and for the opposite reason: a half-finished Pages deployment is worse
+# than a redundant one, whereas an image build superseded by a newer push is
+# building a tag that is about to be overwritten anyway.
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: sofelia/ramjet-ingress
+
+  # `ramjet-engine` depends on the ramjet runtime by path (`../enhance-socket`),
+  # so the build context is the parent of both checkouts and the sibling has to
+  # be there — see the Dockerfile. It is a separate repository with its own
+  # release cadence, which means a floating `main` here makes the image content
+  # depend on a commit this repository does not record. Pin this to a tag or a
+  # SHA before cutting a release, or the `v*` image is not reproducible from
+  # this repository alone.
+  RUNTIME_REPO: sofelia-ai/ramjet
+  RUNTIME_REF: main
+
+jobs:
+  # One job per architecture on a runner of that architecture. The alternative
+  # — one runner, both platforms, arm64 under QEMU — is not a slower build of
+  # the same thing: a Rust release build with LTO under emulation runs past an
+  # hour and regularly past the job timeout. GitHub's arm64 runners are free for
+  # public repositories, which is what makes the native split cost nothing.
+  build:
+    strategy:
+      # Both architectures' logs in one run. The publish job needs both digests
+      # and will not run if either is missing, so letting the second finish
+      # costs a few minutes and saves a second push to find the second failure.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Require the Docker Hub credentials
+        env:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          token: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [[ -z "$username" || -z "$token" ]]; then
+            echo "::error::Set the DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets (Settings -> Secrets and variables -> Actions). DOCKERHUB_TOKEN is an access token from hub.docker.com/settings/security with Read & Write scope, not the account password."
+            exit 1
+          fi
+
+      # Both checkouts are siblings under $GITHUB_WORKSPACE, which is therefore
+      # the parent directory the Dockerfile expects as its build context.
+      - name: Check out ramjet-ingress
+        uses: actions/checkout@v4
+        with:
+          path: ramjet-ingress
+
+      - name: Check out the ramjet runtime beside it
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RUNTIME_REPO }}
+          ref: ${{ inputs.runtime_ref || env.RUNTIME_REF }}
+          path: enhance-socket
+
+      # Fail here, in a step that can say why, rather than fifteen minutes into
+      # a Docker build with a cargo manifest error. The workspace resolves
+      # `ramjet` and `ramjet-http` by path into the sibling checkout, and cargo
+      # refuses to load a workspace whose path dependency is absent — so a
+      # runtime ref that predates either crate cannot build this repository.
+      - name: Check the runtime checkout carries what the workspace needs
+        env:
+          ref: ${{ inputs.runtime_ref || env.RUNTIME_REF }}
+        run: |
+          for manifest in enhance-socket/Cargo.toml enhance-socket/ramjet-http/Cargo.toml; do
+            if [[ ! -f "$manifest" ]]; then
+              echo "::error::$manifest is missing from $RUNTIME_REPO@$ref. The ramjet-ingress workspace resolves this crate by path and cannot build without it."
+              exit 1
+            fi
+          done
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Only the labels are used here — the tags this computes are discarded,
+      # because the per-architecture push below is deliberately untagged. Labels
+      # have to be applied at build time, though, since they live in each
+      # image's config: without them a published image carries no reference back
+      # to the commit and repository it came from, which is the one question
+      # anyone holding a mystery image needs answered.
+      - name: Labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Pushed by digest and left untagged. Each runner produces a
+      # single-architecture manifest that nothing references yet; the publish
+      # job below is what binds them together under the real tags. Tagging here
+      # instead would mean the second architecture's push overwrites the
+      # first's, which is the failure this whole shape exists to avoid.
+      #
+      # `provenance: false` because an attestation turns each per-architecture
+      # push into an index rather than a plain manifest, and `imagetools create`
+      # then nests one index inside another — a manifest list whose entries are
+      # not images, which clients resolve as no matching platform.
+      #
+      # GitHub Actions cache rather than a registry cache: the volume exported
+      # is small, because the multi-gigabyte state — Cargo's registry and the
+      # target directory — lives in BuildKit `--mount=type=cache` mounts, and
+      # those are builder-local and never part of a cache export at all. So the
+      # 10 GB repository budget is not under pressure, and the tags of a public
+      # product image stay free of `buildcache-*` entries sitting above `latest`
+      # in the Docker Hub listing. What the cache actually buys, stated plainly:
+      # the base image layers, and a whole-layer hit when the sources are
+      # unchanged — which is the tag-a-commit-already-built-on-main path, where
+      # a release build becomes a re-tag. A source change is a cold compile
+      # either way, because the cache mounts do not survive the runner.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ramjet-ingress/Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      # The digest is the whole payload: an empty file named after it, which
+      # the publish job turns back into an image reference.
+      - name: Export the digest
+        env:
+          digest: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # The tags are created exactly once, here, over both digests at once. Until
+  # this job runs, the images are in the registry but unreachable by name.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      # `latest` only from the default branch, so a tag build never moves it —
+      # tagging an old commit is a thing people do, and it should not repoint
+      # `latest` at it. `sha-<short>` on every build, which is the only tag that
+      # is always unambiguous and the one to pin in a values file. Semver tags
+      # come from the ref and so appear on `v*` builds alone.
+      #
+      # There is deliberately no `{{major}}`: on 0.x it would publish a tag `0`
+      # that a minor release is allowed to break, which is the one promise the
+      # version number is making that we would rather not undermine.
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Both substitutions below are unquoted on purpose, which is the mechanism
+      # rather than an oversight: one expands to `-t <tag> -t <tag> ...` and the
+      # other to one `image@sha256:<digest>` per file in this directory, and
+      # quoting either would hand `imagetools` a single argument containing
+      # spaces. Hence the disable — the splitting is what is wanted.
+      - name: Create the manifest list
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Inspect what was published
+        env:
+          version: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "$IMAGE:$version"

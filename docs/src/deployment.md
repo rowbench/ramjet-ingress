@@ -246,7 +246,7 @@ reference](./configuration/flags.md).
 
 ```yaml
 image:
-  repository: ramjet-ingress
+  repository: sofelia/ramjet-ingress
   tag: ""                        # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
   pullSecrets: []
@@ -429,6 +429,30 @@ to load into. Importing rather than pulling is what lets `imagePullPolicy` stay
 ran, with no path by which the kubelet could quietly substitute a registry copy.
 
 ## The container image
+
+`sofelia/ramjet-ingress` on Docker Hub, public, and what the chart installs by
+default — the quick starts at the top of this page pull it and need no local
+build.
+
+It is a manifest list covering `linux/amd64` and `linux/arm64`, so the pull
+resolves to the node's architecture on its own.
+
+| Tag | What it points at |
+|---|---|
+| `0.1.0`, `0.1` | A `v*` release. The chart's default, by way of an empty `image.tag` falling back to `appVersion` — so chart and image version together. |
+| `sha-<short>` | One commit, exactly. Published by every build, and the tag to pin when a specific build is what you mean. |
+| `latest` | The most recent build of `main`. It moves, which makes it the wrong thing for a cluster: a pod rescheduled onto a new node can come back as a different build than the pods beside it. |
+
+`.github/workflows/images.yml` publishes them on every push to `main` and every
+`v*` tag. Each architecture builds on a runner of that architecture — a Rust
+release build with LTO under QEMU runs past the job timeout, so emulation is not
+a slower version of the same thing but a broken one — and each pushes by digest
+into the registry untagged. A final job creates the manifest list over both
+digests, which is the only point at which any tag above starts resolving. The
+workflow needs `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as repository secrets;
+see [deploy/README.md](https://github.com/rowbench/ramjet-ingress/blob/main/deploy/README.md#publishing-it).
+
+### How it is built
 
 Multi-stage: a full Rust toolchain compiles, and
 `gcr.io/distroless/cc-debian12:nonroot` carries the result. The runtime has no

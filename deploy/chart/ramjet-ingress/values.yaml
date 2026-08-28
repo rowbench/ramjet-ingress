@@ -1,7 +1,16 @@
 # Default configuration for ramjet-ingress.
 
+# Published by .github/workflows/images.yml on every push to main and every
+# `v*` tag, as a manifest list covering linux/amd64 and linux/arm64 — so the
+# pull resolves to the node's architecture with nothing set here.
+#
+# The default tag is the chart's own appVersion rather than `latest`, which is
+# the difference between a pod restart getting the image its chart was tested
+# against and getting whatever main built this morning. `latest` exists, and is
+# the wrong thing to run: pin `tag` to a `sha-<short>` build to name one commit
+# exactly.
 image:
-  repository: ramjet-ingress
+  repository: sofelia/ramjet-ingress
   tag: ""            # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
   pullSecrets: []

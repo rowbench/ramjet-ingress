@@ -21,6 +21,62 @@ the admin port, and an `IngressClass` named `ramjet`. Point workloads at it with
 The static manifests are generated from the presets. Edit the preset, not the
 manifest — see [Regenerating](#regenerating-the-static-manifests).
 
+## The image
+
+Both commands above pull `sofelia/ramjet-ingress`. Nothing above needs a local
+build, a registry of your own, or an `imagePullSecret` — it is a public repository
+on Docker Hub.
+
+It is published as a manifest list covering `linux/amd64` and `linux/arm64`, so
+the pull resolves to whatever the node happens to be and a cluster with both
+kinds of node needs no second values file.
+
+| Tag | What it points at |
+|---|---|
+| `0.1.0`, `0.1` | A `v*` release. This is what the chart installs: `image.tag` is empty by default and falls back to the chart's `appVersion`, so chart and image move together. |
+| `sha-<short>` | One commit, exactly. The tag to pin when you need to name a specific build — every build publishes one, release or not. |
+| `latest` | The most recent build of `main`. Fine for a look, wrong for a cluster: it moves under you, and a pod restarting on a new node can quietly come back as a different build than its neighbours. |
+
+Overriding the default is a normal values change:
+
+```sh
+helm install ramjet deploy/chart/ramjet-ingress \
+  --namespace ramjet-ingress --create-namespace \
+  --set image.tag=sha-8637f64
+```
+
+Mirroring it into a private registry is the same, plus `image.repository` and
+`image.pullSecrets`.
+
+### Publishing it
+
+[`.github/workflows/images.yml`](../.github/workflows/images.yml) builds and
+pushes on every push to `main` and every `v*` tag. The two architectures build
+on runners of their own architecture rather than one runner emulating the other,
+because a Rust release build under QEMU runs past the job timeout; each pushes
+by digest, and a final job binds both digests under the tags above.
+
+It needs two repository secrets — Settings → Secrets and variables → Actions.
+The workflow checks for them in its first step and fails with a message naming
+them, rather than getting as far as a login error:
+
+| Secret | Value |
+|---|---|
+| `DOCKERHUB_USERNAME` | The Docker Hub account that owns the repository |
+| `DOCKERHUB_TOKEN` | An access token from [Docker Hub security settings](https://hub.docker.com/settings/security) with Read & Write scope — not the account password |
+
+### Building it yourself
+
+The context is the **parent** directory, not this one, because `ramjet-engine`
+depends on the `ramjet` runtime in a sibling checkout by path:
+
+```sh
+docker build -f Dockerfile -t ramjet-ingress:dev ..
+```
+
+That sibling (`../enhance-socket`) has to be there, and it is why CI checks out
+two repositories side by side before it builds anything.
+
 ## Generic install
 
 No provider preset, cluster defaults everywhere:
