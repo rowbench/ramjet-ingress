@@ -600,10 +600,12 @@ is io_uring's, so the platform without io_uring measures none of it.
   under a pinned one** (moby v24.0.7's default plus the three io_uring
   syscalls). It is a superset of what nginx needs so it cannot disadvantage
   nginx, but it is a difference between contenders.
-- **The two engines are not feature-equivalent.** The uring engine serves
-  HTTP/1.1 plaintext and nothing else. None of the missing features is exercised
-  by this workload, so the comparison is like for like *for this traffic*. It is
-  **not** a claim that the engines are interchangeable.
+- **The two engines were not feature-equivalent when this was measured.** The
+  uring engine served HTTP/1.1 plaintext and nothing else. None of the missing
+  features is exercised by this workload, so the comparison is like for like
+  *for this traffic*. It was **not** a claim that the engines are
+  interchangeable. Most of that gap has since closed — see [TLS, and a
+  tunnel](#tls-and-a-tunnel) below and [Engines](./operations/engines.md).
 - **c256 is a single run**, not a median, and is reported as such.
 - The correctness gate compares the two engines' response headers field by
   field, so **neither can be fast by doing less.**
@@ -612,11 +614,80 @@ is io_uring's, so the platform without io_uring measures none of it.
 
 - Not that io_uring beats epoll in general. This is one proxy workload, one
   kernel, one VM.
-- Not that the uring engine is ready to deploy. It has no TLS, no HTTP/2, no
-  upgrades and no Kubernetes mode.
+- Not that the uring engine is ready to deploy. **At the time of this
+  measurement** it had no TLS, no HTTP/2, no upgrades and no Kubernetes mode.
+  That list is now down to graceful drain, and HTTP/2 by dispatch.
 - Not that the hyper engine is badly written. Profiling took it to the syscall
   floor, and this is what is underneath that floor. The difference is the I/O
   model, which is what was being tested.
+
+## TLS, and a tunnel
+
+The measurements above are plaintext HTTP/1.1, which is what the uring engine
+could serve when they were taken. It terminates TLS now. Same machine, same
+topology, same pinning, same rules — one certificate added.
+
+Both sides resume sessions, which is the setting that decides a TLS benchmark:
+nginx ships `ssl_session_tickets on` and every deployment turns on
+`ssl_session_cache`, so a run against a ramjet with resumption off would be
+measuring a configuration nobody deploys. ECDSA P-256, one certificate generated
+per run and mounted into all three containers, HTTP/1.1 on all three.
+
+**Keep-alive**, 30s per run, three rounds, median by throughput:
+
+| c=64 | rps | p50 | p99 |
+|---|---:|---:|---:|
+| ramjet (hyper) | 82,735 | 0.68 ms | 2.48 ms |
+| **ramjet (uring)** | **107,920** | **0.51 ms** | 2.38 ms |
+| nginx | 76,531 | 0.76 ms | 2.40 ms |
+
+| c=256 | rps | p50 | p99 |
+|---|---:|---:|---:|
+| ramjet (hyper) | 81,265 | 2.96 ms | 6.24 ms |
+| **ramjet (uring)** | **104,188** | **2.14 ms** | 7.02 ms |
+| nginx | 68,758 | 3.38 ms | 8.92 ms |
+
+**A new connection per request**, so every request pays for a handshake — which
+is what a rolling deployment or a reconnecting CDN does to a replica:
+
+| | conn/s | p50 | p99 |
+|---|---:|---:|---:|
+| ramjet (hyper) | 12,412 | 5.09 ms | 12.62 ms |
+| **ramjet (uring)** | **14,436** | **4.25 ms** | **11.25 ms** |
+| nginx | 5,736 | 10.68 ms | 25.86 ms |
+
+The margin over hyper survives TLS almost intact: 1.30x at c=64, 1.28x at c=256,
+against 1.30x on the plaintext run. Crypto is added work, but it is added to
+both ramjet contenders equally, and what separates them is still how the bytes
+reach the record layer rather than what happens inside it.
+
+The handshake row narrows to 1.16x between the engines, and it should — a
+handshake is arithmetic, not syscalls. The 2.52x over nginx there is *ring*
+against OpenSSL as much as it is one proxy against another, and should be read
+as a statement about two TLS stacks.
+
+### WebSocket tunnels are level, and that is the expected result
+
+64 tunnels, 128-byte payloads, one echo in flight per connection:
+
+| | echo/s | p50 | p99 |
+|---|---:|---:|---:|
+| ramjet (hyper) | 103,422 | 595 µs | 1,509 µs |
+| ramjet (uring) | 105,271 | 585 µs | **1,374 µs** |
+| nginx | 102,843 | **571 µs** | 1,619 µs |
+
+All three within 2.4%. A reader who saw 1.30x on the TLS table would expect a
+gap here, and there is none, for a reason worth stating: after a 101 there is no
+request, no routing and no header rewriting — one read and one write per echo on
+each side, with nothing to batch and nothing to overlap. The rate is bounded by
+round-trip latency rather than by how many times the kernel is entered, and
+submission batching is exactly the advantage that has nothing to work on.
+
+What does separate them is steadiness: both ramjet engines hold a 1.2–1.4%
+spread across runs against nginx's 7.1%, and the uring engine has the best p99.
+
+Full protocol, raw JSON and the fairness notes are in
+[`bench/engine/RESULTS.md`](https://github.com/rowbench/ramjet-ingress/blob/main/bench/engine/RESULTS.md).
 
 ## Route matching
 

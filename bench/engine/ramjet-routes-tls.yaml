@@ -1,0 +1,27 @@
+# The plaintext benchmark's table with a certificate attached.
+#
+# One host, one path, two endpoints, round-robin: the same shape as
+# ramjet-routes.yaml, because the point of the TLS run is to add exactly one
+# variable to it. A bigger table would measure the router, and bench/PROFILE.md
+# already measured the router — the match is 0.1% of a request.
+#
+# The certificate is generated per run into the same directory as this file's
+# mount, so there is no key in the repository and no expiry date in a fixture.
+
+backends:
+  - name: bench
+    policy: roundRobin
+    endpoints:
+      - 172.31.98.11:8080
+      - 172.31.98.12:8080
+
+routes:
+  - host: bench.test
+    path: /
+    pathType: Prefix
+    backend: bench
+
+tls:
+  - host: bench.test
+    cert: certs/cert.pem
+    key: certs/key.pem

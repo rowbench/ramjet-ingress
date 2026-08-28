@@ -1,0 +1,18 @@
+# The WebSocket tunnel benchmark's table.
+#
+# Two `ws_echo` upstreams, round-robin, on the same two cores the HTTP
+# benchmarks' upstreams use — so a tunnel run and a request run differ in what
+# they measure and not in where the work is pinned.
+
+backends:
+  - name: ws
+    policy: roundRobin
+    endpoints:
+      - 172.31.98.11:9001
+      - 172.31.98.12:9001
+
+routes:
+  - host: bench.test
+    path: /
+    pathType: Prefix
+    backend: ws

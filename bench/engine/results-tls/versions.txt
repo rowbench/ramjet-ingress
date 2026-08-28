@@ -1,0 +1,10 @@
+date:      2026-08-28T18:13:41Z
+host:      Darwin 25.5.0 arm64
+docker:    29.7.2
+kernel:    7.0.12-linuxkit
+ramjet:    8dac25f
+nginx:     nginx version: nginx/1.31.4
+oha:       oha 1.16.0
+openssl:   OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)
+protocol:  https, HTTP/1.1, keep-alive
+duration:  30s x 3 rounds, warmup 10s

@@ -21,6 +21,7 @@
   - [Canary auto-promotion](./operations/canary.md)
   - [Traffic mirroring](./operations/mirroring.md)
   - [HTTP/3](./operations/http3.md)
+  - [Engines](./operations/engines.md)
 
 ---
 

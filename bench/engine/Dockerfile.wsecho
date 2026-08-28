@@ -1,0 +1,37 @@
+# The WebSocket upstream for the tunnel benchmark, and the load generator that
+# drives it.
+#
+# The upstream is `enhance-socket`'s own `ws_echo` example: a real WebSocket
+# server, on the runtime this repository's second engine is built on, with a
+# conformance suite of its own. Using it rather than a third-party echo image
+# means the thing behind the proxy is code this project can read — and the
+# proxy under test does not parse frames, so what the upstream is matters only
+# in that it must be correct.
+#
+# Build context is the **parent** of the repository, the same as
+# Dockerfile.ramjet, for the same reason: the two repositories keep their real
+# names and their real relative positions.
+
+FROM rust:1-slim-bookworm AS builder
+
+WORKDIR /src
+
+# `ring` compiles C for the wss variants of the example crate's dependencies.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends make \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY enhance-socket ./enhance-socket
+COPY ramjet-ingress/bench/engine/wsload ./wsload
+
+RUN cd enhance-socket && cargo build --release --example ws_echo
+RUN cd wsload && cargo build --release
+
+FROM debian:bookworm-slim
+
+COPY --from=builder /src/enhance-socket/target/release/examples/ws_echo /usr/local/bin/ws_echo
+COPY --from=builder /src/wsload/target/release/wsload /usr/local/bin/wsload
+
+EXPOSE 9001
+
+ENTRYPOINT ["/usr/local/bin/ws_echo"]

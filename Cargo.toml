@@ -8,6 +8,11 @@ members = [
     "crates/ramjet-ingressd",
     "crates/ramjet-top",
 ]
+# The WebSocket load generator in bench/engine is a benchmark tool, not part of
+# the product. Excluding it keeps `cargo test --workspace` from building it, and
+# keeps its thread-per-connection shape from being mistaken for something the
+# data plane does.
+exclude = ["bench/engine/wsload"]
 
 [workspace.package]
 version = "0.1.0"

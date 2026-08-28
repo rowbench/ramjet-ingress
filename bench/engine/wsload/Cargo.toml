@@ -1,0 +1,16 @@
+[package]
+name = "wsload"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A WebSocket echo load generator for bench/engine, because oha does not speak WebSocket."
+
+# Deliberately outside the workspace, and with no dependencies. It is a
+# benchmark tool, not part of the product: keeping it out means `cargo test
+# --workspace` does not build it and its blocking-thread-per-connection shape
+# cannot be mistaken for something the data plane does.
+
+[dependencies]
+
+[profile.release]
+opt-level = 3

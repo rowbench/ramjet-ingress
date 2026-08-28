@@ -1,0 +1,9 @@
+date:      2026-08-28T18:22:50Z
+host:      Darwin 25.5.0 arm64
+docker:    29.7.2
+kernel:    7.0.12-linuxkit
+ramjet:    8dac25f
+nginx:     nginx version: nginx/1.31.4
+upstream:  enhance-socket ws_echo
+load:      wsload, 64 connections, 128-byte payload
+duration:  20s x 3 rounds

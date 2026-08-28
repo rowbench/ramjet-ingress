@@ -15,8 +15,9 @@ changes nothing else about the serving path.
 | `ramjet-router` — route table, matcher, load balancing | working, tested, benchmarked |
 | `ramjet-proxy` — listeners, TLS, HTTP/1.1, HTTP/2, upstreams | working, tested against real sockets |
 | `ramjet-proxy` — HTTP/3 over QUIC | experimental, off by default, tested against real UDP sockets |
+| `ramjet-engine` — the completion-based data plane | working, tested against real sockets; see [Two engines](#two-engines) |
 | `ramjet-controller` — Kubernetes watch, translate, status | working, tested against in-memory objects |
-| `ramjet-ingressd` — the daemon | Kubernetes mode and dev mode |
+| `ramjet-ingressd` — the daemon | Kubernetes mode and dev mode, on either engine |
 
 What is deliberately absent is in [Limitations](#limitations). The line that
 matters operationally: there is no leader election yet, so run **one replica**.
@@ -61,9 +62,19 @@ Three properties follow, and they are the point of the design:
 crates/
   ramjet-router/      sans-io: route table, matcher, LB selection
   ramjet-proxy/       sockets, rustls, HTTP/1.1 + HTTP/2 + HTTP/3, upstream pools
+  ramjet-engine/      the second data plane: a completion-based reactor
   ramjet-controller/  Kubernetes informers, annotation translation, status
   ramjet-ingressd/    the daemon binary
 ```
+
+`ramjet-engine` depends on `ramjet-proxy`, which is the one dependency edge in
+this diagram that is not obvious. It is there so the two engines share *types*
+rather than behaviour: one `CertStore`, one `SniResolver`, one PROXY protocol
+parser, one mirror queue, one `Handoff`. `ramjet-ingressd` hands both engines
+the same `Arc`s, so a Secret rotation reaches whichever one is serving and a
+name resolves to the same certificate on both. The cost is that `ramjet-engine`
+links hyper, which it does not use; the alternative was a second copy of the
+certificate plumbing with its own opportunity to drift.
 
 `ramjet-router` depends on `arc-swap`, `regex`, and `thiserror`. Not on tokio,
 not on hyper, not on rustls. It never opens a socket, spawns a task, or reads a
@@ -946,6 +957,135 @@ line per occurrence would bury the outage under its own logs.
 The admin listener never reads a header — Prometheus and the kubelet reach the
 pod directly and speak no PROXY protocol, and requiring it there would take
 `/metrics` and both probes offline the moment the flag was set.
+
+## Two engines
+
+There are two data planes in this binary, and `--engine` picks which one serves.
+
+```
+                    --engine hyper            --engine uring
+                    ──────────────            ──────────────
+  runtime           tokio, one per core       the ramjet reactor, one per core
+  I/O               readiness: epoll/kqueue   completion: io_uring, or kqueue
+  per request       four syscalls, plus one   four submissions into a ring, and
+                    to learn a socket is      one io_uring_enter for a batch
+                    ready
+```
+
+They are not two implementations of the same idea. `ramjet-proxy` is hyper on
+tokio and is what every measurement before this phase was taken on;
+`ramjet-engine` exists to answer the question `bench/PROFILE.md` ended on —
+59.4% of a request is the four unavoidable syscalls and another 9.1% is finding
+out a socket is ready, and getting under that means making fewer of them.
+
+### What they share, and why it is types rather than code
+
+Everything above the socket:
+
+- **the route table.** One `SharedRouteTable`, one `ArcSwap`, one `load_full()`
+  per request on both. A generation published while traffic is flowing takes
+  effect on the next request on either engine, including the next request on an
+  already-open keep-alive connection.
+- **the certificate store.** One `CertStore` and one `SniResolver`. A name
+  resolves to the same certificate whichever engine answers the handshake, and a
+  rotation reaches both at the same instant because it is the same two
+  `ArcSwap`s published in the same order.
+- **the PROXY protocol parser**, unchanged and unmoved. It was written sans-io
+  and incremental, which is exactly what a completion-based reactor needs.
+- **the mirror queue.** `Mirror::enqueue` is a `try_send` on a bounded channel,
+  so a reactor thread hands a copy to a worker living on tokio without either
+  knowing about the other.
+- **the generation history**, and so rollback pins, and so `/admin/generations`.
+
+What is *not* shared is the HTTP implementation. `ramjet-engine` has its own
+sans-io HTTP/1.1 codec and its own header rewriting, and the target is not
+"similar behaviour" but the same bytes on the wire. That duplication is a real
+risk, so it is policed rather than hoped about: see [The differential
+test](#the-differential-test).
+
+### Where TLS sits
+
+rustls never touches a socket — it moves bytes between two buffers — so
+terminating TLS on the reactor needed no driver change at all:
+
+```
+  reactor    ciphertext in and out of the socket, and nothing else
+  rustls     ciphertext <-> plaintext
+  codec      plaintext <-> HTTP/1.1 messages
+```
+
+The HTTP state machine below cannot tell which listener a request arrived on
+except through `X-Forwarded-Proto`, which is the property that let the whole TLS
+lane be added without a second version of anything underneath it.
+
+What TLS costs is the plaintext path's zero-copy relay. Where the plaintext
+engine forwards a response body out of the buffer it arrived in, under TLS every
+byte is copied at least once in each direction, because rustls reads plaintext
+out of its own buffer and writes ciphertext into another. kTLS is what would win
+that back by moving the record layer into the kernel; it is a separate piece of
+work and is not attempted here.
+
+### One port, two engines
+
+The uring engine speaks HTTP/1.1. Rather than not offering HTTP/2, it offers it
+and hands those connections to a hyper engine in the same process.
+
+A `rustls::server::Acceptor` reads the ClientHello and **stops** — before a
+`ServerConfig` is chosen, before a byte is written back — and the ALPN list is
+readable there. So the decision is made while the connection is still nobody's:
+
+```
+  accept ─▶ read ClientHello ─▶ offered h2?
+                                   │
+                        no ────────┴──────── yes
+                        │                     │
+                  serve here            hand over: the descriptor, plus every
+                  (http/1.1)            byte read from it, to the other engine
+```
+
+Handing over a live descriptor is only safe because it is not live at that
+moment: the read that produced the ClientHello has completed and nothing has
+been submitted since, and the reactor holds one-shot registrations released on
+completion, so it has no state for that descriptor at all. The generation is
+bumped anyway — a completion arriving after the descriptor left would otherwise
+be delivered against whatever number the kernel handed out next, which is a bug
+that would appear only under load, in production, as one connection reading
+another's bytes.
+
+The socket has had bytes read from it and none written, so replaying the prefix
+reconstructs the client's stream exactly. There is no reset and no second
+handshake: the ClientHello is answered once, by the engine that can speak what
+it asked for. The plaintext listener does the same for the HTTP/2
+prior-knowledge preface.
+
+Two engines serving one port means one `/metrics` has to describe both, so the
+exposition sums the tokio side's counters into the reactor's. Without that,
+dispatch mode reports the HTTP/1.1 half of its traffic and silently omits the
+rest.
+
+### Falling back
+
+`io_uring_setup` is blocked by Docker's default seccomp profile, and whether a
+given cluster allows it depends on the node image, the container runtime, and
+the pod's own profile. So `--engine uring` asks the host before anything binds
+— one ring's setup and teardown — and serves on hyper if the answer is no, with
+the errno in the log. The ordering is the point: falling back after a listener
+is up would mean unbinding ports a load balancer is already using.
+
+`--engine uring-strict` refuses to start instead, for a deployment that would
+rather crash-loop visibly than serve on an engine it did not choose.
+
+### The differential test
+
+Two engines that are supposed to be indistinguishable cannot be tested by
+asserting either one against a literal — that is a test which keeps passing
+after the *other* one drifts. So both are started, driven with byte-identical
+requests against byte-identical route tables, and compared on the answer, the
+whole rewritten head the upstream received field by field, and the counter
+deltas. `/metrics` gets the same treatment: both counter sets through the same
+events, and the two strings asserted equal.
+
+The full parity matrix is in [docs/src/operations/engines.md](docs/src/operations/engines.md).
 
 ## Performance
 

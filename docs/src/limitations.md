@@ -77,28 +77,32 @@ the dependency the layering split exists to avoid.
 
 `--default-tls-secret` is the supported way to serve a fallback certificate.
 
-## The `uring` engine is static-mode only
+## The `uring` engine does not drain, and does not speak HTTP/2 itself
 
-`--engine uring` serves HTTP/1.1 plaintext and nothing else:
+`--engine uring` reached parity with the hyper engine on TLS, WebSocket
+upgrades, the PROXY protocol, mirroring, per-route counters and Kubernetes mode.
+What is left is two things, and they are different in kind.
 
-- **No TLS** (502)
-- **No HTTP/2** (502)
-- **No protocol upgrades** (502)
-- **No Kubernetes mode** — static routes only
-- **Refuses `--proxy-protocol` at startup**, rather than ignoring it: silently
-  attributing every request to the load balancer is the one outcome an operator
-  who set the flag would never detect. The parser is sans-io precisely so it can
-  be reused in the reactor's accept path unchanged, which is where the read
-  belongs.
-- **Refuses `--http3` at startup**, because it has neither TLS nor QUIC.
+**It does not drain.** The hyper engine stops accepting on `SIGTERM` and then
+waits up to `--shutdown-grace` for in-flight requests to finish. The uring
+engine stops accepting and closes. On a rolling update that is the difference
+between a request completing and a client retrying, and it is the largest
+remaining gap between the two engines.
 
-Each refusal names the other engine, and the same list prints at startup. A gap
-that behaves like a bug in whatever is on the other end is worse than a missing
-feature.
+**It speaks HTTP/1.1.** HTTP/2 is served by handing those connections to a hyper
+engine in the same process — the ClientHello is read before a configuration is
+chosen, so a client that offered `h2` is passed over with its bytes intact and
+sees one connection that negotiated HTTP/2. That works, and it is on by default,
+but it means an HTTP/2-heavy deployment is running both engines and getting the
+reactor's benefit on the HTTP/1.1 half only. `--no-h2-dispatch` turns the
+dispatch off, at the cost of not offering HTTP/2 at all.
 
-It is also **one phase behind** the hyper data plane, which has been through a
-profiling pass and a benchmark rewrite. See
-[Performance](./performance.md#what-is-not-claimed).
+HTTP/3 stays on the hyper engine's QUIC listener, and `--http3` with `--engine
+uring` is refused at startup rather than ignored. gRPC is refused on both, for
+the same reason: it needs an HTTP/2 upstream, and neither engine dials one.
+
+[Engines](./operations/engines.md) has the full parity matrix, and the
+differential test that keeps it honest.
 
 ## HTTP/3 is experimental and off by default
 
