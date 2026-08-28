@@ -545,6 +545,161 @@ async fn a_request_for_an_unrouted_host_is_a_404_over_quic() {
 }
 
 // ---------------------------------------------------------------------------
+// Mirroring
+// ---------------------------------------------------------------------------
+
+/// What a mirror backend saw.
+#[derive(Debug)]
+struct Seen {
+    method: String,
+    path: String,
+    host: Option<String>,
+    marker: Option<String>,
+    body: String,
+}
+
+/// An upstream that reports every request it receives down a channel.
+async fn spawn_recorder() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<Seen>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let addr = spawn_http(move |request: Request<hyper::body::Incoming>| {
+        let tx = tx.clone();
+        async move {
+            let method = request.method().to_string();
+            let path = request
+                .uri()
+                .path_and_query()
+                .map_or_else(|| "/".to_owned(), |p| p.to_string());
+            let header = |name: &str| {
+                request
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
+            let host = header("host");
+            let marker = header("x-mirrored-by");
+            let body = request
+                .into_body()
+                .collect()
+                .await
+                .map(|c| String::from_utf8_lossy(&c.to_bytes()).into_owned())
+                .unwrap_or_default();
+            let _ = tx.send(Seen {
+                method,
+                path,
+                host,
+                marker,
+                body,
+            });
+            Response::new(common::full("recorded"))
+        }
+    })
+    .await;
+    (addr, rx)
+}
+
+/// The one-host table of [`table`], with every request also copied to `shadow`.
+fn mirrored_table(host: &str, primary: SocketAddr, shadow: SocketAddr) -> ramjet_router::RouteTable {
+    use ramjet_router::{
+        CertifiedKeyHandle, Endpoint, LbPolicy, MirrorRules, PathType, RouteOptions,
+        RouteTableBuilder,
+    };
+
+    let mut builder = RouteTableBuilder::new();
+    builder
+        .backend("prod", LbPolicy::RoundRobin, vec![Endpoint::new(primary)])
+        .expect("a backend");
+    builder
+        .backend("shadow", LbPolicy::RoundRobin, vec![Endpoint::new(shadow)])
+        .expect("a backend");
+    builder
+        .route_with(
+            Some(host),
+            "/",
+            PathType::Prefix,
+            "prod",
+            &RouteOptions {
+                mirror: Some(MirrorRules {
+                    backend: "shadow",
+                    percent: 100,
+                    host: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("a route");
+    builder
+        .certificate(host, Arc::new(CertifiedKeyHandle::new(CERT_ID)))
+        .expect("a certificate");
+    builder.build().expect("a valid table")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mirrored_request_over_quic_reaches_the_shadow_backend() {
+    // ARCHITECTURE says a mirror annotation means the same thing whichever
+    // protocol a request arrived on, and `tests/mirroring.rs` only ever proves
+    // it over TCP. The QUIC path is where it could quietly not be true: the
+    // HTTP/3 runtime has to have started a `Mirror` of its own, and a body that
+    // the mirror has already read has to reach the primary whole — which for an
+    // HTTP/3 request means the bytes come back as a prefix in front of a QUIC
+    // stream rather than in front of hyper's `Incoming`.
+    let primary = spawn_echo("prod").await;
+    let (shadow, mut seen) = spawn_recorder().await;
+
+    let cert = TestCert::generate(&["h3.example.com"]);
+    let proxy = TestProxy::start_with(
+        mirrored_table("h3.example.com", primary, shadow),
+        ProxyOptions {
+            tls: true,
+            http3: true,
+            certs: cert_store(&[(CERT_ID, &cert)]),
+            ..ProxyOptions::default()
+        },
+    )
+    .await;
+    let quic = proxy.http3.expect("a QUIC port");
+
+    let mut client = H3Client::connect(quic, "h3.example.com", &[&cert]).await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("https://h3.example.com/orders?page=2")
+        .body(())
+        .expect("a request");
+    let mut stream = client.send.send_request(request).await.expect("a stream");
+    stream
+        .send_data(Bytes::from_static(b"the payload"))
+        .await
+        .expect("send data");
+    stream.finish().await.expect("finish");
+    let reply = collect(&mut stream).await;
+
+    // The primary is untouched: same upstream, same response, and it saw the
+    // whole body even though the mirror read it first.
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.header("x-upstream"), Some("prod"));
+    assert_eq!(reply.text(), "POST /orders?page=2");
+
+    let copy = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+        .await
+        .expect("the mirror backend received a copy")
+        .expect("the recorder is still running");
+    assert_eq!(copy.method, "POST");
+    assert_eq!(copy.path, "/orders?page=2");
+    assert_eq!(copy.body, "the payload", "the copy is a copy, body included");
+    assert_eq!(
+        copy.marker.as_deref(),
+        Some("ramjet-ingress"),
+        "a shadow backend has to be able to tell a copy from the real thing"
+    );
+    assert_eq!(
+        copy.host.as_deref(),
+        Some("h3.example.com"),
+        "the copy keeps the name the client addressed, which HTTP/3 carries in \
+         :authority rather than a Host header"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Certificates
 // ---------------------------------------------------------------------------
 
