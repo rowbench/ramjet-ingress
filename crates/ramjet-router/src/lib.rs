@@ -72,8 +72,10 @@ mod stats;
 mod table;
 mod tls;
 
-pub use backend::{select_endpoint, Backend, BackendId, Endpoint, LbPolicy};
-pub use builder::{BuildError, CanaryRules, MirrorRules, RouteOptions, RouteTableBuilder};
+pub use backend::{select_endpoint, Backend, BackendId, BackendProtocol, Endpoint, LbPolicy};
+pub use builder::{
+    BackendOptions, BuildError, CanaryRules, MirrorRules, RouteOptions, RouteTableBuilder,
+};
 pub use canary::CanarySpec;
 pub use mirror::{MirrorSpec, MIRROR_PERCENT_TOTAL};
 pub use path::{PathRule, PathType};

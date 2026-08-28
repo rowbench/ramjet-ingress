@@ -22,33 +22,49 @@ contained change.
 Until then: **scale by making the one replica bigger**, and use
 `--no-status-update` if you must run more.
 
-## gRPC upstreams answer 502
+## There is no TLS to the upstream
 
-gRPC is defined in terms of HTTP/2 streams and trailers and has no HTTP/1.1
-form. Downstream already speaks h2, but the upstream pool dials HTTP/1.1, so a
-gRPC request would be silently downgraded into something the backend cannot
-parse.
+The upstream side speaks two protocols — HTTP/1.1 by default, and cleartext
+HTTP/2 for a backend annotated
+[`backend-protocol: GRPC`](./configuration/annotations.md#backend-protocol) —
+and **both are cleartext**. That is the same default ingress-nginx ships, and
+inside a cluster it is usually what you want.
 
-Requests with an `application/grpc` content type are **rejected explicitly**,
-naming the limitation, instead. Lifting it means an h2 upstream mode selected
-per backend from `backend-protocol: GRPC`.
+The consequence is which annotation values are honoured. `HTTP` and `GRPC` are;
+`GRPCS` and `HTTPS` are **read, reported in a warning, and not honoured**,
+because both mean "dial this pod over TLS" and there is no code here that does.
+`AUTO_HTTP` would need per-endpoint scheme detection, and `FCGI` is not HTTP.
+The backend stays on HTTP/1.1 in all four cases and the warning names the value,
+rather than the request being served against a protocol nobody asked for.
 
-## Upstream is HTTP/1.1 only
+Lifting this means a client-side rustls configuration for upstream connections,
+with its own trust store and its own answer to what verifies a pod certificate.
 
-Which is the same default ingress-nginx ships, and is transparent for everything
-except the case above. There is no TLS to the upstream either.
+## gRPC needs one annotation, and is refused without it
 
-## h2c is untested
+gRPC over an HTTP/1.1 backend cannot work — gRPC is defined in terms of HTTP/2
+streams and trailers and has no HTTP/1.1 form — so a request with an
+`application/grpc` content type whose backend is HTTP/1.1 is answered with a
+`502` that names the annotation to add:
 
-Downstream HTTP/2 over TLS is negotiated by ALPN, which offers `h2` ahead of
-`http/1.1`, and there is a test that proxies a real request over it.
+```
+502 Bad Gateway: gRPC requires an HTTP/2 backend; set
+nginx.ingress.kubernetes.io/backend-protocol: GRPC on the Ingress
+```
 
-Cleartext HTTP/2 is a different story. The plaintext listener is built on
-hyper-util's protocol-detecting connection builder, so a client sending the
-HTTP/2 connection preface **should** be served — but nothing in the tree
-exercises that path, and the `h2c` string appears only in a hop-by-hop header
-test. Treat prior-knowledge h2c as unverified rather than as supported, and do
-not plan a deployment around it without testing it yourself first.
+Add it and the request is forwarded like any other. This is a refusal to guess,
+not a missing feature.
+
+## WebSocket does not cross an h2c backend
+
+`Connection` and `Upgrade` are forbidden in HTTP/2, so an upgrade request sent to
+a backend annotated `GRPC` reaches the application as an ordinary request rather
+than as a handshake. WebSocket over HTTP/2 (RFC 8441 extended CONNECT) is not
+implemented in either direction.
+
+This is only a constraint if one Service port serves both WebSocket and gRPC,
+which is unusual. Otherwise: WebSocket routes go to an `HTTP` backend, gRPC
+routes to a `GRPC` one, and both work.
 
 ## `ExternalName` Services serve 503
 
@@ -92,8 +108,14 @@ reactor's benefit on the HTTP/1.1 half only. `--no-h2-dispatch` turns the
 dispatch off, at the cost of not offering HTTP/2 at all.
 
 HTTP/3 stays on the hyper engine's QUIC listener, and `--http3` with `--engine
-uring` is refused at startup rather than ignored. gRPC is refused on both, for
-the same reason: it needs an HTTP/2 upstream, and neither engine dials one.
+uring` is refused at startup rather than ignored.
+
+**HTTP/2 upstreams are the hyper engine's alone.** The uring engine has its own
+HTTP/1.1 upstream pool rather than sharing hyper's, so a route whose backend is
+annotated `backend-protocol: GRPC` answers `502` there, naming the engine, and
+gRPC to it is refused with it. The h2 dispatch above does not help: it moves the
+*downstream* connection, and the backend protocol is a property of the route.
+A cluster serving gRPC wants `--engine hyper`.
 
 [Engines](./operations/engines.md) has the full parity matrix, and the
 differential test that keeps it honest.

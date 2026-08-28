@@ -22,6 +22,7 @@
 //! backends:
 //!   - name: api
 //!     policy: roundRobin            # roundRobin | random | leastConn
+//!     protocol: http                # http | h2c; h2c is prior-knowledge HTTP/2
 //!     endpoints:
 //!       - 127.0.0.1:9001            # shorthand for weight 1
 //!       - address: 127.0.0.1:9002
@@ -59,8 +60,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ramjet_router::{
-    BuildError, CanaryRules, CertifiedKeyHandle, Endpoint, LbPolicy, MirrorRules, PathType,
-    RouteOptions, RouteTable, RouteTableBuilder,
+    BackendOptions, BackendProtocol, BuildError, CanaryRules, CertifiedKeyHandle, Endpoint,
+    LbPolicy, MirrorRules, PathType, RouteOptions, RouteTable, RouteTableBuilder,
 };
 use rustls::sign::CertifiedKey;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -171,7 +172,14 @@ pub fn build(document: Document, base: &Path) -> Result<Loaded, ConfigError> {
         }
         summary.endpoints += endpoints.len();
         summary.backends += 1;
-        builder.backend(&backend.name, backend.policy.into(), endpoints)?;
+        builder.backend_with(
+            &backend.name,
+            endpoints,
+            &BackendOptions {
+                policy: backend.policy.into(),
+                protocol: backend.protocol.into(),
+            },
+        )?;
     }
 
     for route in &document.routes {
@@ -306,6 +314,9 @@ pub struct BackendSpec {
     /// How requests are spread across its endpoints.
     #[serde(default)]
     pub policy: PolicySpec,
+    /// Which protocol to dial them with.
+    #[serde(default)]
+    pub protocol: ProtocolSpec,
     /// Where to send them. May be empty, exactly as a Service with no ready
     /// pods may be.
     #[serde(default)]
@@ -360,6 +371,31 @@ impl From<PolicySpec> for LbPolicy {
             PolicySpec::RoundRobin => LbPolicy::RoundRobin,
             PolicySpec::Random => LbPolicy::Random,
             PolicySpec::LeastConn => LbPolicy::LeastConn,
+        }
+    }
+}
+
+/// Upstream protocol, spelled the way the router spells it.
+///
+/// Deliberately `http`/`h2c` rather than the annotation's `HTTP`/`GRPC`. This
+/// file is not an Ingress and there is no compatibility to keep, and the honest
+/// name for the thing is the protocol — nothing here is gRPC-specific, and a
+/// plain HTTP/2 service is as valid a backend as a gRPC one.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProtocolSpec {
+    /// HTTP/1.1 cleartext.
+    #[default]
+    Http,
+    /// Cleartext HTTP/2 with prior knowledge.
+    H2c,
+}
+
+impl From<ProtocolSpec> for BackendProtocol {
+    fn from(protocol: ProtocolSpec) -> Self {
+        match protocol {
+            ProtocolSpec::Http => BackendProtocol::Http1,
+            ProtocolSpec::H2c => BackendProtocol::H2c,
         }
     }
 }
@@ -542,6 +578,50 @@ routes: [{host: app.example.com, path: /, backend: app}]
         assert_eq!(endpoints[0].weight, 1, "the short form means weight 1");
         assert_eq!(endpoints[1].weight, 3);
         assert_eq!(backend.backend().policy(), LbPolicy::LeastConn);
+    }
+
+    #[test]
+    fn a_backend_speaks_http1_until_it_asks_for_h2c() {
+        let loaded = parse(
+            "
+backends:
+  - {name: web, endpoints: [127.0.0.1:1]}
+  - {name: rpc, protocol: h2c, endpoints: [127.0.0.1:2]}
+routes:
+  - {host: app.example.com, path: /rpc, backend: rpc}
+  - {host: app.example.com, path: /, backend: web}
+",
+        )
+        .expect("valid");
+
+        let rpc = loaded
+            .table
+            .match_request("app.example.com", "/rpc")
+            .expect("a match");
+        assert_eq!(rpc.backend().protocol(), BackendProtocol::H2c);
+        let web = loaded
+            .table
+            .match_request("app.example.com", "/")
+            .expect("a match");
+        assert_eq!(web.backend().protocol(), BackendProtocol::Http1);
+    }
+
+    #[test]
+    fn an_unknown_protocol_is_refused_rather_than_defaulted() {
+        // The static-routes file is a developer's file, and a typo in it should
+        // stop the process at startup rather than serve HTTP/1.1 at a gRPC pod
+        // for as long as it takes somebody to notice.
+        let error = parse(
+            "
+backends: [{name: app, protocol: grpc, endpoints: [127.0.0.1:1]}]
+routes: [{host: app.example.com, path: /, backend: app}]
+",
+        )
+        .expect_err("an unknown protocol is refused");
+        assert!(
+            error.to_string().contains("protocol"),
+            "the error should name the field: {error}"
+        );
     }
 
     #[test]

@@ -265,6 +265,11 @@ fn routes(state: &AdminState) -> Value {
                 "path_type": rule.path_type().as_str(),
                 "backend": backend.map(|b| b.name()).unwrap_or(""),
                 "endpoints": backend.map_or(0, |b| b.endpoints().len()),
+                // The only way to confirm from outside a running pod that
+                // `backend-protocol` took effect. It is not visible in any
+                // counter, and a route dialled with the wrong one fails at the
+                // far end where nothing here can see it.
+                "protocol": backend.map_or("", |b| b.protocol().as_str()),
                 "requests_total": totals.requests,
                 "errors_5xx_total": totals.errors_5xx,
                 "upstream_latency_ms_sum": totals.upstream_latency_ms(),
@@ -500,6 +505,10 @@ mod tests {
         assert_eq!(listed[0]["path_type"], "Exact");
         assert_eq!(listed[0]["backend"], "prod/api:80");
         assert_eq!(listed[0]["endpoints"], 2);
+        assert_eq!(
+            listed[0]["protocol"], "http",
+            "a backend nobody annotated reports the default rather than nothing"
+        );
         assert_eq!(listed[0]["canary"]["backend"], "prod/api-canary:80");
         assert_eq!(listed[0]["canary"]["weight_percent"], 25);
 

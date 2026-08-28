@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use ramjet_router::RouteTable;
+use ramjet_router::{BackendProtocol, RouteTable};
 use serde_json::{json, Value};
 
 /// A route's identity, as it appears on both sides of a comparison.
@@ -37,6 +37,13 @@ type RouteKey = (String, String, &'static str);
 struct RouteTarget {
     backend: String,
     endpoints: usize,
+    /// Which protocol the data plane dials the backend with.
+    ///
+    /// Reported alongside the endpoint count rather than left implicit: flipping
+    /// `backend-protocol` changes nothing an operator can see in the route — same
+    /// host, same path, same backend name, same pods — and everything about how
+    /// requests reach it.
+    protocol: BackendProtocol,
     /// The mirror, rendered as it will be reported. `None` for no mirror.
     ///
     /// A rendered string rather than a struct because every use of it here is a
@@ -116,6 +123,15 @@ impl ConfigDiff {
                     "{} {}: {} -> {}",
                     key.0, key.1, was.backend, target.backend
                 )),
+                Some(was) if was.protocol != target.protocol => {
+                    // Ahead of the endpoint count deliberately: if both moved,
+                    // the protocol is the one that explains a backend which
+                    // suddenly answers nothing.
+                    diff.backends_changed.push(format!(
+                        "{} {}: {} -> {} upstream",
+                        key.0, key.1, was.protocol, target.protocol
+                    ));
+                }
                 Some(was) if was.endpoints != target.endpoints => {
                     diff.backends_changed.push(format!(
                         "{} {}: {} -> {} endpoints",
@@ -324,6 +340,7 @@ fn routes_of(table: Option<&RouteTable>) -> BTreeMap<RouteKey, RouteTarget> {
                 RouteTarget {
                     backend: backend.map_or_else(String::new, |b| b.name().to_owned()),
                     endpoints: backend.map_or(0, |b| b.endpoints().len()),
+                    protocol: backend.map(ramjet_router::Backend::protocol).unwrap_or_default(),
                     mirror: rule.mirror().map(|mirror| {
                         let target = table
                             .backend(mirror.backend())
@@ -464,6 +481,49 @@ mod tests {
             diff.routes_added.is_empty() && diff.routes_removed.is_empty(),
             "the route is the same route; only where it points moved"
         );
+    }
+
+    /// The same table, dialled over a different protocol.
+    fn h2c_table(host: &str, path: &str, backend: &str, count: u16) -> RouteTable {
+        let mut builder = RouteTableBuilder::new();
+        builder
+            .backend_with(
+                backend,
+                endpoints(count),
+                &ramjet_router::BackendOptions {
+                    policy: LbPolicy::RoundRobin,
+                    protocol: BackendProtocol::H2c,
+                },
+            )
+            .expect("registers");
+        builder
+            .route(Some(host), path, PathType::Prefix, backend)
+            .expect("drafts");
+        builder.build().expect("builds")
+    }
+
+    #[test]
+    fn flipping_the_backend_protocol_is_a_backend_change() {
+        // Nothing else about the route moved — same host, same path, same
+        // backend name, same endpoint count — so this is the only line that can
+        // tell an operator why a working backend started answering differently.
+        let first = table("example.com", "/", "prod/api:80", 2);
+        let second = h2c_table("example.com", "/", "prod/api:80", 2);
+
+        let diff = ConfigDiff::compute(Some(&first), &second);
+        assert_eq!(
+            diff.backends_changed,
+            vec!["example.com /: http -> h2c upstream"]
+        );
+        assert!(diff.routes_added.is_empty() && diff.routes_removed.is_empty());
+        assert!(!diff.is_empty(), "a protocol change is not an empty diff");
+    }
+
+    #[test]
+    fn an_unchanged_protocol_is_not_reported() {
+        let first = h2c_table("example.com", "/", "prod/api:80", 2);
+        let second = h2c_table("example.com", "/", "prod/api:80", 2);
+        assert!(ConfigDiff::compute(Some(&first), &second).is_empty());
     }
 
     /// The one that matters during a rollout: no Ingress changed, but the

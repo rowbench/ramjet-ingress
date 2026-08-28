@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
 use common::{
-    cert_store, dead_addr, empty_body, get, request, send_tls, send_tls_h2, spawn_echo,
-    spawn_http, spawn_raw, tls_client_config, ProxyOptions, TestCert, TestProxy,
+    cert_store, dead_addr, empty_body, full, get, request, send_tls, send_tls_h2, spawn_echo,
+    spawn_h2c, spawn_http, spawn_raw, tls_client_config, ProxyOptions, TestBody, TestCert,
+    TestProxy,
 };
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body_util::BodyExt;
@@ -150,6 +151,8 @@ struct H3Reply {
     status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
+    /// The trailing header block, when the response had one.
+    trailers: Option<HeaderMap>,
     /// How long after the request the response *head* arrived, which is the
     /// number the streaming tests are about.
     head_after: Duration,
@@ -162,6 +165,13 @@ impl H3Reply {
 
     fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    fn trailer(&self, name: &str) -> Option<&str> {
+        self.trailers
+            .as_ref()?
+            .get(name)
+            .and_then(|value| value.to_str().ok())
     }
 }
 
@@ -189,10 +199,14 @@ async fn collect(
     while let Some(mut chunk) = stream.recv_data().await.expect("body data") {
         body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
     }
+    // RFC 9114 carries trailers as a second HEADERS frame after the data, so
+    // they are only readable once the body is drained.
+    let trailers = stream.recv_trailers().await.unwrap_or(None);
     H3Reply {
         status: response.status(),
         headers: response.headers().clone(),
         body: Bytes::from(body),
+        trailers,
         head_after,
     }
 }
@@ -1067,4 +1081,150 @@ async fn a_route_table_published_mid_connection_is_picked_up() {
         Some("second"),
         "the same connection must serve the newly published table"
     );
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/3 downstream, h2c upstream
+// ---------------------------------------------------------------------------
+
+/// The same table as [`table`], with the backend dialled over cleartext HTTP/2.
+fn h2c_table(host: &str, endpoints: &[SocketAddr], cert_id: u64) -> ramjet_router::RouteTable {
+    use ramjet_router::{
+        BackendOptions, BackendProtocol, CertifiedKeyHandle, Endpoint, LbPolicy, PathType,
+        RouteTableBuilder,
+    };
+
+    let mut builder = RouteTableBuilder::new();
+    builder
+        .backend_with(
+            "app",
+            endpoints.iter().copied().map(Endpoint::new).collect(),
+            &BackendOptions {
+                policy: LbPolicy::RoundRobin,
+                protocol: BackendProtocol::H2c,
+            },
+        )
+        .expect("a backend");
+    builder
+        .route(Some(host), "/", PathType::Prefix, "app")
+        .expect("a route");
+    builder
+        .certificate(host, Arc::new(CertifiedKeyHandle::new(cert_id)))
+        .expect("a certificate");
+    builder.build().expect("a valid table")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_http3_client_reaches_an_h2c_backend_with_trailers_intact() {
+    // The third downstream version against the new upstream, and the one that
+    // could plausibly have been left out: HTTP/3 request bodies are not hyper
+    // bodies, so this path reaches `forward` through `ProxyBody::Http3` rather
+    // than through `Stream`. Trailers have to survive the translation from an
+    // h2 trailer frame to an RFC 9114 trailing HEADERS frame — which is the one
+    // piece of a gRPC call a proxy can silently drop.
+    let upstream = spawn_h2c(|_request: Request<hyper::body::Incoming>| async move {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        let mut response = Response::new(trailing_body(b"\x00\x00\x00\x00\x05reply", trailers));
+        response
+            .headers_mut()
+            .insert("x-upstream", http::HeaderValue::from_static("grpc"));
+        response
+    })
+    .await;
+
+    let cert = TestCert::generate(&["h3.example.com"]);
+    let proxy = TestProxy::start_with(
+        h2c_table("h3.example.com", &[upstream], CERT_ID),
+        ProxyOptions {
+            tls: true,
+            http3: true,
+            certs: cert_store(&[(CERT_ID, &cert)]),
+            ..ProxyOptions::default()
+        },
+    )
+    .await;
+    let quic = proxy.http3.expect("a QUIC port");
+
+    let mut client = H3Client::connect(quic, "h3.example.com", &[&cert]).await;
+    let reply = client.get("h3.example.com", "/pkg.Svc/Method").await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.header("x-upstream"), Some("grpc"));
+    assert_eq!(&reply.body[..], b"\x00\x00\x00\x00\x05reply");
+    assert_eq!(
+        reply.trailer("grpc-status"),
+        Some("0"),
+        "a gRPC call over HTTP/3 is only complete if its status trailer arrives"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_http3_request_body_reaches_an_h2c_backend() {
+    let upstream = spawn_h2c(|request: Request<hyper::body::Incoming>| async move {
+        let body = request.into_body().collect().await.expect("a body").to_bytes();
+        Response::new(full(format!("{} bytes", body.len())))
+    })
+    .await;
+
+    let cert = TestCert::generate(&["h3.example.com"]);
+    let proxy = TestProxy::start_with(
+        h2c_table("h3.example.com", &[upstream], CERT_ID),
+        ProxyOptions {
+            tls: true,
+            http3: true,
+            certs: cert_store(&[(CERT_ID, &cert)]),
+            ..ProxyOptions::default()
+        },
+    )
+    .await;
+    let quic = proxy.http3.expect("a QUIC port");
+
+    let mut client = H3Client::connect(quic, "h3.example.com", &[&cert]).await;
+    let reply = client
+        .post(
+            "h3.example.com",
+            "/upload",
+            vec![Bytes::from_static(b"abcde"), Bytes::from_static(b"fghij")],
+            Duration::ZERO,
+        )
+        .await;
+
+    assert_eq!(reply.text(), "10 bytes");
+}
+
+/// A body of one chunk followed by a trailing header block.
+fn trailing_body(data: &'static [u8], trailers: HeaderMap) -> TestBody {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct Trailing {
+        data: Option<Bytes>,
+        trailers: Option<HeaderMap>,
+    }
+
+    impl http_body::Body for Trailing {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            if let Some(data) = self.data.take() {
+                return Poll::Ready(Some(Ok(http_body::Frame::data(data))));
+            }
+            Poll::Ready(
+                self.trailers
+                    .take()
+                    .map(|t| Ok(http_body::Frame::trailers(t))),
+            )
+        }
+    }
+
+    Trailing {
+        data: Some(Bytes::from_static(data)),
+        trailers: Some(trailers),
+    }
+    .boxed()
 }

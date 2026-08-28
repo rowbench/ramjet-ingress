@@ -1276,15 +1276,28 @@ one `Option<StatusWriter>`, so it is a contained change. Until then, scale by
 making the one replica bigger, and use `--no-status-update` if you must run
 more.
 
-**gRPC upstreams answer 502.** gRPC is defined in terms of HTTP/2 streams and
-trailers and has no HTTP/1.1 form. Downstream already speaks h2, but the
-upstream pool dials HTTP/1.1, so a gRPC request would be silently downgraded
-into something the backend cannot parse. Requests with an `application/grpc`
-content type are rejected explicitly instead, naming the limitation. Lifting it
-means an h2 upstream mode selected per backend from `backend-protocol: GRPC`.
+**There is no TLS to the upstream.** The upstream side dials HTTP/1.1 by default
+and cleartext HTTP/2 for a backend annotated `backend-protocol: GRPC`, and both
+are cleartext. That is the same default ingress-nginx ships, and inside a cluster
+it is usually what you want. The consequence is which annotation values are
+honoured: `GRPCS` and `HTTPS` both mean "dial this pod over TLS" and are read,
+reported in a warning, and not honoured; so are `AUTO_HTTP`, which would need
+per-endpoint scheme detection, and `FCGI`, which is not HTTP. Lifting it means a
+client-side rustls configuration for upstream connections, with its own trust
+store and its own answer to what verifies a pod certificate.
 
-**Upstream is HTTP/1.1 only**, which is the same default ingress-nginx ships and
-is transparent for everything except the case above.
+**gRPC to an unannotated backend answers 502.** gRPC is defined in terms of
+HTTP/2 streams and trailers and has no HTTP/1.1 form, so a request with an
+`application/grpc` content type whose backend is HTTP/1.1 is rejected explicitly
+rather than downgraded into something the backend cannot parse — and the body
+names `backend-protocol: GRPC` as the fix. With the annotation the whole exchange
+works: unary and bidirectional streaming, trailers in both directions, from
+HTTP/1.1, HTTP/2 and HTTP/3 clients alike.
+
+**WebSocket does not cross an h2c backend.** `Connection` and `Upgrade` are
+forbidden in HTTP/2, so an upgrade request to a `GRPC` backend reaches the
+application as an ordinary request; RFC 8441 extended CONNECT is not implemented.
+Only a constraint if one Service port serves both WebSocket and gRPC.
 
 **`ExternalName` Services serve 503.** Following a DNS name from the data plane
 needs a resolver with TTL handling and re-resolution; pointing at whatever the

@@ -37,6 +37,8 @@ APP_NS="${APP_NS:-ramjet-e2e}"
 RELEASE="${RELEASE:-ramjet-e2e}"
 IMAGE="${IMAGE:-ramjet-ingress:e2e}"
 HOST="${HOST:-demo.ramjet.test}"
+# A second host for the HTTP/2-upstream assertion; see the h2c Ingress below.
+GRPC_HOST="${GRPC_HOST:-grpc.ramjet.test}"
 KEEP="${KEEP:-0}"
 
 # Chosen high and fixed so a stale forward from a previous run is visible as a
@@ -352,6 +354,53 @@ spec:
 YAML
 
 K apply -f "$WORK/workload.yaml" >/dev/null
+
+# An Ingress for the HTTP/2-upstream assertion, in the controller's own
+# namespace because an Ingress can only name a Service beside it.
+#
+# The backend is the controller's *own admin Service*. That is not a joke: the
+# admin listener is built on the same protocol-detecting connection builder the
+# traffic listener is, so it speaks cleartext HTTP/2 with prior knowledge — a
+# real h2 server, already running, already in the image that was just loaded.
+# The alternative is pulling a gRPC echo image to prove the same thing, and a
+# second image in the pull path is a slower and flakier e2e for no extra
+# coverage: what is under test is that the proxy sends an HTTP/2 preface
+# upstream and relays a real HTTP/2 response, not what the server does with it.
+#
+# `crates/ramjet-proxy/tests/h2c_upstream.rs` pins both halves of that on real
+# sockets — that the admin listener answers h2c, and that this exact routing
+# shape works — so a failure here is a cluster problem rather than a puzzle.
+cat >"$WORK/h2c.yaml" <<YAML
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-h2c
+  namespace: $SYS_NS
+  annotations:
+    # The whole point of the fixture. Without it this route is dialled over
+    # HTTP/1.1 and the admin listener answers it perfectly well — so the
+    # assertion below checks the response *and* what /admin/routes says the
+    # protocol is, because only the pair can tell the two apart.
+    nginx.ingress.kubernetes.io/backend-protocol: GRPC
+spec:
+  ingressClassName: ramjet
+  rules:
+    - host: $GRPC_HOST
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: $FULLNAME-admin
+                # The chart's adminService.port default. The install above does
+                # not override it, so hard-coding it here keeps the fixture
+                # readable; if that default ever moves, this route 503s and the
+                # assertion says so rather than passing quietly.
+                port: { number: 10254 }
+YAML
+
+K apply -f "$WORK/h2c.yaml" >/dev/null
 
 # ------------------------------------------------------------------- ready ---
 
@@ -712,7 +761,9 @@ fi
 #     io_uring_setup is not permitted, and whether it is inside this cluster's
 #     containers depends on the node image, the container runtime and the pod's
 #     seccomp profile. A suite that passed without saying which data plane ran
-#     it would be reporting half a result.
+#     it would be reporting half a result. Read here rather than at the end
+#     because the assertion after it branches on the answer: the two engines
+#     differ on HTTP/2 upstreams, and the matrix says so.
 step "Which engine served"
 
 POD="$(K -n "$SYS_NS" get pods -l app.kubernetes.io/name=ramjet-ingress \
@@ -734,6 +785,60 @@ else
   SERVED="hyper"
 fi
 note "served by: $SERVED"
+
+# 13. HTTP/2 upstreams, in two halves that only mean something together.
+#
+#     Half one is the control plane: `backend-protocol: GRPC` on a real Ingress
+#     has to survive the watch, the translator and the publish, and come out of
+#     /admin/routes as a backend the data plane will dial over h2c. Half two is
+#     the data plane: the request has to work. Either alone passes while the
+#     feature is broken — an unannotated route reaches the admin listener over
+#     HTTP/1.1 perfectly well, and a table that says `h2c` proves nothing about
+#     what went on the wire — so both are asserted.
+H2C_PROTO="$(curl -s -m 5 "http://127.0.0.1:$ADMIN_PORT/admin/routes" | python3 -c '
+import json, sys
+host = sys.argv[1]
+for r in json.load(sys.stdin).get("routes", []):
+    if r.get("host") == host:
+        print(r.get("protocol", "<absent>"))
+        break
+else:
+    print("<no such route>")
+' "$GRPC_HOST" || true)"
+
+if [[ "$H2C_PROTO" == "h2c" ]]; then
+  pass "backend-protocol: the annotation reached the table — $GRPC_HOST dials h2c"
+else
+  fail "backend-protocol: expected the route for $GRPC_HOST to dial h2c, got '${H2C_PROTO}'"
+fi
+
+H2C_CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 5 -H "Host: $GRPC_HOST" "http://127.0.0.1:$HTTP_PORT/readyz" || true)"
+H2C_BODY="$(curl -s -m 5 -H "Host: $GRPC_HOST" "http://127.0.0.1:$HTTP_PORT/readyz" || true)"
+
+#     The uring engine dials HTTP/1.1 only, so it refuses this route rather than
+#     downgrading it — which is the parity matrix, and is worth asserting as the
+#     documented behaviour rather than skipping.
+if [[ "$SERVED" == "uring" ]]; then
+  if [[ "$H2C_CODE" == "502" ]] && grep -q "uring engine" <<<"$H2C_BODY"; then
+    pass "h2c upstream on uring: refused with 502 naming the engine, as documented"
+  else
+    fail "h2c upstream on uring: expected a 502 naming the engine, got $H2C_CODE '${H2C_BODY}'"
+  fi
+elif [[ "$H2C_CODE" == "200" ]] && [[ "$(tr -d '[:space:]' <<<"$H2C_BODY")" == "ready" ]]; then
+  pass "h2c upstream: HTTP 200 through an h2c-dialled backend, body '$(tr -d '[:space:]' <<<"$H2C_BODY")'"
+else
+  fail "h2c upstream: expected 200 'ready' over h2c, got $H2C_CODE '${H2C_BODY}'"
+fi
+
+# 14. gRPC to a backend nobody annotated. The refusal has to name the fix, or an
+#     operator hitting it has a 502 and no next step.
+GRPC_502="$(curl -s -m 5 -H "Host: $HOST" -H "content-type: application/grpc" \
+  -X POST --data-binary '' "http://127.0.0.1:$HTTP_PORT/pkg.Svc/Method" || true)"
+if grep -q "backend-protocol: GRPC" <<<"$GRPC_502"; then
+  pass "gRPC without the annotation: 502 naming backend-protocol: GRPC"
+else
+  fail "gRPC without the annotation: expected a 502 naming the annotation, got '${GRPC_502}'"
+fi
 
 # ----------------------------------------------------------------- summary ---
 

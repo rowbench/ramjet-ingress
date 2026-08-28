@@ -32,6 +32,44 @@ impl Endpoint {
     }
 }
 
+/// Which protocol the data plane speaks to a backend's endpoints.
+///
+/// This is a property of the *backend*, not of the request: a client speaking
+/// HTTP/1.1 to an [`H2c`](BackendProtocol::H2c) backend is translated, and so is
+/// an HTTP/2 client talking to an [`Http1`](BackendProtocol::Http1) one. The
+/// router does not know what either protocol is — it carries the choice from the
+/// controller to the proxy and nothing more.
+///
+/// It exists because gRPC has no HTTP/1.1 form. gRPC is defined in terms of h2
+/// streams and trailers, so a gRPC backend has to be dialled over HTTP/2 or not
+/// at all; ingress-nginx spells that choice
+/// `nginx.ingress.kubernetes.io/backend-protocol: GRPC`, and so does this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendProtocol {
+    /// HTTP/1.1, cleartext. The default, and what ingress-nginx defaults to.
+    #[default]
+    Http1,
+    /// HTTP/2 over cleartext TCP, with prior knowledge — no upgrade dance and no
+    /// TLS. This is what a gRPC Service inside a cluster listens for.
+    H2c,
+}
+
+impl BackendProtocol {
+    /// The spelling used in the static-routes file and in diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendProtocol::Http1 => "http",
+            BackendProtocol::H2c => "h2c",
+        }
+    }
+}
+
+impl std::fmt::Display for BackendProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// How requests are spread across a backend's endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LbPolicy {
@@ -58,6 +96,7 @@ pub struct Backend {
     name: Box<str>,
     endpoints: Vec<Endpoint>,
     policy: LbPolicy,
+    protocol: BackendProtocol,
     stats_index: u32,
     /// Precomputed weighted rotation: `ring[i]` is an index into `endpoints`.
     /// `None` when every weight is equal, because a plain remainder is cheaper
@@ -70,6 +109,7 @@ impl Backend {
         name: Box<str>,
         endpoints: Vec<Endpoint>,
         policy: LbPolicy,
+        protocol: BackendProtocol,
         stats_index: u32,
     ) -> Self {
         let ring = build_ring(&endpoints);
@@ -77,6 +117,7 @@ impl Backend {
             name,
             endpoints,
             policy,
+            protocol,
             stats_index,
             ring,
         }
@@ -95,6 +136,11 @@ impl Backend {
     /// The load-balancing policy.
     pub fn policy(&self) -> LbPolicy {
         self.policy
+    }
+
+    /// Which protocol the proxy dials these endpoints with.
+    pub fn protocol(&self) -> BackendProtocol {
+        self.protocol
     }
 
     /// This backend's index into [`BackendStats`].
@@ -230,7 +276,26 @@ mod tests {
             .collect();
         let addrs: Vec<SocketAddr> = endpoints.iter().map(|e| e.addr).collect();
         let stats = BackendStats::rebuild(&[("b".into(), addrs)], None);
-        (Backend::new("b".into(), endpoints, policy, 0), stats)
+        (
+            Backend::new("b".into(), endpoints, policy, BackendProtocol::Http1, 0),
+            stats,
+        )
+    }
+
+    #[test]
+    fn a_backend_speaks_http1_unless_it_was_told_otherwise() {
+        let (b, _) = backend(LbPolicy::RoundRobin, &[1]);
+        assert_eq!(b.protocol(), BackendProtocol::Http1);
+        assert_eq!(BackendProtocol::default(), BackendProtocol::Http1);
+    }
+
+    #[test]
+    fn protocols_spell_themselves_the_way_the_config_file_does() {
+        // The static-routes loader parses these strings back, so the two
+        // spellings have to stay in step with `ProtocolSpec` in `ramjet-ingressd`.
+        assert_eq!(BackendProtocol::Http1.as_str(), "http");
+        assert_eq!(BackendProtocol::H2c.as_str(), "h2c");
+        assert_eq!(BackendProtocol::H2c.to_string(), "h2c");
     }
 
     #[test]

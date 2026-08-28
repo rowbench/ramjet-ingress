@@ -81,6 +81,72 @@ where
     addr
 }
 
+/// Serves `handler` over cleartext HTTP/2 with prior knowledge.
+///
+/// No ALPN and no upgrade dance: the server assumes the preface is coming, which
+/// is exactly what a gRPC pod inside a cluster does and exactly what the proxy's
+/// h2c upstream pool sends. Built on hyper's own h2 server rather than on tonic,
+/// because what is under test is framing and trailers rather than protobuf, and
+/// a gRPC-shaped exchange is an h2 exchange with two particular headers on it.
+pub async fn spawn_h2c<F, Fut>(handler: F) -> SocketAddr
+where
+    F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Response<TestBody>> + Send + 'static,
+{
+    let listener = TcpListener::bind(loopback()).await.expect("bind h2c upstream");
+    let addr = listener.local_addr().expect("h2c upstream addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request| {
+                    let handler = handler.clone();
+                    async move { Ok::<_, Infallible>(handler(request).await) }
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// Opens a cleartext HTTP/2 connection with prior knowledge.
+///
+/// Used for both halves of the h2c story: as a client of the proxy's plaintext
+/// listener, which detects the preface, and nowhere else — the proxy's own
+/// upstream side is the code under test.
+pub async fn handshake_h2c(
+    addr: SocketAddr,
+) -> (
+    hyper::client::conn::http2::SendRequest<TestBody>,
+    impl Future<Output = ()> + Send,
+) {
+    let stream = TcpStream::connect(addr).await.expect("connect to the proxy");
+    let (sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .expect("h2c client handshake");
+    let driver = async move {
+        let _ = connection.await;
+    };
+    (sender, driver)
+}
+
+/// Sends one request over a fresh cleartext HTTP/2 connection.
+pub async fn send_h2c(addr: SocketAddr, request: Request<TestBody>) -> Reply {
+    let (mut sender, connection) = handshake_h2c(addr).await;
+    let driver = tokio::spawn(connection);
+    let response = sender.send_request(request).await.expect("a response");
+    let reply = collect(response).await;
+    driver.abort();
+    reply
+}
+
 /// Runs `handler` against the raw socket, for tests about bytes on the wire.
 pub async fn spawn_raw<F, Fut>(handler: F) -> SocketAddr
 where
@@ -348,6 +414,13 @@ pub struct Reply {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Bytes,
+    /// The trailing header block, when the response had one.
+    ///
+    /// Kept separate from `headers` rather than merged: gRPC puts `grpc-status`
+    /// here precisely *because* it arrives after the body, and a test that
+    /// cannot tell a trailer from a header cannot tell whether trailers survived
+    /// the proxy at all.
+    pub trailers: Option<HeaderMap>,
 }
 
 impl Reply {
@@ -361,6 +434,14 @@ impl Reply {
 
     pub fn upstream(&self) -> &str {
         self.header("x-upstream").unwrap_or("<none>")
+    }
+
+    /// The value of one trailing header.
+    pub fn trailer(&self, name: &str) -> Option<&str> {
+        self.trailers
+            .as_ref()?
+            .get(name)
+            .and_then(|value| value.to_str().ok())
     }
 }
 
@@ -442,16 +523,13 @@ pub async fn handshake(
 pub async fn collect(response: Response<Incoming>) -> Reply {
     let status = response.status();
     let headers = response.headers().clone();
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .expect("a complete body")
-        .to_bytes();
+    let collected = response.into_body().collect().await.expect("a complete body");
+    let trailers = collected.trailers().cloned();
     Reply {
         status,
         headers,
-        body,
+        body: collected.to_bytes(),
+        trailers,
     }
 }
 

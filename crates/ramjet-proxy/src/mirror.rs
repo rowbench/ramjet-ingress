@@ -55,6 +55,8 @@ use http_body_util::BodyExt;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use ramjet_router::BackendProtocol;
+
 use crate::body::ProxyBody;
 use crate::metrics::Metrics;
 use crate::upstream::Upstream;
@@ -98,6 +100,10 @@ const MIRROR_TIMEOUT: Duration = Duration::from_secs(5);
 struct MirrorJob {
     parts: Parts,
     body: Bytes,
+    /// Which pool sends it. A shadow backend is annotated independently of the
+    /// production one, so a gRPC service can be mirrored to an h2c shadow while
+    /// the primary stays HTTP/1.1, or the other way round.
+    protocol: BackendProtocol,
 }
 
 /// The queue in front of one serving runtime's mirror worker.
@@ -122,8 +128,11 @@ impl Mirror {
             // with one that does not. `MIRROR_TIMEOUT` is what keeps one slow
             // mirror from holding the line for long.
             while let Some(job) = rx.recv().await {
+                let protocol = job.protocol;
                 let request = Request::from_parts(job.parts, ProxyBody::once(job.body));
-                match tokio::time::timeout(MIRROR_TIMEOUT, exchange(&upstream, request)).await {
+                match tokio::time::timeout(MIRROR_TIMEOUT, exchange(&upstream, protocol, request))
+                    .await
+                {
                     Ok(Ok(())) => metrics.record_mirrored(),
                     Ok(Err(error)) => {
                         metrics.record_mirror_failure();
@@ -162,8 +171,22 @@ impl Mirror {
     /// Never blocks and never fails: `try_send` on a full queue is the drop,
     /// and a closed queue means the runtime is shutting down, which is not a
     /// condition the request path should learn about.
-    pub fn enqueue(&self, metrics: &Metrics, parts: Parts, body: Bytes) {
-        if self.jobs.try_send(MirrorJob { parts, body }).is_err() {
+    pub fn enqueue(
+        &self,
+        metrics: &Metrics,
+        parts: Parts,
+        body: Bytes,
+        protocol: BackendProtocol,
+    ) {
+        if self
+            .jobs
+            .try_send(MirrorJob {
+                parts,
+                body,
+                protocol,
+            })
+            .is_err()
+        {
             metrics.record_mirror_dropped();
         }
     }
@@ -172,9 +195,10 @@ impl Mirror {
 /// Sends one copy and drains whatever comes back.
 async fn exchange(
     upstream: &Upstream,
+    protocol: BackendProtocol,
     request: Request<ProxyBody>,
 ) -> Result<(), crate::upstream::UpstreamError> {
-    let response = upstream.send(request).await?;
+    let response = upstream.send(protocol, request).await?;
     // Read to the end rather than dropping the body: an unread `Incoming` makes
     // hyper close the connection instead of returning it to the pool, which
     // would put a TCP handshake on every single mirrored request.
@@ -261,7 +285,7 @@ mod tests {
         let metrics = Metrics::new();
 
         let (parts, _) = Request::new(()).into_parts();
-        mirror.enqueue(&metrics, parts, Bytes::new());
+        mirror.enqueue(&metrics, parts, Bytes::new(), BackendProtocol::Http1);
         assert_eq!(metrics.mirror_dropped(), 1);
     }
 
@@ -278,7 +302,7 @@ mod tests {
 
         for _ in 0..4 {
             let (parts, _) = Request::new(()).into_parts();
-            mirror.enqueue(&metrics, parts, Bytes::new());
+            mirror.enqueue(&metrics, parts, Bytes::new(), BackendProtocol::Http1);
         }
         assert_eq!(metrics.mirrored(), 0, "nothing was sent, only queued");
         assert_eq!(

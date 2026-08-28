@@ -25,7 +25,9 @@ identical traffic and compares the answers.
 | HTTP/1.1 keep-alive, pipelining | yes | yes |
 | HTTP/2 | yes | by dispatch — see [HTTP/2 on the uring engine](#http2-on-the-uring-engine) |
 | HTTP/3 over QUIC | behind `--http3` | no |
-| gRPC | 502 (needs an HTTP/2 upstream) | 502, same body |
+| HTTP/1.1 upstream | yes | yes |
+| HTTP/2 upstream (`backend-protocol: GRPC`) | yes, h2c prior knowledge | 502 — see [HTTP/2 upstreams](#http2-upstreams-are-the-hyper-engines-alone) |
+| gRPC, trailers and streaming included | yes, to a `GRPC` backend | 502 |
 | TLS termination | yes | yes |
 | SNI, wildcard and default certificates | yes | yes, the same resolver |
 | Session resumption (tickets) | yes | yes, the same configuration |
@@ -109,6 +111,36 @@ alone and an HTTP/2 client negotiates HTTP/1.1 with it — which works, and is
 what every browser falls back to, but costs multiplexing. It also means the
 second engine's threads and upstream pools are never started, which is the
 reason to turn it off.
+
+## HTTP/2 upstreams are the hyper engine's alone
+
+The dispatch above moves a *downstream* connection between engines. The backend
+protocol is a property of the **route**, and the two engines do not share an
+upstream pool — the uring engine has its own, written against its own sans-io
+codec, and it dials HTTP/1.1 only.
+
+So a route whose backend carries
+[`backend-protocol: GRPC`](../configuration/annotations.md#backend-protocol) is
+refused on the uring lane, in its own words:
+
+```
+502 Bad Gateway: this backend needs an HTTP/2 upstream, which the uring engine
+does not dial; use --engine hyper
+```
+
+Distinct from the message a gRPC request gets when its backend was never
+annotated, and deliberately so: that one says *add the annotation*, this one says
+*the annotation is right and this engine cannot honour it*. Two problems, two
+fixes, two sentences.
+
+The refusal is route-level rather than request-level. Any request to that
+backend gets it, not only the ones with a gRPC content type — because the
+backend was declared to speak HTTP/2, and sending it HTTP/1.1 anyway is the
+silent downgrade the annotation exists to prevent.
+
+**A cluster serving gRPC wants `--engine hyper`.** The hyper engine carries the
+whole matrix: HTTP/1.1, HTTP/2 and HTTP/3 clients all reach an h2c backend, with
+trailers and bidirectional streaming intact.
 
 ## Falling back
 

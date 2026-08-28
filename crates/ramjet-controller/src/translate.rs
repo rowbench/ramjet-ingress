@@ -23,19 +23,20 @@
 //! routes in sorted order, and resolved addresses are sorted before they are
 //! registered.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
 use k8s_openapi::api::networking::v1::{Ingress, IngressBackend};
 use kube::ResourceExt;
 use ramjet_router::{
-    BuildError, CanaryRules, CertifiedKeyHandle, MirrorRules, PathType, RouteOptions, RouteTable,
-    RouteTableBuilder,
+    BackendOptions, BackendProtocol, BuildError, CanaryRules, CertifiedKeyHandle, MirrorRules,
+    PathType, RouteOptions, RouteTable, RouteTableBuilder,
 };
 
 use crate::annotations::{
-    CanaryAnnotations, MirrorAnnotations, PromotionAnnotations, ANNOTATION_MIRROR_BACKEND,
+    BackendProtocolAnnotation, CanaryAnnotations, MirrorAnnotations, PromotionAnnotations,
+    ANNOTATION_BACKEND_PROTOCOL, ANNOTATION_MIRROR_BACKEND,
 };
 use crate::class::ClassFilter;
 use crate::config::{
@@ -116,6 +117,8 @@ pub enum WarningKind {
     TlsHostless,
     /// More than one Ingress supplied a cluster-wide default backend.
     DefaultBackendConflict,
+    /// Two Ingresses asked for different `backend-protocol` on one Service port.
+    BackendProtocolConflict,
 }
 
 /// One thing the translator refused, and why.
@@ -199,6 +202,8 @@ struct RoutePlan {
     key: RouteKey,
     backend: ServiceRef,
     owner: ObjectKey,
+    /// `backend-protocol` from the Ingress that declared this route.
+    protocol: BackendProtocol,
     canary: Option<CanaryPlan>,
     mirror: Option<MirrorPlan>,
 }
@@ -209,6 +214,8 @@ struct MirrorPlan {
     backend: ServiceRef,
     percent: u32,
     host: Option<String>,
+    /// From the production Ingress, which is where the mirror annotations live.
+    protocol: BackendProtocol,
 }
 
 /// A canary as planned.
@@ -217,6 +224,10 @@ struct CanaryPlan {
     backend: ServiceRef,
     owner: ObjectKey,
     rules: CanaryAnnotations,
+    /// From the *canary* Ingress. A canary is a separate object with its own
+    /// annotations, so a gRPC rollout can put an h2c canary in front of an
+    /// HTTP/1.1 production Service, or the reverse.
+    protocol: BackendProtocol,
 }
 
 /// Compiles a snapshot of the cluster into a publishable configuration.
@@ -280,7 +291,7 @@ pub fn translate(
         .map(|(r, _)| r)
         .or_else(|| opts.default_backend.clone());
 
-    let backends = collect_backends(&routes, default_backend.as_ref());
+    let backends = collect_backends(&routes, default_backend.as_ref(), &mut warnings);
     register_backends(
         snapshot,
         opts,
@@ -383,8 +394,9 @@ fn plan_ingress(
     };
 
     // Parsed once per Ingress rather than per rule: the annotations are on the
-    // object, so every route it declares shares one mirror.
-    let mirror = mirror_plan(ingress.annotations(), &namespace, &owner, warnings);
+    // object, so every route it declares shares one protocol and one mirror.
+    let protocol = backend_protocol(ingress.annotations(), &owner, warnings);
+    let mirror = mirror_plan(ingress.annotations(), &namespace, &owner, protocol, warnings);
 
     let mut hosts: Vec<Option<String>> = Vec::new();
 
@@ -426,6 +438,7 @@ fn plan_ingress(
                             key,
                             backend,
                             owner: owner.clone(),
+                            protocol,
                             canary: None,
                             mirror: mirror.clone(),
                         },
@@ -466,6 +479,7 @@ fn plan_ingress(
             },
             backend: backend.clone(),
             owner: owner.clone(),
+            protocol,
             canary: None,
             mirror: mirror.clone(),
         });
@@ -481,6 +495,7 @@ fn attach_canary(
 ) {
     let owner = ObjectKey::of(ingress.as_ref());
     let namespace = owner.namespace.clone();
+    let protocol = backend_protocol(ingress.annotations(), &owner, warnings);
 
     for key in &rules.invalid {
         warnings.push(Warning::new(
@@ -556,6 +571,7 @@ fn attach_canary(
                         backend,
                         owner: owner.clone(),
                         rules: rules.clone(),
+                        protocol,
                     });
                 }
             }
@@ -563,28 +579,70 @@ fn attach_canary(
     }
 }
 
-/// Every distinct Service port the table will reference.
+/// Every distinct Service port the table will reference, and how to dial it.
+///
+/// A backend is one Service port, and one Service port is one entry in the route
+/// table however many Ingresses point at it — which means two Ingresses can ask
+/// for two different `backend-protocol` values on the same pods. There is no
+/// answer that satisfies both, so this resolves it the way every other conflict
+/// in this file is resolved: **the first claim wins and the loser is named in a
+/// warning**. First is defined by the route sort order, not by hash iteration
+/// order, so every replica compiles the same table from the same objects.
+///
+/// The alternative — one backend per (Service port, protocol) pair — would give
+/// each Ingress what it asked for, at the cost of two connection pools and two
+/// sets of load-balancer counters for one set of pods, and of a backend name in
+/// `/metrics` that no longer matches the Service. Silently splitting a Service's
+/// traffic accounting in two because somebody annotated a second Ingress is a
+/// worse surprise than a warning saying which annotation did not take.
 fn collect_backends(
     routes: &HashMap<RouteKey, RoutePlan>,
     default_backend: Option<&ServiceRef>,
-) -> BTreeSet<ServiceRef> {
-    let mut set = BTreeSet::new();
-    for plan in routes.values() {
-        set.insert(plan.backend.clone());
+    warnings: &mut Vec<Warning>,
+) -> BTreeMap<ServiceRef, BackendProtocol> {
+    let mut map: BTreeMap<ServiceRef, BackendProtocol> = BTreeMap::new();
+
+    let mut plans: Vec<&RoutePlan> = routes.values().collect();
+    plans.sort_by(|a, b| a.key.sort_key().cmp(&b.key.sort_key()));
+
+    for plan in plans {
+        let mut claim = |target: &ServiceRef, protocol: BackendProtocol, owner: &ObjectKey| {
+            match map.get(target) {
+                None => {
+                    map.insert(target.clone(), protocol);
+                }
+                Some(&held) if held != protocol => warnings.push(Warning::new(
+                    owner.clone(),
+                    WarningKind::BackendProtocolConflict,
+                    format!(
+                        "backend {target} is already registered as `{held}` by another Ingress; \
+                         this Ingress asked for `{protocol}` and was not honoured"
+                    ),
+                )),
+                Some(_) => {}
+            }
+        };
+
+        claim(&plan.backend, plan.protocol, &plan.owner);
         if let Some(canary) = &plan.canary {
-            set.insert(canary.backend.clone());
+            claim(&canary.backend, canary.protocol, &canary.owner);
         }
         // A mirror backend is resolved exactly like any other, endpoints and
         // all. Skipping it here would leave the router with a route naming a
         // backend that was never registered, which fails the whole table.
         if let Some(mirror) = &plan.mirror {
-            set.insert(mirror.backend.clone());
+            claim(&mirror.backend, mirror.protocol, &plan.owner);
         }
     }
+
     if let Some(target) = default_backend {
-        set.insert(target.clone());
+        // The cluster-wide default comes from a flag or from an Ingress with no
+        // rules, and in neither case is there a route whose annotation could
+        // have spoken for it. It stays HTTP/1.1 unless some route also names it,
+        // in which case that route's claim is already in the map.
+        map.entry(target.clone()).or_default();
     }
-    set
+    map
 }
 
 /// Resolves and registers every backend.
@@ -597,14 +655,14 @@ fn collect_backends(
 fn register_backends(
     snapshot: &ClusterSnapshot,
     opts: &ControllerOpts,
-    backends: &BTreeSet<ServiceRef>,
+    backends: &BTreeMap<ServiceRef, BackendProtocol>,
     builder: &mut RouteTableBuilder,
     digest: &mut Digest,
     warnings: &mut Vec<Warning>,
 ) -> Result<(), BuildError> {
     let index = EndpointIndex::new(&snapshot.services, &snapshot.endpoint_slices);
 
-    for target in backends {
+    for (target, protocol) in backends {
         let subject = ObjectKey {
             namespace: target.namespace.clone(),
             name: target.name.clone(),
@@ -652,13 +710,25 @@ fn register_backends(
         let name = target.backend_name();
         digest.str(&name);
         digest.u8(lb_policy_tag(opts.lb_policy));
+        // Folded in so that flipping `backend-protocol` republishes. Without
+        // this the digest would be equal across the change and the rebuild loop
+        // would suppress the publish, leaving the annotation edited and the data
+        // plane still dialling the old protocol.
+        digest.u8(protocol_tag(*protocol));
         digest.u64(endpoints.len() as u64);
         for endpoint in &endpoints {
             digest.str(&endpoint.addr.to_string());
             digest.u64(u64::from(endpoint.weight));
         }
 
-        builder.backend(&name, opts.lb_policy, endpoints)?;
+        builder.backend_with(
+            &name,
+            endpoints,
+            &BackendOptions {
+                policy: opts.lb_policy,
+                protocol: *protocol,
+            },
+        )?;
     }
     Ok(())
 }
@@ -1022,6 +1092,7 @@ fn mirror_plan(
     annotations: &BTreeMap<String, String>,
     namespace: &str,
     owner: &ObjectKey,
+    protocol: BackendProtocol,
     warnings: &mut Vec<Warning>,
 ) -> Option<MirrorPlan> {
     let parsed = MirrorAnnotations::parse(annotations);
@@ -1047,6 +1118,7 @@ fn mirror_plan(
             backend,
             percent: parsed.percent,
             host: parsed.host,
+            protocol,
         }),
         Err(error) => {
             warnings.push(Warning::new(
@@ -1057,6 +1129,30 @@ fn mirror_plan(
             None
         }
     }
+}
+
+/// Reads `backend-protocol` off one Ingress, reporting a value we cannot honour.
+///
+/// The warning is the whole point of not simply defaulting: `GRPCS` and `HTTPS`
+/// are requests for TLS to the upstream, and an operator who wrote one and got
+/// cleartext deserves to be told rather than left reading connection resets.
+fn backend_protocol(
+    annotations: &BTreeMap<String, String>,
+    owner: &ObjectKey,
+    warnings: &mut Vec<Warning>,
+) -> BackendProtocol {
+    let parsed = BackendProtocolAnnotation::parse(annotations);
+    if let Some(value) = &parsed.unsupported {
+        warnings.push(Warning::new(
+            owner.clone(),
+            WarningKind::InvalidAnnotation,
+            format!(
+                "`{ANNOTATION_BACKEND_PROTOCOL}: {value}` is not supported; only `HTTP` and \
+                 `GRPC` are, and this backend stays on HTTP/1.1"
+            ),
+        ));
+    }
+    parsed.protocol
 }
 
 /// Reads a backend into a `ServiceRef`.
@@ -1117,6 +1213,13 @@ fn parse_path_type(raw: &str, owner: &ObjectKey, warnings: &mut Vec<Warning>) ->
             ));
             PathType::ImplementationSpecific
         }
+    }
+}
+
+fn protocol_tag(protocol: BackendProtocol) -> u8 {
+    match protocol {
+        BackendProtocol::Http1 => 0,
+        BackendProtocol::H2c => 1,
     }
 }
 

@@ -53,22 +53,49 @@
 //! | backend matched but has no endpoints | 503 |
 //! | every attempted endpoint refused the connection | 502 |
 //! | upstream sent no headers before the deadline | 504 |
-//! | gRPC upstream (needs HTTP/2, see below) | 502 |
+//! | gRPC arriving at an HTTP/1.1 backend (see below) | 502 |
 //!
 //! Bodies are tiny `&'static [u8]` constants: an error page is not the place to
 //! allocate, and an ingress that gets slower the more it is failing has the
 //! failure mode backwards.
 //!
-//! # TODO: gRPC
+//! # Two upstream protocols, and the version translation between them
 //!
-//! gRPC requires HTTP/2 end to end — it is defined in terms of h2 streams and
-//! trailers, and there is no HTTP/1.1 form of it. Downstream already speaks h2,
-//! but [`Upstream`](crate::upstream::Upstream) dials HTTP/1.1, so a gRPC
-//! request would be silently downgraded into something the backend cannot
-//! parse. Rather than emit a confusing failure, requests with an
-//! `application/grpc` content type are answered with an explicit 502 naming the
-//! limitation. Lifting it means adding an h2 upstream mode, selected per
-//! backend from the `backend-protocol: GRPC` annotation.
+//! Which protocol an endpoint is dialled with is a property of the backend, not
+//! of the request: [`BackendProtocol::H2c`] comes from
+//! `backend-protocol: GRPC` on the Ingress and is carried through the route
+//! table. So all four combinations occur and all four have to work — an
+//! HTTP/1.1 client reaching an h2c backend, an HTTP/2 client reaching an
+//! HTTP/1.1 one, and both matching pairs.
+//!
+//! The translation is three lines and each one matters:
+//!
+//! - **Version.** The outgoing `Version` is set from the backend's protocol, not
+//!   from what the client spoke.
+//! - **Authority.** HTTP/1.1 carries the client's name in `Host`; HTTP/2 carries
+//!   it in `:authority`, which hyper derives from the request URI — and the URI
+//!   has to be the endpoint, because that is what keys the connection pool. A
+//!   request going out over h2 therefore drops `Host` rather than sending one
+//!   that disagrees with `:authority`, which RFC 9113 §8.3.1 lets a server treat
+//!   as malformed. `X-Forwarded-Host` still carries the name the client used, on
+//!   both paths.
+//! - **Upgrades.** `Connection` and `Upgrade` are connection-specific headers
+//!   that HTTP/2 forbids outright, so an upgrade request is not reconstructed
+//!   for an h2c backend. It goes upstream as an ordinary request, the upstream
+//!   does not answer 101, and the client gets whatever the application said —
+//!   rather than an h2 stream error. WebSocket over HTTP/2 (RFC 8441 extended
+//!   CONNECT) is a separate protocol and is not implemented.
+//!
+//! # gRPC, and the one case that is still refused
+//!
+//! gRPC is defined in terms of h2 streams and trailers and has no HTTP/1.1 form,
+//! so a gRPC request sent to an [`Http1`](BackendProtocol::Http1) backend would
+//! be downgraded into something the backend cannot parse. That request is still
+//! answered with an explicit 502, and the body now names the annotation that
+//! fixes it. A gRPC request to an [`H2c`](BackendProtocol::H2c) backend is
+//! forwarded like any other: trailers — where `grpc-status` lives — pass through
+//! in both directions, because [`ProxyBody`] relays whole frames and a trailer
+//! frame is just a frame.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -81,8 +108,8 @@ use hyper::body::Incoming;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use ramjet_router::{
-    select_endpoint, Backend, MirrorSpec, RouteCounters, RouteSlot, RouteTable, SharedRouteTable,
-    MIRROR_PERCENT_TOTAL,
+    select_endpoint, Backend, BackendProtocol, MirrorSpec, RouteCounters, RouteSlot, RouteTable,
+    SharedRouteTable, MIRROR_PERCENT_TOTAL,
 };
 
 use crate::body::ProxyBody;
@@ -99,8 +126,14 @@ const BODY_UPSTREAM_FAILED: &[u8] = b"502 Bad Gateway: the upstream connection f
 const BODY_BAD_TARGET: &[u8] = b"502 Bad Gateway: the endpoint address is not a valid URI\n";
 const BODY_UPGRADE_FAILED: &[u8] = b"502 Bad Gateway: the upstream refused to complete the upgrade\n";
 const BODY_TIMEOUT: &[u8] = b"504 Gateway Timeout: the upstream sent no response headers in time\n";
-const BODY_GRPC: &[u8] =
-    b"502 Bad Gateway: gRPC upstreams require HTTP/2, which ramjet does not yet speak upstream\n";
+/// A gRPC request whose backend is dialled over HTTP/1.1.
+///
+/// The hint is the whole value of this response. The failure it replaces —
+/// forwarding gRPC over HTTP/1.1 — surfaces at the client as a parse error from
+/// a library that cannot say which hop broke it, and the fix is one annotation
+/// on an Ingress the operator already has.
+const BODY_GRPC: &[u8] = b"502 Bad Gateway: gRPC requires an HTTP/2 backend; \
+set nginx.ingress.kubernetes.io/backend-protocol: GRPC on the Ingress\n";
 
 /// Which listener a request arrived on, which is what `X-Forwarded-Proto` says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,11 +288,15 @@ async fn dispatch(
     matched: &Matched<'_>,
     recorder: Recorder<'_>,
 ) -> Response<ProxyBody> {
-    if is_grpc(request.headers()) {
+    let backend = matched.backend;
+    let protocol = backend.protocol();
+
+    // Only for an HTTP/1.1 backend. An h2c backend is exactly what gRPC needs,
+    // and refusing there would be refusing the feature.
+    if protocol == BackendProtocol::Http1 && is_grpc(request.headers()) {
         return static_response(StatusCode::BAD_GATEWAY, BODY_GRPC);
     }
 
-    let backend = matched.backend;
     let endpoints = backend.endpoints();
     if endpoints.is_empty() {
         return static_response(StatusCode::SERVICE_UNAVAILABLE, BODY_NO_ENDPOINT);
@@ -282,20 +319,35 @@ async fn dispatch(
         forwarded_host.clone(),
     );
     headers::ensure_request_id(&mut parts.headers);
-    if let Some(protocol) = &upgrade {
-        headers::restore_upgrade(&mut parts.headers, protocol);
-    }
 
-    // An HTTP/2 request carries its host in `:authority` and has no `Host`
-    // header at all. Downgrading it to HTTP/1.1 without restoring `Host` would
-    // let hyper's client fill one in from the endpoint's `ip:port`, which is
-    // exactly the rewrite this proxy promises not to do.
-    if !parts.headers.contains_key(header::HOST) {
-        if let Some(host) = forwarded_host {
-            parts.headers.insert(header::HOST, host);
+    match protocol {
+        BackendProtocol::Http1 => {
+            if let Some(upgraded) = &upgrade {
+                headers::restore_upgrade(&mut parts.headers, upgraded);
+            }
+            // An HTTP/2 request carries its host in `:authority` and has no
+            // `Host` header at all. Downgrading it to HTTP/1.1 without restoring
+            // `Host` would let hyper's client fill one in from the endpoint's
+            // `ip:port`, which is exactly the rewrite this proxy promises not to
+            // do.
+            if !parts.headers.contains_key(header::HOST) {
+                if let Some(host) = forwarded_host {
+                    parts.headers.insert(header::HOST, host);
+                }
+            }
+            parts.version = Version::HTTP_11;
+        }
+        BackendProtocol::H2c => {
+            // `:authority` comes from the request URI, which is rewritten to the
+            // endpoint below because that is what keys the pool. A `Host` header
+            // saying something else is a request a server may treat as
+            // malformed, so it goes; `X-Forwarded-Host` already carries the name
+            // the client used. `Connection`/`Upgrade` stay stripped for the same
+            // class of reason — HTTP/2 forbids them outright.
+            parts.headers.remove(header::HOST);
+            parts.version = Version::HTTP_2;
         }
     }
-    parts.version = Version::HTTP_11;
 
     let path_and_query = parts.uri.path_and_query().cloned();
 
@@ -364,7 +416,7 @@ async fn dispatch(
         let _inflight = slot.and_then(|slot| slot.acquire(index));
 
         let started = Instant::now();
-        match state.upstream.send(request).await {
+        match state.upstream.send(protocol, request).await {
             Ok(response) => {
                 let elapsed = started.elapsed();
                 state.metrics.record_upstream_latency(elapsed);
@@ -563,11 +615,33 @@ async fn mirror_request(
     if let Some(host) = target.host.and_then(|h| HeaderValue::from_str(h).ok()) {
         copy_parts.headers.insert(header::HOST, host);
     }
+    // The shadow backend carries its own annotation, so the copy is re-versioned
+    // for *its* protocol rather than inheriting the primary's. `parts` was
+    // rewritten for the primary before this function was called, which is what
+    // makes a copy of an HTTP/1.1 request to an h2c shadow — or the reverse —
+    // need fixing up here rather than being correct by accident.
+    let protocol = target.backend.protocol();
+    match protocol {
+        BackendProtocol::Http1 => copy_parts.version = Version::HTTP_11,
+        BackendProtocol::H2c => {
+            // Same reasoning as the primary path: `:authority` comes from the
+            // URI, and `mirror-host` was just written into `Host`, so keeping it
+            // would send two disagreeing authorities. `mirror-host` is a
+            // deliberate override, so it goes into `X-Forwarded-Host` where an
+            // h2 backend can still read it.
+            if let Some(host) = copy_parts.headers.remove(header::HOST) {
+                copy_parts.headers.insert(&headers::X_FORWARDED_HOST, host);
+            }
+            copy_parts.version = Version::HTTP_2;
+        }
+    }
     // Whatever is in here describes the downstream connection, and an upgrade
     // handle in particular must not be duplicated into a request nobody reads.
     copy_parts.extensions.clear();
 
-    target.mirror.enqueue(&state.metrics, copy_parts, copy);
+    target
+        .mirror
+        .enqueue(&state.metrics, copy_parts, copy, protocol);
     primary
 }
 

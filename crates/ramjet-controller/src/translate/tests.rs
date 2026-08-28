@@ -11,7 +11,8 @@ use super::*;
 use crate::annotations::{
     ANNOTATION_AUTO_PROMOTE, ANNOTATION_AUTO_PROMOTE_INTERVAL, ANNOTATION_AUTO_PROMOTE_MAX_5XX,
     ANNOTATION_AUTO_PROMOTE_MAX_LATENCY, ANNOTATION_AUTO_PROMOTE_MIN_REQUESTS,
-    ANNOTATION_AUTO_PROMOTE_STATUS, ANNOTATION_AUTO_PROMOTE_STEPS, ANNOTATION_CANARY,
+    ANNOTATION_AUTO_PROMOTE_STATUS, ANNOTATION_AUTO_PROMOTE_STEPS, ANNOTATION_BACKEND_PROTOCOL,
+    ANNOTATION_CANARY,
     ANNOTATION_CANARY_WEIGHT, ANNOTATION_MIRROR_HOST, ANNOTATION_MIRROR_PERCENT,
     DEFAULT_PROMOTE_INTERVAL, DEFAULT_PROMOTE_STEPS,
 };
@@ -1790,5 +1791,277 @@ fn promotion_targets_come_out_in_a_deterministic_order() {
     assert_eq!(
         names,
         vec!["prod/a-canary", "prod/m-canary", "prod/z-canary"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// backend-protocol
+// ---------------------------------------------------------------------------
+
+/// The protocol the compiled table will dial `host path` with.
+fn protocol_of(table: &RouteTable, host: &str, path: &str) -> Option<BackendProtocol> {
+    table.match_request(host, path).map(|m| m.backend().protocol())
+}
+
+/// One Ingress serving `example.com /`, carrying `backend-protocol: <value>`.
+fn with_protocol(value: &str) -> ClusterSnapshot {
+    let ingress = annotate(
+        ours(ingress(
+            "default",
+            "web",
+            &[rule(Some("example.com"), &[path("/", "Prefix", "web", 80)])],
+        )),
+        ANNOTATION_BACKEND_PROTOCOL,
+        value,
+    );
+    backed(
+        base().with_ingress(ingress),
+        "default",
+        "web",
+        80,
+        8080,
+        &["10.0.0.1"],
+    )
+}
+
+#[test]
+fn a_backend_is_http1_without_the_annotation() {
+    let snapshot = backed(
+        base().with_ingress(ours(ingress(
+            "default",
+            "web",
+            &[rule(Some("example.com"), &[path("/", "Prefix", "web", 80)])],
+        ))),
+        "default",
+        "web",
+        80,
+        8080,
+        &["10.0.0.1"],
+    );
+    let t = compile(&snapshot);
+    assert_eq!(
+        protocol_of(&t.config.table, "example.com", "/"),
+        Some(BackendProtocol::Http1)
+    );
+    assert!(t.warnings.is_empty());
+}
+
+#[test]
+fn grpc_compiles_to_an_h2c_backend() {
+    let t = compile(&with_protocol("GRPC"));
+    assert_eq!(
+        protocol_of(&t.config.table, "example.com", "/"),
+        Some(BackendProtocol::H2c)
+    );
+    assert!(
+        t.warnings.is_empty(),
+        "a supported value produces no warning: {:?}",
+        t.warnings
+    );
+}
+
+#[test]
+fn the_protocol_is_read_case_insensitively_as_ingress_nginx_reads_it() {
+    for spelling in ["grpc", "Grpc", " GRPC "] {
+        let t = compile(&with_protocol(spelling));
+        assert_eq!(
+            protocol_of(&t.config.table, "example.com", "/"),
+            Some(BackendProtocol::H2c),
+            "{spelling:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unsupported_protocol_warns_and_leaves_the_backend_on_http1() {
+    // Not silently HTTP: an operator who asked for GRPCS gets a line naming the
+    // value, and the route still serves rather than the table failing to build.
+    for value in ["GRPCS", "HTTPS", "AUTO_HTTP", "FCGI"] {
+        let t = compile(&with_protocol(value));
+        assert_eq!(
+            protocol_of(&t.config.table, "example.com", "/"),
+            Some(BackendProtocol::Http1),
+            "{value} must not change the protocol"
+        );
+        let found = warnings(&t, WarningKind::InvalidAnnotation);
+        assert_eq!(found.len(), 1, "{value} should produce exactly one warning");
+        assert!(
+            found[0].detail.contains(value),
+            "the warning must name the value, got: {}",
+            found[0].detail
+        );
+    }
+}
+
+#[test]
+fn the_protocol_moves_the_digest_so_the_change_is_published() {
+    // The rebuild loop suppresses a publish when the digest is unchanged, so an
+    // annotation that does not reach the digest is an annotation that takes
+    // effect only after some unrelated edit.
+    let plain = compile(&with_protocol("HTTP")).digest;
+    let grpc = compile(&with_protocol("GRPC")).digest;
+    assert_ne!(plain, grpc, "flipping backend-protocol must republish");
+}
+
+#[test]
+fn each_ingress_annotates_its_own_backends() {
+    let rpc = annotate(
+        ours(ingress(
+            "default",
+            "rpc",
+            &[rule(Some("example.com"), &[path("/rpc", "Prefix", "rpc", 80)])],
+        )),
+        ANNOTATION_BACKEND_PROTOCOL,
+        "GRPC",
+    );
+    let web = ours(ingress(
+        "default",
+        "web",
+        &[rule(Some("example.com"), &[path("/", "Prefix", "web", 80)])],
+    ));
+    let snapshot = backed(
+        backed(
+            base().with_ingress(rpc).with_ingress(web),
+            "default",
+            "rpc",
+            80,
+            8080,
+            &["10.0.0.1"],
+        ),
+        "default",
+        "web",
+        80,
+        8080,
+        &["10.0.0.2"],
+    );
+
+    let t = compile(&snapshot);
+    assert_eq!(
+        protocol_of(&t.config.table, "example.com", "/rpc"),
+        Some(BackendProtocol::H2c)
+    );
+    assert_eq!(
+        protocol_of(&t.config.table, "example.com", "/"),
+        Some(BackendProtocol::Http1)
+    );
+}
+
+#[test]
+fn two_ingresses_disagreeing_about_one_service_get_the_first_claim_and_a_warning() {
+    // A backend is one Service port however many Ingresses point at it, so the
+    // two cannot both be satisfied. First by route order wins — `/a` before
+    // `/b` — and the loser is named rather than left wondering.
+    let grpc = annotate(
+        ours(ingress(
+            "default",
+            "a",
+            &[rule(Some("example.com"), &[path("/a", "Prefix", "web", 80)])],
+        )),
+        ANNOTATION_BACKEND_PROTOCOL,
+        "GRPC",
+    );
+    let plain = ours(ingress(
+        "default",
+        "b",
+        &[rule(Some("example.com"), &[path("/b", "Prefix", "web", 80)])],
+    ));
+    let snapshot = backed(
+        base().with_ingress(grpc).with_ingress(plain),
+        "default",
+        "web",
+        80,
+        8080,
+        &["10.0.0.1"],
+    );
+
+    let t = compile(&snapshot);
+    let conflicts = warnings(&t, WarningKind::BackendProtocolConflict);
+    assert_eq!(conflicts.len(), 1, "{:?}", t.warnings);
+    assert_eq!(conflicts[0].subject.name, "b", "the later claim is the one reported");
+    // One backend, and it is the one the first route asked for.
+    assert_eq!(
+        protocol_of(&t.config.table, "example.com", "/a"),
+        Some(BackendProtocol::H2c)
+    );
+    assert_eq!(
+        protocol_of(&t.config.table, "example.com", "/b"),
+        Some(BackendProtocol::H2c),
+        "the same Service port is the same backend, so it has one protocol"
+    );
+}
+
+#[test]
+fn two_ingresses_agreeing_about_one_service_produce_no_warning() {
+    let one = annotate(
+        ours(ingress(
+            "default",
+            "a",
+            &[rule(Some("example.com"), &[path("/a", "Prefix", "web", 80)])],
+        )),
+        ANNOTATION_BACKEND_PROTOCOL,
+        "GRPC",
+    );
+    let two = annotate(
+        ours(ingress(
+            "default",
+            "b",
+            &[rule(Some("example.com"), &[path("/b", "Prefix", "web", 80)])],
+        )),
+        ANNOTATION_BACKEND_PROTOCOL,
+        "grpc",
+    );
+    let snapshot = backed(
+        base().with_ingress(one).with_ingress(two),
+        "default",
+        "web",
+        80,
+        8080,
+        &["10.0.0.1"],
+    );
+
+    let t = compile(&snapshot);
+    assert!(warnings(&t, WarningKind::BackendProtocolConflict).is_empty());
+}
+
+#[test]
+fn a_canary_carries_its_own_protocol() {
+    // The canary is a separate object with its own annotations, which is what
+    // makes a gRPC rollout in front of an HTTP/1.1 production Service possible.
+    let mut snapshot = canary_pair(&[(ANNOTATION_BACKEND_PROTOCOL, "GRPC")]);
+    snapshot = backed(snapshot, "default", "stable", 80, 8080, &["10.0.0.1"]);
+    snapshot = backed(snapshot, "default", "canary", 80, 8080, &["10.0.0.2"]);
+
+    let t = compile(&snapshot);
+    let table = &t.config.table;
+    let matched = table.match_request("example.com", "/").expect("a route");
+    assert_eq!(matched.backend().protocol(), BackendProtocol::Http1);
+    let canary = matched.canary().expect("a canary");
+    assert_eq!(
+        table.backend(canary.backend()).expect("a backend").protocol(),
+        BackendProtocol::H2c
+    );
+}
+
+#[test]
+fn the_cluster_default_backend_stays_http1_when_no_route_names_it() {
+    let opts = ControllerOpts {
+        default_backend: Some("default/fallback:80".parse().expect("a service ref")),
+        ..ControllerOpts::default()
+    };
+    let snapshot = backed(
+        with_protocol("GRPC"),
+        "default",
+        "fallback",
+        80,
+        8080,
+        &["10.0.0.9"],
+    );
+
+    let t = compile_with(&snapshot, &opts);
+    let table = &t.config.table;
+    let id = table.default_backend().expect("a default backend");
+    assert_eq!(
+        table.backend(id).expect("a backend").protocol(),
+        BackendProtocol::Http1
     );
 }

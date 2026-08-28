@@ -26,13 +26,34 @@
 //! covers both cannot tell them apart without capping how much anyone can
 //! download.
 //!
-//! # HTTP/1.1 upstream only, for now
+//! # Two pools, one per upstream protocol
 //!
-//! Downstream speaks HTTP/1.1 and HTTP/2; upstream is HTTP/1.1. That is the
-//! same default ingress-nginx ships, and it is transparent for everything
-//! except gRPC, which requires HTTP/2 end to end. gRPC upstreams are detected
-//! and rejected explicitly in [`forward`](crate::forward) rather than being
-//! downgraded into a confusing failure. See the TODO there.
+//! Downstream speaks HTTP/1.1, HTTP/2 and HTTP/3; upstream speaks HTTP/1.1 by
+//! default and cleartext HTTP/2 for a backend that asked for it. The choice is a
+//! property of the *backend*, not of the request — see
+//! [`BackendProtocol`](ramjet_router::BackendProtocol) — so the two directions
+//! are fully crossed: an HTTP/1.1 client reaches an h2c backend, and an HTTP/2
+//! client reaches an HTTP/1.1 one.
+//!
+//! The two pools are separate clients rather than one client with negotiation,
+//! because there is nothing to negotiate. h2c with prior knowledge means sending
+//! the HTTP/2 connection preface at a server already known to speak it; there is
+//! no ALPN on a cleartext socket and the upgrade dance in RFC 7540 §3.2 is
+//! deprecated and unimplemented by most servers. A backend is one or the other,
+//! the controller says which, and a client that speaks the wrong one to a socket
+//! produces an error at the first frame rather than a subtly wrong request.
+//!
+//! ## Why the h2 pool is sized the way it is
+//!
+//! `pool_max_idle_per_host` is a per-endpoint ceiling on *connections*, and h2
+//! multiplexes: hyper's pool marks an HTTP/2 connection shareable and hands the
+//! same one to every concurrent request for that endpoint, so the steady state
+//! is one connection per endpoint carrying every stream. That is the point of
+//! HTTP/2, and it is why the number that keeps the HTTP/1.1 pool from churning
+//! (see [`DEFAULT_POOL_MAX_IDLE_PER_HOST`]) is simply not the binding constraint
+//! here. What binds instead is the server's `SETTINGS_MAX_CONCURRENT_STREAMS`,
+//! which is the upstream's to choose and which hyper already respects by opening
+//! a second connection when the first is saturated.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -43,6 +64,7 @@ use hyper::body::Incoming;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::{Client, Error as LegacyError};
 use hyper_util::rt::TokioExecutor;
+use ramjet_router::BackendProtocol;
 
 use crate::body::ProxyBody;
 
@@ -151,29 +173,25 @@ impl std::error::Error for UpstreamError {
     }
 }
 
-/// A pooled HTTP/1.1 client for upstream endpoints.
+/// Pooled clients for upstream endpoints: one HTTP/1.1, one cleartext HTTP/2.
+///
+/// Both are built at startup whether or not the published table has any h2c
+/// backend. A `Client` that has never been asked for a connection holds an empty
+/// pool and one `Arc`, so the alternative — building the h2 client lazily, or
+/// only when a generation happens to contain an h2c backend — would trade a few
+/// hundred bytes for a rebuild that has to reach into the data plane.
 #[derive(Debug, Clone)]
 pub struct Upstream {
-    client: Client<HttpConnector, ProxyBody>,
+    http1: Client<HttpConnector, ProxyBody>,
+    h2c: Client<HttpConnector, ProxyBody>,
     response_timeout: Duration,
     max_connect_attempts: usize,
 }
 
 impl Upstream {
-    /// Builds a client from `config`.
+    /// Builds the clients from `config`.
     pub fn new(config: &UpstreamConfig) -> Self {
-        let mut connector = HttpConnector::new();
-        connector.set_connect_timeout(Some(config.connect_timeout));
-        // The same argument as on the accept side: Nagle delays a small write
-        // waiting for company, and a request header block has none coming.
-        connector.set_nodelay(true);
-        connector.set_keepalive(config.tcp_keepalive);
-        // Endpoints are always `ip:port` literals from the route table, so the
-        // connector's IP fast path applies and no name resolution happens on
-        // the request path.
-        connector.enforce_http(true);
-
-        let client = Client::builder(TokioExecutor::new())
+        let http1 = Client::builder(TokioExecutor::new())
             .pool_idle_timeout(config.pool_idle_timeout)
             .pool_max_idle_per_host(config.pool_max_idle_per_host)
             // hyper's own retry of a request that raced an upstream closing a
@@ -181,10 +199,21 @@ impl Upstream {
             // `forward`; it is the same endpoint, and hyper only does it when
             // it knows nothing was written.
             .retry_canceled_requests(true)
-            .build(connector);
+            .build(connector(config));
+
+        let h2c = Client::builder(TokioExecutor::new())
+            // Prior knowledge: send the preface and never try HTTP/1.1. Without
+            // this the client would speak HTTP/1.1 to a cleartext socket, which
+            // is precisely the silent downgrade this mode exists to remove.
+            .http2_only(true)
+            .pool_idle_timeout(config.pool_idle_timeout)
+            .pool_max_idle_per_host(config.pool_max_idle_per_host)
+            .retry_canceled_requests(true)
+            .build(connector(config));
 
         Upstream {
-            client,
+            http1,
+            h2c,
             response_timeout: config.response_timeout,
             max_connect_attempts: config.max_connect_attempts.max(1),
         }
@@ -195,20 +224,46 @@ impl Upstream {
         self.max_connect_attempts
     }
 
-    /// Sends one request and waits for its response headers.
+    /// Sends one request over `protocol` and waits for its response headers.
     ///
     /// The returned body is still streaming; the timeout covers headers only.
+    /// For an h2 exchange that means the timeout does not bound a long-lived
+    /// stream either — a server-streaming RPC that sends its first message after
+    /// ten minutes is a working RPC, and the headers arrived long before it.
     pub async fn send(
         &self,
+        protocol: BackendProtocol,
         request: Request<ProxyBody>,
     ) -> Result<http::Response<Incoming>, UpstreamError> {
-        match tokio::time::timeout(self.response_timeout, self.client.request(request)).await {
+        let client = match protocol {
+            BackendProtocol::Http1 => &self.http1,
+            BackendProtocol::H2c => &self.h2c,
+        };
+        match tokio::time::timeout(self.response_timeout, client.request(request)).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(error)) if error.is_connect() => Err(UpstreamError::Connect(error)),
             Ok(Err(error)) => Err(UpstreamError::Transport(error)),
             Err(_elapsed) => Err(UpstreamError::Timeout),
         }
     }
+}
+
+/// The TCP connector both pools dial through.
+///
+/// Identical for the two protocols, because everything it configures is below
+/// HTTP: the handshake that differs happens after the socket is up.
+fn connector(config: &UpstreamConfig) -> HttpConnector {
+    let mut connector = HttpConnector::new();
+    connector.set_connect_timeout(Some(config.connect_timeout));
+    // The same argument as on the accept side: Nagle delays a small write
+    // waiting for company, and a request header block has none coming.
+    connector.set_nodelay(true);
+    connector.set_keepalive(config.tcp_keepalive);
+    // Endpoints are always `ip:port` literals from the route table, so the
+    // connector's IP fast path applies and no name resolution happens on
+    // the request path.
+    connector.enforce_http(true);
+    connector
 }
 
 /// Builds the absolute URI for dispatching to `endpoint`.

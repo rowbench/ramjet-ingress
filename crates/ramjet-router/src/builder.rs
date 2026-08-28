@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use regex::{Regex, RegexBuilder};
 
-use crate::backend::{Backend, BackendId, Endpoint, LbPolicy};
+use crate::backend::{Backend, BackendId, BackendProtocol, Endpoint, LbPolicy};
 use crate::canary::{CanarySpec, HeaderSpec};
 use crate::host::{FxHashMap, FxHashSet, MAX_HOST_LEN};
 use crate::mirror::{MirrorSpec, MIRROR_PERCENT_TOTAL};
@@ -244,6 +244,26 @@ struct MirrorDraft {
     host: Option<Box<str>>,
 }
 
+/// Everything about a backend that is not its name or its endpoints.
+///
+/// A struct rather than two more positional arguments: `backend(name, policy,
+/// protocol, endpoints)` is a signature where swapping two arguments still
+/// compiles, and the mistake it invites — dialling h2c at an HTTP/1.1
+/// application — fails at the far end of a request rather than at the call site.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackendOptions {
+    /// How requests are spread across the endpoints.
+    pub policy: LbPolicy,
+    /// Which protocol the proxy dials the endpoints with.
+    pub protocol: BackendProtocol,
+}
+
+struct BackendDraft {
+    name: Box<str>,
+    options: BackendOptions,
+    endpoints: Vec<Endpoint>,
+}
+
 struct RouteDraft {
     slot: HostSlot,
     path: Box<str>,
@@ -260,7 +280,7 @@ pub struct RouteTableBuilder {
     generation: u64,
     previous: Option<Arc<BackendStats>>,
     previous_routes: Option<Arc<RouteStats>>,
-    backends: Vec<(Box<str>, LbPolicy, Vec<Endpoint>)>,
+    backends: Vec<BackendDraft>,
     backend_ids: FxHashMap<Box<str>, BackendId>,
     routes: Vec<RouteDraft>,
     default_backend: Option<Box<str>>,
@@ -299,7 +319,7 @@ impl RouteTableBuilder {
         self
     }
 
-    /// Registers a backend.
+    /// Registers a backend the proxy will reach over HTTP/1.1.
     ///
     /// An empty endpoint list is allowed: a Service whose pods are all
     /// unready is a normal state during a rollout, and rejecting the whole
@@ -311,6 +331,23 @@ impl RouteTableBuilder {
         policy: LbPolicy,
         endpoints: Vec<Endpoint>,
     ) -> Result<BackendId, BuildError> {
+        self.backend_with(
+            name,
+            endpoints,
+            &BackendOptions {
+                policy,
+                protocol: BackendProtocol::Http1,
+            },
+        )
+    }
+
+    /// Registers a backend, choosing the protocol as well as the policy.
+    pub fn backend_with(
+        &mut self,
+        name: &str,
+        endpoints: Vec<Endpoint>,
+        options: &BackendOptions,
+    ) -> Result<BackendId, BuildError> {
         if self.backend_ids.contains_key(name) {
             return Err(BuildError::DuplicateBackend {
                 name: name.to_owned(),
@@ -319,7 +356,11 @@ impl RouteTableBuilder {
         let id = BackendId(self.backends.len() as u32);
         let name: Box<str> = name.into();
         self.backend_ids.insert(name.clone(), id);
-        self.backends.push((name, policy, endpoints));
+        self.backends.push(BackendDraft {
+            name,
+            options: *options,
+            endpoints,
+        });
         Ok(id)
     }
 
@@ -492,14 +533,27 @@ impl RouteTableBuilder {
         // built from the same ordering the table will use.
         let specs: Vec<(Box<str>, Vec<std::net::SocketAddr>)> = backends
             .iter()
-            .map(|(name, _, eps)| (name.clone(), eps.iter().map(|e| e.addr).collect()))
+            .map(|draft| {
+                (
+                    draft.name.clone(),
+                    draft.endpoints.iter().map(|e| e.addr).collect(),
+                )
+            })
             .collect();
         let stats = Arc::new(BackendStats::rebuild(&specs, previous.as_deref()));
 
         let built_backends: Vec<Backend> = backends
             .into_iter()
             .enumerate()
-            .map(|(i, (name, policy, eps))| Backend::new(name, eps, policy, i as u32))
+            .map(|(i, draft)| {
+                Backend::new(
+                    draft.name,
+                    draft.endpoints,
+                    draft.options.policy,
+                    draft.options.protocol,
+                    i as u32,
+                )
+            })
             .collect();
 
         // Group rules by host, rejecting collisions as we go.
@@ -1127,6 +1181,32 @@ mod tests {
             ),
             Err(BuildError::MirrorBackendMissing { .. })
         ));
+    }
+
+    #[test]
+    fn the_protocol_survives_the_build_and_defaults_to_http1() {
+        let mut b = RouteTableBuilder::new();
+        b.backend_with(
+            "grpc",
+            vec![],
+            &BackendOptions {
+                policy: LbPolicy::RoundRobin,
+                protocol: BackendProtocol::H2c,
+            },
+        )
+        .expect("registers");
+        b.backend("plain", LbPolicy::RoundRobin, vec![])
+            .expect("registers");
+        b.route(Some("example.com"), "/rpc", PathType::Prefix, "grpc")
+            .expect("drafts");
+        b.route(Some("example.com"), "/", PathType::Prefix, "plain")
+            .expect("drafts");
+        let table = b.build().expect("builds");
+
+        let rpc = table.match_request("example.com", "/rpc").expect("matches");
+        assert_eq!(rpc.backend().protocol(), BackendProtocol::H2c);
+        let plain = table.match_request("example.com", "/").expect("matches");
+        assert_eq!(plain.backend().protocol(), BackendProtocol::Http1);
     }
 
     #[test]

@@ -38,6 +38,12 @@ pub const ANNOTATION_CANARY_BY_HEADER_PATTERN: &str =
 /// Cookie that can force a canary decision.
 pub const ANNOTATION_CANARY_BY_COOKIE: &str = "nginx.ingress.kubernetes.io/canary-by-cookie";
 
+/// Protocol the data plane speaks to this Ingress's backends.
+///
+/// Transcribed from ingress-nginx, values included; see
+/// [`BackendProtocolAnnotation`] for which of theirs are honoured.
+pub const ANNOTATION_BACKEND_PROTOCOL: &str = "nginx.ingress.kubernetes.io/backend-protocol";
+
 /// Backend a copy of each sampled request is sent to, as
 /// `namespace/service:port`. Its presence is what turns mirroring on.
 pub const ANNOTATION_MIRROR_BACKEND: &str = "ramjet.dev/mirror-backend";
@@ -212,6 +218,72 @@ impl MirrorAnnotations {
     /// Whether this Ingress asked for mirroring at all.
     pub fn enabled(&self) -> bool {
         self.backend.is_some()
+    }
+}
+
+/// What `backend-protocol` on one Ingress resolved to.
+///
+/// ingress-nginx accepts six values. Two of them mean something this data plane
+/// can do, and the other four name a capability it does not have yet:
+///
+/// | Value | Here |
+/// |---|---|
+/// | `HTTP` | HTTP/1.1 cleartext — the default |
+/// | `GRPC` | h2c with prior knowledge |
+/// | `GRPCS`, `HTTPS` | would need TLS to the upstream, which does not exist |
+/// | `AUTO_HTTP` | would need per-endpoint scheme detection |
+/// | `FCGI` | not an HTTP protocol at all |
+///
+/// The four unsupported values are **reported and then ignored**, leaving the
+/// backend on HTTP/1.1. That combination is deliberate: silently treating
+/// `GRPCS` as `HTTP` would send cleartext at a port expecting TLS with nothing
+/// to explain the connection resets, and refusing to compile the Ingress would
+/// hand one namespace owner a way to take out the table. So the request is
+/// served the way an unannotated one would be, and the warning says exactly
+/// which value was not honoured.
+///
+/// Values are matched **case-insensitively after trimming**, which is what
+/// ingress-nginx does — it uppercases before matching — so `grpc` and ` GRPC `
+/// both work on a cluster being migrated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackendProtocolAnnotation {
+    /// What the data plane will actually speak.
+    pub protocol: ramjet_router::BackendProtocol,
+    /// The value as written, when it named a protocol we do not implement.
+    ///
+    /// `Some` is the reportable case: an operator asked for something specific
+    /// and did not get it. A value we simply cannot parse lands here too, since
+    /// the operator's next action — look at the annotation — is the same.
+    pub unsupported: Option<String>,
+}
+
+impl BackendProtocolAnnotation {
+    /// Reads `backend-protocol` off an object's metadata.
+    pub fn parse(annotations: &BTreeMap<String, String>) -> Self {
+        let Some(raw) = annotations
+            .get(ANNOTATION_BACKEND_PROTOCOL)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        else {
+            return Self::default();
+        };
+
+        // `eq_ignore_ascii_case` rather than allocating an uppercased copy: this
+        // runs once per Ingress per rebuild, and every accepted spelling is
+        // ASCII.
+        if raw.eq_ignore_ascii_case("HTTP") {
+            return Self::default();
+        }
+        if raw.eq_ignore_ascii_case("GRPC") {
+            return BackendProtocolAnnotation {
+                protocol: ramjet_router::BackendProtocol::H2c,
+                unsupported: None,
+            };
+        }
+        BackendProtocolAnnotation {
+            protocol: ramjet_router::BackendProtocol::Http1,
+            unsupported: Some(raw.to_owned()),
+        }
     }
 }
 
@@ -535,6 +607,87 @@ mod tests {
         ]));
         assert!(!m.enabled());
         assert_eq!(m.host, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Backend protocol
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_backend_protocol_annotation_means_http1() {
+        let p = BackendProtocolAnnotation::parse(&ann(&[]));
+        assert_eq!(p.protocol, ramjet_router::BackendProtocol::Http1);
+        assert_eq!(p.unsupported, None);
+    }
+
+    #[test]
+    fn grpc_selects_h2c_however_it_is_spelled() {
+        // ingress-nginx uppercases and trims before matching, so a cluster being
+        // migrated may carry any of these and all of them have to mean the same
+        // thing here.
+        for spelling in ["GRPC", "grpc", "Grpc", "  GRPC  ", "\tgRPC\n"] {
+            let p = BackendProtocolAnnotation::parse(&ann(&[(
+                ANNOTATION_BACKEND_PROTOCOL,
+                spelling,
+            )]));
+            assert_eq!(
+                p.protocol,
+                ramjet_router::BackendProtocol::H2c,
+                "{spelling:?}"
+            );
+            assert_eq!(p.unsupported, None, "{spelling:?}");
+        }
+    }
+
+    #[test]
+    fn http_is_accepted_explicitly_and_is_not_reported() {
+        // Writing the default out is not a mistake, and warning about it would
+        // put noise in the log of every cluster that spells its intent.
+        for spelling in ["HTTP", "http", " Http "] {
+            let p = BackendProtocolAnnotation::parse(&ann(&[(
+                ANNOTATION_BACKEND_PROTOCOL,
+                spelling,
+            )]));
+            assert_eq!(p.protocol, ramjet_router::BackendProtocol::Http1);
+            assert_eq!(p.unsupported, None, "{spelling:?}");
+        }
+    }
+
+    #[test]
+    fn the_protocols_ingress_nginx_has_and_we_do_not_are_named_back() {
+        // Each of these means something specific to somebody migrating, and each
+        // is refused by name rather than quietly becoming HTTP.
+        for value in ["GRPCS", "HTTPS", "AUTO_HTTP", "FCGI"] {
+            let p =
+                BackendProtocolAnnotation::parse(&ann(&[(ANNOTATION_BACKEND_PROTOCOL, value)]));
+            assert_eq!(
+                p.protocol,
+                ramjet_router::BackendProtocol::Http1,
+                "{value} must not change the protocol"
+            );
+            assert_eq!(
+                p.unsupported.as_deref(),
+                Some(value),
+                "{value} must be reported back verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_value_is_reported_rather_than_guessed_at() {
+        let p = BackendProtocolAnnotation::parse(&ann(&[(ANNOTATION_BACKEND_PROTOCOL, "h2c")]));
+        assert_eq!(p.protocol, ramjet_router::BackendProtocol::Http1);
+        // `h2c` is what *we* call it internally, and it is still not one of the
+        // six values ingress-nginx defines. Accepting our own spelling would
+        // make an Ingress that works here and nowhere else.
+        assert_eq!(p.unsupported.as_deref(), Some("h2c"));
+    }
+
+    #[test]
+    fn a_blank_backend_protocol_reads_as_absent() {
+        let p = BackendProtocolAnnotation::parse(&ann(&[(ANNOTATION_BACKEND_PROTOCOL, "   ")]));
+        assert_eq!(p.protocol, ramjet_router::BackendProtocol::Http1);
+        assert_eq!(p.unsupported, None);
     }
 
     // -----------------------------------------------------------------------

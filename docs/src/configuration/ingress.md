@@ -216,7 +216,9 @@ for a reason rather than a TODO:
   plane needs a resolver with TTL handling and re-resolution; pointing at
   whatever the name resolved to at compile time would be a stale-address bug
   waiting for the first failover.
-- **gRPC upstreams answer 502.** Upstream is HTTP/1.1, and gRPC has no HTTP/1.1
-  form. Requests with an `application/grpc` content type are rejected
-  explicitly, naming the limitation, rather than being silently downgraded into
-  something the backend cannot parse.
+- **A gRPC Service answers 502 until you annotate it.** gRPC has no HTTP/1.1
+  form, and a Service is dialled over HTTP/1.1 unless it says otherwise, so a
+  request with an `application/grpc` content type is rejected explicitly rather
+  than downgraded into something the backend cannot parse. The 502 names the fix:
+  [`backend-protocol: GRPC`](./annotations.md#backend-protocol) on the Ingress,
+  after which the Service is dialled over h2c and gRPC works end to end.

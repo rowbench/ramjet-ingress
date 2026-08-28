@@ -67,6 +67,85 @@ metadata:
     nginx.ingress.kubernetes.io/canary-by-header: x-canary
 ```
 
+## Backend protocol
+
+How the data plane talks to the pods behind a Service. Set on the Ingress, and
+it applies to every backend that Ingress's rules point at.
+
+| Annotation | On | Value | Default | Effect |
+|---|---|---|---|---|
+| `nginx.ingress.kubernetes.io/backend-protocol` | Ingress | `HTTP` or `GRPC` | `HTTP` | `GRPC` dials the pods with cleartext HTTP/2 (h2c, prior knowledge). Matched case-insensitively after trimming, as ingress-nginx matches it |
+
+`GRPC` is what makes a gRPC Service work: gRPC is defined in terms of HTTP/2
+streams and trailers and has no HTTP/1.1 form, so without this the request would
+be downgraded into something the backend cannot parse. With it, the whole
+exchange works — unary and streaming, in both directions, with `grpc-status`
+arriving in the trailers where the client expects it. The client may speak
+HTTP/1.1, HTTP/2, or HTTP/3; the version is translated at this hop.
+
+Nothing about it is gRPC-specific. Any Service that speaks h2c — a plain
+HTTP/2 API, a service mesh sidecar — is reached correctly with the same value.
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: GRPC
+```
+
+### The four values ingress-nginx has that this does not
+
+`GRPCS`, `HTTPS`, `AUTO_HTTP` and `FCGI` are **read, reported, and not
+honoured**. The backend stays on HTTP/1.1 and a warning names the value:
+
+```
+default/api [InvalidAnnotation]: `nginx.ingress.kubernetes.io/backend-protocol: GRPCS`
+is not supported; only `HTTP` and `GRPC` are, and this backend stays on HTTP/1.1
+```
+
+`GRPCS` and `HTTPS` need TLS to the upstream, which this data plane does not do
+yet; `AUTO_HTTP` needs per-endpoint scheme detection; `FCGI` is not HTTP.
+Treating any of them as `HTTP` silently would send cleartext at a port expecting
+TLS, with nothing but connection resets to explain it. Refusing to compile the
+Ingress would be worse — one namespace owner could take the table out — so the
+route serves and the warning is the signal.
+
+### What an h2c backend sees
+
+Two things differ from the HTTP/1.1 path, both forced by HTTP/2 itself:
+
+- **No `Host` header.** HTTP/2 carries the authority in the `:authority`
+  pseudo-header, and `:authority` has to name the endpoint because that is what
+  keys the upstream connection pool. Sending a `Host` that disagrees with it is
+  something [RFC 9113 §8.3.1][rfc9113] lets a server treat as malformed. **The
+  client's host name is in `X-Forwarded-Host`**, on this path and the HTTP/1.1
+  one alike.
+- **No protocol upgrades.** `Connection` and `Upgrade` are forbidden in HTTP/2,
+  so a WebSocket handshake is not reconstructed for an h2c backend; it reaches
+  the application as an ordinary request. WebSocket over HTTP/2 (RFC 8441
+  extended CONNECT) is not implemented. Put WebSocket routes on an `HTTP`
+  backend.
+
+[rfc9113]: https://www.rfc-editor.org/rfc/rfc9113#section-8.3.1
+
+### One Service port is one backend
+
+A backend is a Service port, however many Ingresses point at it, so two
+Ingresses cannot give the same pods two protocols. If they try, the first claim
+in route order wins and the other is reported:
+
+```
+default/b [BackendProtocolConflict]: backend default/web:80 is already registered
+as `h2c` by another Ingress; this Ingress asked for `http` and was not honoured
+```
+
+Split the Service, or annotate both the same way.
+
+### Not on the uring engine
+
+`--engine uring` dials HTTP/1.1 only. A route whose backend is `GRPC` answers
+`502` there, naming the engine, rather than being downgraded — see
+[Engines](../operations/engines.md).
+
 ## Traffic mirroring
 
 `ramjet.dev` prefix: there is no ingress-nginx spelling of this. Set these on
