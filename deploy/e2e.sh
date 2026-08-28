@@ -118,7 +118,11 @@ done
 # ------------------------------------------------------------------- build ---
 
 step "Building $IMAGE"
-docker build -t "$IMAGE" "$REPO_ROOT"
+# The build context is the *parent* directory, not this repository. The
+# workspace's ramjet-engine crate depends on the `ramjet` runtime from the
+# enhance-socket sibling checkout by path, so the Dockerfile copies both trees
+# in and a context rooted here cannot see the second one.
+docker build -f "$REPO_ROOT/Dockerfile" -t "$IMAGE" "$REPO_ROOT/.."
 SIZE="$(docker image inspect "$IMAGE" --format '{{.Size}}' | awk '{printf "%.1f MB", $1/1024/1024}')"
 note "image size: $SIZE"
 
