@@ -21,6 +21,17 @@
 set -euo pipefail
 
 CONTEXT="${CONTEXT:-docker-desktop}"
+
+# Which data plane the release runs. `ENGINE=uring deploy/e2e.sh` puts the whole
+# suite through the reactor engine instead of hyper.
+#
+# Worth doing, and not only for coverage: whether io_uring_setup is permitted
+# inside a kubelet's containers depends on the node image, the container
+# runtime, and the pod's seccomp profile, and none of those is knowable from
+# here. With `uring` the replica falls back to hyper if the answer is no, and
+# the run below reports which engine actually served rather than assuming. That
+# report is the result.
+ENGINE="${ENGINE:-hyper}"
 SYS_NS="${SYS_NS:-ramjet-e2e-system}"
 APP_NS="${APP_NS:-ramjet-e2e}"
 RELEASE="${RELEASE:-ramjet-e2e}"
@@ -166,6 +177,7 @@ H upgrade --install "$RELEASE" "$CHART" \
   --set image.tag="${IMAGE##*:}" \
   --set image.pullPolicy="$PULL_POLICY" \
   --set controller.logLevel="info,kube=warn" \
+  --set engine="$ENGINE" \
   --set-string controller.publishAddress="127.0.0.1" \
   --wait --timeout 3m
 
@@ -694,10 +706,40 @@ else
   note "no CanaryStepped Event found; this is a soft check (Events need RBAC and are best-effort)"
 fi
 
+# 12. Which engine actually served all of the above.
+#
+#     Asked rather than assumed. `--engine uring` falls back to hyper where
+#     io_uring_setup is not permitted, and whether it is inside this cluster's
+#     containers depends on the node image, the container runtime and the pod's
+#     seccomp profile. A suite that passed without saying which data plane ran
+#     it would be reporting half a result.
+step "Which engine served"
+
+POD="$(K -n "$SYS_NS" get pods -l app.kubernetes.io/name=ramjet-ingress \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+LOG="$(K -n "$SYS_NS" logs "$POD" --tail=200 2>/dev/null || true)"
+
+if grep -q "falling back to the hyper engine" <<<"$LOG"; then
+  # `|| true` on both halves: under `set -o pipefail` a grep that matches
+  # nothing fails the pipeline and takes the script with it — which is how the
+  # first version of this block killed the run at exactly the moment it had
+  # something to report.
+  REASON="$(grep -o 'falling back.*' <<<"$LOG" | head -1 || true)"
+  note "requested engine '$ENGINE'; the reactor would not start and it fell back"
+  note "  $REASON"
+  SERVED="hyper (fell back from $ENGINE)"
+elif grep -qE 'engine[= ]+uring' <<<"$LOG"; then
+  SERVED="uring"
+else
+  SERVED="hyper"
+fi
+note "served by: $SERVED"
+
 # ----------------------------------------------------------------- summary ---
 
 step "Summary"
 printf '%s\n' "${RESULTS[@]}"
-printf '\n%d passed, %d failed. Image %s (%s).\n' "$PASSES" "$FAILURES" "$IMAGE" "$SIZE"
+printf '\n%d passed, %d failed. Image %s (%s). Engine requested %s, served %s.\n' \
+  "$PASSES" "$FAILURES" "$IMAGE" "$SIZE" "$ENGINE" "$SERVED"
 
 (( FAILURES == 0 )) || exit 1

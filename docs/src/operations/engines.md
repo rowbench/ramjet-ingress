@@ -129,6 +129,31 @@ $ kubectl logs -l app.kubernetes.io/name=ramjet-ingress --tail=20 | head
 ramjet-ingressd 0.1.0 — engine uring, 3 backend(s), 6 endpoint(s), 4 route(s)
 ```
 
+A replica that fell back says so on the line above that one.
+
+### One cluster where it does fall back
+
+Docker Desktop's Kubernetes, measured rather than assumed. `deploy/e2e.sh` was
+run against it with `ENGINE=uring`, and the pod reported:
+
+```text
+WARN the ramjet reactor will not start on this host; falling back to the hyper
+     engine error=Operation not permitted (os error 1) requested="uring"
+     serving="hyper"
+```
+
+`io_uring_setup` returns `EPERM` inside that kubelet's containers. The whole
+suite then passed on the hyper engine — routing, canary split, TLS with SNI,
+per-route stats, mirroring, auto-promotion — which is the outcome the fallback
+exists to produce: a replica that serves rather than one that crash-loops
+because of a syscall policy nobody set deliberately.
+
+The same syscall is permitted in the *plain Docker* daemon on the same machine
+once the seccomp profile allows it, which is how
+[`bench/engine/`](https://github.com/rowbench/ramjet-ingress/blob/main/bench/engine/RESULTS.md)
+measures the reactor at all. The difference is the pod's seccomp profile, not
+the kernel — so on a cluster where you control that profile, `uring` will run.
+
 ## Mirroring and the request body
 
 Both engines mirror. They differ in when the copy is taken, and the uring
