@@ -17,7 +17,8 @@ use regex::{Regex, RegexBuilder};
 use crate::backend::{Backend, BackendId, Endpoint, LbPolicy};
 use crate::canary::{CanarySpec, HeaderSpec};
 use crate::host::{FxHashMap, FxHashSet, MAX_HOST_LEN};
-use crate::path::{PathRule, PathType};
+use crate::mirror::{MirrorSpec, MIRROR_PERCENT_TOTAL};
+use crate::path::{PathRule, PathType, RuleExtras};
 use crate::stats::{BackendStats, RouteIdentity, RouteStats};
 use crate::table::{RouteTable, VirtualHost};
 use crate::tls::{CertifiedKeyHandle, SniMap};
@@ -131,6 +132,25 @@ pub enum BuildError {
         /// The configured total.
         total: u32,
     },
+
+    /// A mirror percentage was above 100.
+    ///
+    /// Unlike a canary weight there is no denominator to raise: a mirror
+    /// duplicates rather than splits, so "150% of requests" names nothing.
+    #[error("mirror percent {percent} is above 100")]
+    MirrorPercent {
+        /// The configured percentage.
+        percent: u32,
+    },
+
+    /// A mirror named no backend.
+    #[error("mirror on `{host}{path}` names no backend")]
+    MirrorBackendMissing {
+        /// The host the mirror is attached to.
+        host: String,
+        /// The path the mirror is attached to.
+        path: String,
+    },
 }
 
 /// The ingress-nginx canary annotations for one route.
@@ -153,6 +173,41 @@ pub struct CanaryRules<'a> {
     pub weight: u32,
     /// `canary-weight-total`; `0` means the default of 100.
     pub weight_total: u32,
+}
+
+/// The mirror configuration for one route.
+///
+/// Field names mirror the annotation suffixes, the same way [`CanaryRules`]
+/// does, so the controller's translation layer stays a transcription.
+///
+/// `percent: 0` is legal and means "mirror nothing": an operator turning a
+/// mirror off should not have to delete the annotation that says where it
+/// points, and a `Default` that silently mirrored everything would be the wrong
+/// way round for a feature that duplicates load.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MirrorRules<'a> {
+    /// Backend the copy is sent to. Required.
+    pub backend: &'a str,
+    /// Share of matching requests copied, out of 100.
+    pub percent: u32,
+    /// `Host` header sent instead of the client's.
+    pub host: Option<&'a str>,
+}
+
+/// The optional behaviour attached to one route.
+///
+/// Exists so that adding a third kind of per-route behaviour does not double
+/// the number of `*_route` methods on the builder again. [`route`](
+/// RouteTableBuilder::route) and [`canary_route`](
+/// RouteTableBuilder::canary_route) are the two shapes that were already
+/// common enough to keep their own names; everything else goes through
+/// [`route_with`](RouteTableBuilder::route_with).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RouteOptions<'a> {
+    /// A weighted second backend, per the ingress-nginx canary annotations.
+    pub canary: Option<CanaryRules<'a>>,
+    /// A fire-and-forget copy of the request.
+    pub mirror: Option<MirrorRules<'a>>,
 }
 
 /// Which bucket a rule belongs to.
@@ -183,6 +238,12 @@ struct CanaryDraft {
     weight_total: u32,
 }
 
+struct MirrorDraft {
+    backend: Box<str>,
+    percent: u32,
+    host: Option<Box<str>>,
+}
+
 struct RouteDraft {
     slot: HostSlot,
     path: Box<str>,
@@ -190,6 +251,7 @@ struct RouteDraft {
     regex: Option<Box<Regex>>,
     backend: Box<str>,
     canary: Option<CanaryDraft>,
+    mirror: Option<MirrorDraft>,
 }
 
 /// Builds a [`RouteTable`].
@@ -283,9 +345,7 @@ impl RouteTableBuilder {
         path_type: PathType,
         backend: &str,
     ) -> Result<(), BuildError> {
-        let draft = self.draft(host, path, path_type, backend)?;
-        self.routes.push(draft);
-        Ok(())
+        self.route_with(host, path, path_type, backend, &RouteOptions::default())
     }
 
     /// Adds a route with a canary attached.
@@ -301,57 +361,39 @@ impl RouteTableBuilder {
         backend: &str,
         canary: &CanaryRules<'_>,
     ) -> Result<(), BuildError> {
+        self.route_with(
+            host,
+            path,
+            path_type,
+            backend,
+            &RouteOptions {
+                canary: Some(*canary),
+                mirror: None,
+            },
+        )
+    }
+
+    /// Adds a route carrying any combination of the optional behaviours.
+    ///
+    /// The canary and the mirror are independent: a request diverted to the
+    /// canary is mirrored on exactly the same terms as a stable one, because
+    /// the mirror belongs to the rule rather than to where the rule happened to
+    /// send this request.
+    pub fn route_with(
+        &mut self,
+        host: Option<&str>,
+        path: &str,
+        path_type: PathType,
+        backend: &str,
+        options: &RouteOptions<'_>,
+    ) -> Result<(), BuildError> {
         let mut draft = self.draft(host, path, path_type, backend)?;
-
-        if canary.header_value.is_some() && canary.header_pattern.is_some() {
-            return Err(BuildError::CanaryHeaderConflict {
-                host: draft.slot.display().to_owned(),
-                path: path.to_owned(),
-            });
+        if let Some(canary) = &options.canary {
+            draft.canary = Some(canary_draft(canary, &draft.slot, path)?);
         }
-
-        let weight_total = if canary.weight_total == 0 {
-            DEFAULT_WEIGHT_TOTAL
-        } else {
-            canary.weight_total
-        };
-        if canary.weight > weight_total {
-            return Err(BuildError::CanaryWeight {
-                weight: canary.weight,
-                total: weight_total,
-            });
+        if let Some(mirror) = &options.mirror {
+            draft.mirror = Some(mirror_draft(mirror, &draft.slot, path)?);
         }
-
-        let header = match canary.header {
-            Some(name) => {
-                let pattern = match canary.header_pattern {
-                    // Header patterns are full-value matches in ingress-nginx,
-                    // so anchor both ends. The non-capturing group keeps a
-                    // top-level alternation from escaping the anchors.
-                    Some(p) => Some(Box::new(compile(&format!("^(?:{p})$"), false).map_err(
-                        |source| BuildError::BadCanaryPattern {
-                            pattern: p.to_owned(),
-                            source,
-                        },
-                    )?)),
-                    None => None,
-                };
-                Some(HeaderSpec {
-                    name: name.into(),
-                    value: canary.header_value.map(Into::into),
-                    pattern,
-                })
-            }
-            None => None,
-        };
-
-        draft.canary = Some(CanaryDraft {
-            backend: canary.backend.into(),
-            header,
-            cookie: canary.cookie.map(Into::into),
-            weight: canary.weight,
-            weight_total,
-        });
         self.routes.push(draft);
         Ok(())
     }
@@ -427,6 +469,7 @@ impl RouteTableBuilder {
             regex,
             backend: backend.into(),
             canary: None,
+            mirror: None,
         })
     }
 
@@ -480,27 +523,38 @@ impl RouteTableBuilder {
                 regex,
                 backend,
                 canary,
+                mirror,
             } = draft;
 
             let backend_id = resolve_backend(&backend_ids, &backend, &slot, &path)?;
             let canary = match canary {
                 Some(c) => {
                     let id = resolve_backend(&backend_ids, &c.backend, &slot, &path)?;
-                    Some(Box::new(CanarySpec::new(
+                    Some(CanarySpec::new(
                         id,
                         c.header,
                         c.cookie,
                         c.weight,
                         c.weight_total,
-                    )))
+                    ))
+                }
+                None => None,
+            };
+            let mirror = match mirror {
+                Some(m) => {
+                    let id = resolve_backend(&backend_ids, &m.backend, &slot, &path)?;
+                    Some(MirrorSpec::new(id, m.percent, m.host))
                 }
                 None => None,
             };
 
-            buckets
-                .entry(slot)
-                .or_default()
-                .push(PathRule::new(path, path_type, regex, backend_id, canary));
+            buckets.entry(slot).or_default().push(PathRule::new(
+                path,
+                path_type,
+                regex,
+                backend_id,
+                RuleExtras::build(canary, mirror),
+            ));
         }
 
         // Bake the precedence order in, so matching never has to compare
@@ -566,6 +620,87 @@ impl RouteTableBuilder {
             generation,
         ))
     }
+}
+
+/// Validates the canary annotations for one route and compiles its header rule.
+fn canary_draft(
+    canary: &CanaryRules<'_>,
+    slot: &HostSlot,
+    path: &str,
+) -> Result<CanaryDraft, BuildError> {
+    if canary.header_value.is_some() && canary.header_pattern.is_some() {
+        return Err(BuildError::CanaryHeaderConflict {
+            host: slot.display().to_owned(),
+            path: path.to_owned(),
+        });
+    }
+
+    let weight_total = if canary.weight_total == 0 {
+        DEFAULT_WEIGHT_TOTAL
+    } else {
+        canary.weight_total
+    };
+    if canary.weight > weight_total {
+        return Err(BuildError::CanaryWeight {
+            weight: canary.weight,
+            total: weight_total,
+        });
+    }
+
+    let header = match canary.header {
+        Some(name) => {
+            let pattern = match canary.header_pattern {
+                // Header patterns are full-value matches in ingress-nginx,
+                // so anchor both ends. The non-capturing group keeps a
+                // top-level alternation from escaping the anchors.
+                Some(p) => Some(Box::new(compile(&format!("^(?:{p})$"), false).map_err(
+                    |source| BuildError::BadCanaryPattern {
+                        pattern: p.to_owned(),
+                        source,
+                    },
+                )?)),
+                None => None,
+            };
+            Some(HeaderSpec {
+                name: name.into(),
+                value: canary.header_value.map(Into::into),
+                pattern,
+            })
+        }
+        None => None,
+    };
+
+    Ok(CanaryDraft {
+        backend: canary.backend.into(),
+        header,
+        cookie: canary.cookie.map(Into::into),
+        weight: canary.weight,
+        weight_total,
+    })
+}
+
+/// Validates the mirror annotations for one route.
+fn mirror_draft(
+    mirror: &MirrorRules<'_>,
+    slot: &HostSlot,
+    path: &str,
+) -> Result<MirrorDraft, BuildError> {
+    if mirror.backend.is_empty() {
+        return Err(BuildError::MirrorBackendMissing {
+            host: slot.display().to_owned(),
+            path: path.to_owned(),
+        });
+    }
+    if mirror.percent > MIRROR_PERCENT_TOTAL {
+        return Err(BuildError::MirrorPercent {
+            percent: mirror.percent,
+        });
+    }
+    Ok(MirrorDraft {
+        backend: mirror.backend.into(),
+        percent: mirror.percent,
+        host: mirror.host.map(Into::into),
+    })
 }
 
 /// Resolves a backend name, building the (allocating) referrer string only if
@@ -842,6 +977,167 @@ mod tests {
             .and_then(|m| m.canary())
             .map(|c| c.weight_total());
         assert_eq!(spec, Some(100));
+    }
+
+    /// A builder with `prod` and `shadow` registered, which is what every
+    /// mirror test needs before it can say anything about mirroring.
+    fn with_two_backends() -> RouteTableBuilder {
+        let mut b = RouteTableBuilder::new();
+        b.backend("prod", LbPolicy::RoundRobin, vec![])
+            .expect("registers");
+        b.backend("shadow", LbPolicy::RoundRobin, vec![])
+            .expect("registers");
+        b
+    }
+
+    #[test]
+    fn a_mirror_is_attached_to_its_route() {
+        let mut b = with_two_backends();
+        b.route_with(
+            Some("example.com"),
+            "/",
+            PathType::Prefix,
+            "prod",
+            &RouteOptions {
+                mirror: Some(MirrorRules {
+                    backend: "shadow",
+                    percent: 25,
+                    host: Some("shadow.example.com"),
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("drafts");
+        let table = b.build().expect("builds");
+
+        let matched = table.match_request("example.com", "/x").expect("matches");
+        let mirror = matched.mirror().expect("a mirror");
+        assert_eq!(mirror.percent(), 25);
+        assert_eq!(mirror.host(), Some("shadow.example.com"));
+        assert_eq!(
+            table.backend(mirror.backend()).map(Backend::name),
+            Some("shadow")
+        );
+        assert_eq!(
+            matched.backend().name(),
+            "prod",
+            "a mirror must not change where the request itself goes"
+        );
+    }
+
+    #[test]
+    fn a_route_can_carry_a_canary_and_a_mirror_at_once() {
+        // They are independent by design: the mirror belongs to the rule, not
+        // to whichever backend the canary sent this request to.
+        let mut b = with_two_backends();
+        b.backend("next", LbPolicy::RoundRobin, vec![])
+            .expect("registers");
+        b.route_with(
+            Some("example.com"),
+            "/",
+            PathType::Prefix,
+            "prod",
+            &RouteOptions {
+                canary: Some(CanaryRules {
+                    backend: "next",
+                    weight: 10,
+                    ..Default::default()
+                }),
+                mirror: Some(MirrorRules {
+                    backend: "shadow",
+                    percent: 100,
+                    host: None,
+                }),
+            },
+        )
+        .expect("drafts");
+        let table = b.build().expect("builds");
+
+        let matched = table.match_request("example.com", "/").expect("matches");
+        assert_eq!(matched.canary().map(|c| c.weight()), Some(10));
+        assert_eq!(matched.mirror().map(|m| m.percent()), Some(100));
+    }
+
+    #[test]
+    fn a_mirror_naming_an_unregistered_backend_is_rejected() {
+        let mut b = RouteTableBuilder::new();
+        b.backend("prod", LbPolicy::RoundRobin, vec![])
+            .expect("registers");
+        b.route_with(
+            Some("example.com"),
+            "/",
+            PathType::Prefix,
+            "prod",
+            &RouteOptions {
+                mirror: Some(MirrorRules {
+                    backend: "ghost",
+                    percent: 100,
+                    host: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("drafts");
+        match b.build() {
+            Err(BuildError::UnknownBackend { name, referrer }) => {
+                assert_eq!(name, "ghost");
+                assert_eq!(referrer, "example.com/");
+            }
+            other => panic!("expected UnknownBackend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mirror_percent_above_a_hundred_is_rejected() {
+        // There is no denominator to raise, the way `canary-weight-total`
+        // raises a canary's: a mirror duplicates, so 150% names nothing.
+        let mut b = with_two_backends();
+        assert!(matches!(
+            b.route_with(
+                Some("example.com"),
+                "/",
+                PathType::Prefix,
+                "prod",
+                &RouteOptions {
+                    mirror: Some(MirrorRules {
+                        backend: "shadow",
+                        percent: 150,
+                        host: None,
+                    }),
+                    ..Default::default()
+                },
+            ),
+            Err(BuildError::MirrorPercent { percent: 150 })
+        ));
+    }
+
+    #[test]
+    fn a_mirror_with_no_backend_is_rejected() {
+        let mut b = with_two_backends();
+        assert!(matches!(
+            b.route_with(
+                Some("example.com"),
+                "/",
+                PathType::Prefix,
+                "prod",
+                &RouteOptions {
+                    mirror: Some(MirrorRules::default()),
+                    ..Default::default()
+                },
+            ),
+            Err(BuildError::MirrorBackendMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn a_plain_route_carries_neither() {
+        let mut b = with_two_backends();
+        b.route(Some("example.com"), "/", PathType::Prefix, "prod")
+            .expect("drafts");
+        let table = b.build().expect("builds");
+        let matched = table.match_request("example.com", "/").expect("matches");
+        assert!(matched.canary().is_none());
+        assert!(matched.mirror().is_none());
     }
 
     #[test]

@@ -7,6 +7,7 @@
 
 use crate::backend::BackendId;
 use crate::canary::CanarySpec;
+use crate::mirror::MirrorSpec;
 use regex::Regex;
 
 /// How a rule's path is compared against the request path.
@@ -79,6 +80,34 @@ pub(crate) fn prefix_matches(rule_path: &str, match_len: usize, path: &str) -> b
     }
 }
 
+/// The optional behaviour a rule can carry, behind one pointer.
+///
+/// A canary and a mirror are both rare and both boxed for the same reason: the
+/// rules of a host are scanned linearly, so [`PathRule`]'s size decides how
+/// many of them arrive in a cache line together. What makes this *one* box
+/// rather than two is that the rarity compounds — giving every rule in a
+/// ten-thousand route table a second null pointer, to describe the handful that
+/// have a mirror, is the wrong side of that trade. A rule with neither pays
+/// nothing; a rule with either pays one allocation it was going to make anyway.
+pub(crate) struct RuleExtras {
+    pub canary: Option<CanarySpec>,
+    pub mirror: Option<MirrorSpec>,
+}
+
+impl RuleExtras {
+    /// `None` when neither half is present, so a plain rule keeps a null
+    /// pointer rather than an allocation holding two `None`s.
+    pub(crate) fn build(
+        canary: Option<CanarySpec>,
+        mirror: Option<MirrorSpec>,
+    ) -> Option<Box<Self>> {
+        if canary.is_none() && mirror.is_none() {
+            return None;
+        }
+        Some(Box::new(RuleExtras { canary, mirror }))
+    }
+}
+
 /// One path rule inside a [`VirtualHost`](crate::VirtualHost).
 ///
 /// Rules are stored pre-sorted into their final precedence order, so matching
@@ -97,9 +126,8 @@ pub struct PathRule {
     /// after the precedence sort, because that is the order the rules end up
     /// in; counters survive a rebuild by identity, not by index.
     stats_index: u32,
-    /// Boxed because canaries are rare and this field would otherwise widen
-    /// every rule in the table.
-    canary: Option<Box<CanarySpec>>,
+    /// The canary and the mirror, if either is configured. See [`RuleExtras`].
+    extras: Option<Box<RuleExtras>>,
 }
 
 impl PathRule {
@@ -108,7 +136,7 @@ impl PathRule {
         path_type: PathType,
         regex: Option<Box<Regex>>,
         backend: BackendId,
-        canary: Option<Box<CanarySpec>>,
+        extras: Option<Box<RuleExtras>>,
     ) -> Self {
         let match_len = match path_type {
             PathType::Prefix => prefix_match_len(&path) as u32,
@@ -121,7 +149,7 @@ impl PathRule {
             regex,
             backend,
             stats_index: 0,
-            canary,
+            extras,
         }
     }
 
@@ -172,7 +200,12 @@ impl PathRule {
 
     /// The canary attached to this route, if any.
     pub fn canary(&self) -> Option<&CanarySpec> {
-        self.canary.as_deref()
+        self.extras.as_ref()?.canary.as_ref()
+    }
+
+    /// The mirror attached to this route, if any.
+    pub fn mirror(&self) -> Option<&MirrorSpec> {
+        self.extras.as_ref()?.mirror.as_ref()
     }
 }
 
@@ -182,7 +215,8 @@ impl std::fmt::Debug for PathRule {
             .field("path", &self.path)
             .field("path_type", &self.path_type)
             .field("backend", &self.backend)
-            .field("canary", &self.canary.is_some())
+            .field("canary", &self.canary().is_some())
+            .field("mirror", &self.mirror().is_some())
             .finish()
     }
 }

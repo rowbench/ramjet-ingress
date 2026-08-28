@@ -66,14 +66,16 @@ mod backend;
 mod builder;
 mod canary;
 mod host;
+mod mirror;
 mod path;
 mod stats;
 mod table;
 mod tls;
 
 pub use backend::{select_endpoint, Backend, BackendId, Endpoint, LbPolicy};
-pub use builder::{BuildError, CanaryRules, RouteTableBuilder};
+pub use builder::{BuildError, CanaryRules, MirrorRules, RouteOptions, RouteTableBuilder};
 pub use canary::CanarySpec;
+pub use mirror::{MirrorSpec, MIRROR_PERCENT_TOTAL};
 pub use path::{PathRule, PathType};
 pub use stats::{
     BackendSlot, BackendStats, InflightGuard, RouteCounters, RouteIdentity, RouteSlot, RouteStats,

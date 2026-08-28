@@ -7,6 +7,7 @@ use arc_swap::{ArcSwap, Guard};
 use crate::backend::{Backend, BackendId};
 use crate::canary::CanarySpec;
 use crate::host::{self, FxHashMap, Scan, MAX_HOST_LEN};
+use crate::mirror::MirrorSpec;
 use crate::path::PathRule;
 use crate::stats::{BackendStats, RouteStats};
 use crate::tls::SniMap;
@@ -109,6 +110,14 @@ impl<'t> MatchResult<'t> {
     /// The canary attached to the matched rule, if any.
     pub fn canary(&self) -> Option<&'t CanarySpec> {
         self.rule?.canary()
+    }
+
+    /// The mirror attached to the matched rule, if any.
+    ///
+    /// `None` for a request the default backend answered: a mirror belongs to a
+    /// rule, and there is no rule to have configured one.
+    pub fn mirror(&self) -> Option<&'t MirrorSpec> {
+        self.rule?.mirror()
     }
 
     /// How the host was resolved.

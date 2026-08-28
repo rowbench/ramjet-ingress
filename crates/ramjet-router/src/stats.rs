@@ -237,12 +237,66 @@ impl RouteTotals {
     pub fn upstream_latency_ms(&self) -> f64 {
         self.upstream_latency_micros as f64 / 1000.0
     }
+
+    /// Field-wise `self - other`, saturating at zero.
+    ///
+    /// Two callers, one shape. Subtracting an earlier reading gives the traffic
+    /// in a window; subtracting the canary block from the totals gives the
+    /// stable share, because the canary block is a subset — see [`RouteSlot`].
+    ///
+    /// Saturating rather than wrapping because neither subtraction is
+    /// guaranteed monotonic in practice: the two blocks are read at slightly
+    /// different instants and a rebuild can swap the slab in between, so a
+    /// canary count one ahead of the total it was taken from is a normal race
+    /// and must read as zero rather than as eighteen quintillion.
+    pub fn saturating_sub(&self, other: &RouteTotals) -> RouteTotals {
+        RouteTotals {
+            requests: self.requests.saturating_sub(other.requests),
+            errors_5xx: self.errors_5xx.saturating_sub(other.errors_5xx),
+            upstream_latency_micros: self
+                .upstream_latency_micros
+                .saturating_sub(other.upstream_latency_micros),
+            upstream_latency_count: self
+                .upstream_latency_count
+                .saturating_sub(other.upstream_latency_count),
+        }
+    }
+
+    /// 5xx as a percentage of requests, or `None` with no requests to divide by.
+    pub fn error_percent(&self) -> Option<f64> {
+        (self.requests > 0).then(|| self.errors_5xx as f64 * 100.0 / self.requests as f64)
+    }
+
+    /// Mean upstream latency in milliseconds, or `None` with no observations.
+    ///
+    /// The count can be zero while `requests` is not: a request answered with a
+    /// locally generated 503 never reached an upstream and so has no latency to
+    /// average.
+    pub fn avg_latency_ms(&self) -> Option<f64> {
+        (self.upstream_latency_count > 0)
+            .then(|| self.upstream_latency_ms() / self.upstream_latency_count as f64)
+    }
 }
 
-/// Every shard of one route's counters.
+/// Every shard of one route's counters, twice.
+///
+/// # Why the canary block is a subset and not a sibling
+///
+/// A canary-diverted request is recorded in **both** blocks: the route's
+/// totals stay the route's totals, and the canary block says how much of that
+/// was the new backend. The other arrangement — stable in one, canary in the
+/// other — would make every existing graph of a route's request rate step down
+/// the moment somebody started a canary, which is precisely the graph an
+/// operator is watching at that moment. Stable traffic is `totals - canary`,
+/// and the one subtraction is a much better price than a discontinuity in a
+/// dashboard.
+///
+/// The cost is on the diverted request only: four more relaxed adds, to a
+/// separate 128-byte block, and nothing at all for a route with no canary.
 #[derive(Debug, Default)]
 pub struct RouteSlot {
     shards: [RouteCounters; ROUTE_STAT_SHARDS],
+    canary_shards: [RouteCounters; ROUTE_STAT_SHARDS],
 }
 
 impl RouteSlot {
@@ -258,19 +312,34 @@ impl RouteSlot {
         self.shards.get(index).unwrap_or(&self.shards[0])
     }
 
+    /// The block a serving runtime writes to *in addition* when the canary took
+    /// the request.
+    #[inline]
+    pub fn canary_shard(&self, shard: usize) -> &RouteCounters {
+        let index = shard % ROUTE_STAT_SHARDS;
+        self.canary_shards.get(index).unwrap_or(&self.canary_shards[0])
+    }
+
     /// Every shard summed, for a scrape.
     pub fn totals(&self) -> RouteTotals {
-        let mut totals = RouteTotals::default();
-        for counters in &self.shards {
-            totals.requests += counters.requests.load(Ordering::Relaxed);
-            totals.errors_5xx += counters.errors_5xx.load(Ordering::Relaxed);
-            totals.upstream_latency_micros +=
-                counters.upstream_latency_micros.load(Ordering::Relaxed);
-            totals.upstream_latency_count +=
-                counters.upstream_latency_count.load(Ordering::Relaxed);
-        }
-        totals
+        sum(&self.shards)
     }
+
+    /// The canary-diverted share of [`totals`](Self::totals).
+    pub fn canary_totals(&self) -> RouteTotals {
+        sum(&self.canary_shards)
+    }
+}
+
+fn sum(shards: &[RouteCounters; ROUTE_STAT_SHARDS]) -> RouteTotals {
+    let mut totals = RouteTotals::default();
+    for counters in shards {
+        totals.requests += counters.requests.load(Ordering::Relaxed);
+        totals.errors_5xx += counters.errors_5xx.load(Ordering::Relaxed);
+        totals.upstream_latency_micros += counters.upstream_latency_micros.load(Ordering::Relaxed);
+        totals.upstream_latency_count += counters.upstream_latency_count.load(Ordering::Relaxed);
+    }
+    totals
 }
 
 /// What makes a route the same route across a rebuild.
@@ -485,17 +554,124 @@ mod tests {
     }
 
     #[test]
+    fn a_canary_request_lands_in_both_blocks() {
+        // The property the split is built on: the route's totals stay the
+        // route's totals, and the canary block says how much of that was the
+        // new backend.
+        let stats = RouteStats::rebuild(&[route("example.com", "/", "api")], None);
+        let slot = stats.slot(0).expect("slot");
+
+        slot.shard(0).record_response(200);
+
+        slot.shard(0).record_response(500);
+        slot.canary_shard(0).record_response(500);
+
+        assert_eq!(slot.totals().requests, 2);
+        assert_eq!(slot.totals().errors_5xx, 1);
+        assert_eq!(slot.canary_totals().requests, 1);
+        assert_eq!(slot.canary_totals().errors_5xx, 1);
+
+        let stable = slot.totals().saturating_sub(&slot.canary_totals());
+        assert_eq!(stable.requests, 1);
+        assert_eq!(stable.errors_5xx, 0, "the 5xx was the canary's");
+    }
+
+    #[test]
+    fn a_route_with_no_canary_has_an_empty_canary_block() {
+        let stats = RouteStats::rebuild(&[route("example.com", "/", "api")], None);
+        let slot = stats.slot(0).expect("slot");
+        for shard in 0..ROUTE_STAT_SHARDS {
+            slot.shard(shard).record_response(200);
+        }
+        assert_eq!(slot.totals().requests, ROUTE_STAT_SHARDS as u64);
+        assert_eq!(slot.canary_totals(), RouteTotals::default());
+    }
+
+    #[test]
+    fn canary_shards_are_summed_and_wrap_like_the_others() {
+        let stats = RouteStats::rebuild(&[route("example.com", "/", "api")], None);
+        let slot = stats.slot(0).expect("slot");
+        for shard in 0..ROUTE_STAT_SHARDS {
+            slot.canary_shard(shard).record_response(200);
+            slot.canary_shard(shard)
+                .record_upstream_latency(Duration::from_millis(4));
+        }
+        assert!(std::ptr::eq(
+            slot.canary_shard(0),
+            slot.canary_shard(ROUTE_STAT_SHARDS)
+        ));
+
+        let totals = slot.canary_totals();
+        assert_eq!(totals.requests, ROUTE_STAT_SHARDS as u64);
+        assert_eq!(totals.upstream_latency_count, ROUTE_STAT_SHARDS as u64);
+        assert_eq!(totals.avg_latency_ms(), Some(4.0));
+    }
+
+    #[test]
+    fn the_canary_block_survives_a_rebuild_with_its_route() {
+        let identities = [route("example.com", "/", "api")];
+        let first = RouteStats::rebuild(&identities, None);
+        first.slot(0).expect("slot").canary_shard(0).record_response(503);
+
+        let second = RouteStats::rebuild(&identities, Some(&first));
+        assert_eq!(second.slot(0).expect("slot").canary_totals().errors_5xx, 1);
+    }
+
+    #[test]
+    fn a_subtraction_that_would_go_negative_reads_as_zero() {
+        // The two blocks are read at different instants, so a canary count one
+        // ahead of the total it came from is a normal race.
+        let totals = RouteTotals {
+            requests: 1,
+            ..RouteTotals::default()
+        };
+        let canary = RouteTotals {
+            requests: 3,
+            errors_5xx: 2,
+            ..RouteTotals::default()
+        };
+        assert_eq!(totals.saturating_sub(&canary), RouteTotals::default());
+    }
+
+    #[test]
+    fn rates_are_none_rather_than_a_division_by_zero() {
+        let empty = RouteTotals::default();
+        assert_eq!(empty.error_percent(), None);
+        assert_eq!(empty.avg_latency_ms(), None);
+
+        let served = RouteTotals {
+            requests: 200,
+            errors_5xx: 3,
+            upstream_latency_micros: 0,
+            // Every request answered locally: there is a rate but no latency.
+            upstream_latency_count: 0,
+        };
+        assert_eq!(served.error_percent(), Some(1.5));
+        assert_eq!(served.avg_latency_ms(), None);
+    }
+
+    #[test]
     fn each_shard_has_its_own_cache_line() {
         // The whole reason the blocks are aligned. If they ever share a line,
         // the hot path is silently paying for coherence traffic again.
         let slot = RouteSlot::default();
-        let first = std::ptr::from_ref(slot.shard(0)) as usize;
-        let second = std::ptr::from_ref(slot.shard(1)) as usize;
-        assert!(
-            second - first >= 128,
-            "shards are {} bytes apart",
-            second - first
-        );
+        for pair in [
+            (slot.shard(0), slot.shard(1)),
+            (slot.canary_shard(0), slot.canary_shard(1)),
+            // The two blocks of one shard are written by the same core on the
+            // same request, but they are still separate lines: sharing one
+            // would put the canary counters back into the line the stable
+            // counters are already contending for across shards.
+            (slot.shard(0), slot.canary_shard(0)),
+        ] {
+            let first = std::ptr::from_ref(pair.0) as usize;
+            let second = std::ptr::from_ref(pair.1) as usize;
+            assert!(
+                second.abs_diff(first) >= 128,
+                "blocks are {} bytes apart",
+                second.abs_diff(first)
+            );
+        }
     }
 
     #[test]
