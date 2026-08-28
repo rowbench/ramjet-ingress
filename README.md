@@ -1,8 +1,15 @@
 # ramjet-ingress
 
+[![docs](https://img.shields.io/badge/docs-rowbench.github.io-blue)](https://rowbench.github.io/ramjet-ingress/)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
+
 A Kubernetes ingress controller with a native Rust data plane. No nginx, no
 config file regeneration, no reload: a configuration change swaps an `Arc`, and
 in-flight connections never notice.
+
+**📖 [Documentation](https://rowbench.github.io/ramjet-ingress/)** — quick start,
+deployment per cloud, the full annotation and flag references, operations
+guides, and the benchmarks with their caveats.
 
 The design and its reasoning are in [ARCHITECTURE.md](ARCHITECTURE.md). This
 file is about running it.
@@ -312,3 +319,16 @@ allowing `exec`, so an empty `docker ps` is not evidence that there is no node
 to load into. Importing rather than pulling is what lets `imagePullPolicy` stay
 `Never`: the assertions then prove the image *this script built* is the one that
 ran, with no path by which the kubelet could quietly substitute a registry copy.
+
+## License
+
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

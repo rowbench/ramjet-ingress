@@ -1,0 +1,27 @@
+[book]
+title = "ramjet-ingress"
+description = "A Kubernetes ingress controller with a native Rust data plane. No nginx, no config regeneration, no reload."
+authors = ["Hamdallah"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/rowbench/ramjet-ingress"
+edit-url-template = "https://github.com/rowbench/ramjet-ingress/edit/main/docs/{path}"
+site-url = "/ramjet-ingress/"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 20
+use-boolean-and = true

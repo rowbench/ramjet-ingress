@@ -2,3 +2,6 @@ target/
 
 # Agent tooling session state, not project content.
 .omc/
+
+# mdBook output. The site is built by CI, not committed.
+docs/book/
