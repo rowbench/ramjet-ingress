@@ -961,6 +961,14 @@ The admin listener never reads a header — Prometheus and the kubelet reach the
 pod directly and speak no PROXY protocol, and requiring it there would take
 `/metrics` and both probes offline the moment the flag was set.
 
+**Both engines read it, with the same parser.**
+`ramjet_proxy::proxy_protocol` is sans-io and incremental, so the uring engine
+unwinds the header inside its own connection state machine — ahead of the TLS
+record layer, in the same order and with the same "required, not optional"
+answer — rather than carrying a second implementation of a trust decision this
+important. Everything above is therefore the whole story whichever `--engine`
+is serving.
+
 ## Two engines
 
 There are two data planes in this binary, and `--engine` picks which one serves.
@@ -1288,14 +1296,6 @@ rewrite, header-mutation, rate-limit, session-affinity, or auth rules, so the
 corresponding `nginx.ingress.kubernetes.io` annotations are not read. Those
 attach to `PathRule` when the proxy can act on them; parsing an annotation the
 data plane ignores is worse than not parsing it, because it looks configured.
-
-**The PROXY protocol is hyper-engine only.** `--engine uring` has no
-implementation of it and refuses `--proxy-protocol` at startup rather than
-ignoring it, because silently attributing every request to the load balancer is
-the one outcome an operator who set the flag would never detect. TODO: the read
-belongs in the reactor's accept path, before the connection is handed to the
-HTTP/1.1 state machine; the parser in `ramjet_proxy::proxy_protocol` is sans-io
-precisely so it can be reused there unchanged.
 
 **An `IngressTLS` entry with no `hosts` is skipped.** The controller cannot read
 a certificate's SANs to work out which names it covers — that would mean parsing
