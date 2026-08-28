@@ -6,6 +6,7 @@ members = [
     "crates/ramjet-proxy",
     "crates/ramjet-controller",
     "crates/ramjet-ingressd",
+    "crates/ramjet-top",
 ]
 
 [workspace.package]
