@@ -557,16 +557,41 @@ fi
 #    been copied to echo-shadow. Two halves are asserted, because either alone
 #    could be true while the feature is broken: the copies actually arrived at
 #    the shadow backend, and none of them cost the client anything.
-MIRRORED="$(awk '/^ramjet_mirrored_total / {print $2}' <<<"$METRICS")"
-MIRROR_FAILED="$(awk '/^ramjet_mirror_failures_total / {print $2}' <<<"$METRICS")"
-MIRROR_DROPPED="$(awk '/^ramjet_mirror_dropped_total / {print $2}' <<<"$METRICS")"
+#
+#    Read fresh rather than from the $METRICS snapshot above, and only once the
+#    queue has drained. `ramjet_mirrored_total` is incremented *after* the
+#    exchange completes — that is what its help text promises, "which accepted
+#    the copy" — while the shadow's access log records on receipt. So while
+#    copies are still in flight the shadow is legitimately ahead of the counter,
+#    and comparing a stale snapshot against a later log read stacks a second
+#    skew on top of that. Settle first, then the two agree.
+mirror_counters() {
+  curl -s -m 5 "http://127.0.0.1:$ADMIN_PORT/metrics" \
+    | awk '/^ramjet_mirrored_total /       {m = $2}
+           /^ramjet_mirror_failures_total /{f = $2}
+           /^ramjet_mirror_dropped_total / {d = $2}
+           END {print m+0, f+0, d+0}'
+}
+read -r MIRRORED MIRROR_FAILED MIRROR_DROPPED <<<"$(mirror_counters)"
+for _ in $(seq 1 15); do
+  sleep 1
+  read -r M2 F2 D2 <<<"$(mirror_counters)"
+  [[ "$M2 $F2 $D2" == "$MIRRORED $MIRROR_FAILED $MIRROR_DROPPED" ]] && break
+  MIRRORED=$M2; MIRROR_FAILED=$F2; MIRROR_DROPPED=$D2
+done
+
 # The shadow's own view, so this is not just the proxy marking its own homework:
 # the echo image logs every request it serves.
 SHADOW_SAW="$(K -n "$APP_NS" logs deploy/echo-shadow --tail=-1 2>/dev/null | grep -c 'GET' || true)"
-if (( ${MIRRORED:-0} > 0 )) && (( ${MIRROR_FAILED:-0} == 0 )) && (( SHADOW_SAW > 0 )); then
-  pass "mirroring: ${MIRRORED} copies sent, ${SHADOW_SAW} seen by echo-shadow, ${MIRROR_FAILED} failed, ${MIRROR_DROPPED} dropped"
+# `>=` rather than `==`: the shadow's log is the ground truth for what arrived,
+# and nothing here stops another copy landing between the two reads. What would
+# be a bug is the counter running *ahead* of the shadow, which would mean
+# counting copies that were never accepted.
+if (( ${MIRRORED:-0} > 0 )) && (( ${MIRROR_FAILED:-0} == 0 )) \
+   && (( SHADOW_SAW >= MIRRORED )); then
+  pass "mirroring: ${MIRRORED} copies accepted by echo-shadow, which logged ${SHADOW_SAW}; ${MIRROR_FAILED} failed, ${MIRROR_DROPPED} dropped"
 else
-  fail "mirroring: sent=${MIRRORED:-<absent>} shadow_saw=${SHADOW_SAW} failed=${MIRROR_FAILED:-<absent>} dropped=${MIRROR_DROPPED:-<absent>}"
+  fail "mirroring: accepted=${MIRRORED:-<absent>} shadow_logged=${SHADOW_SAW} failed=${MIRROR_FAILED:-<absent>} dropped=${MIRROR_DROPPED:-<absent>}"
 fi
 
 # 9. The mirroring invariant: with the shadow backend gone, the production
