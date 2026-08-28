@@ -505,9 +505,36 @@ do not overlap. **"At least 31% ahead of nginx" is the claim that survives**,
 and +44.7% is the median's reading of the same thing. `report.py` makes this
 check itself and refuses the run if the ranges ever overlap.
 
-The hyper row is not under-measured: here it is 0.13% from nginx, so +44.9% for
-uring over hyper is the same result as +44.7% over nginx rather than an artifact
-of a cold hyper.
+The hyper row is not under-measured **relative to nginx**: here it is 0.13% from
+nginx, so +44.9% for uring over hyper is the same result as +44.7% over nginx
+rather than an artifact of a cold hyper.
+
+### And a cross-day check that cuts the other way
+
+Comparing this session against the committed head-to-head runs — taking **both
+cells from the same run**, which an earlier version of the engine document
+failed to do — puts nginx's row here on the low side:
+
+| | engine session | 4f58bd7, after optimization | d1c08c6, first measurement |
+|---|---:|---:|---:|
+| nginx, absolute | 80,790 | 86,670 | 89,593 |
+| baseline, absolute | 229,902 | 229,400 | 247,875 |
+| **nginx as % of baseline** | **35.1%** | **37.8%** | **36.1%** |
+
+The ratio travels across days at the **few-percent level** — 2.6 points against
+the nearer comparator, 1.0 against the older one — which is enough to trust this
+session's ordering, and not enough to swap an absolute row for another day's.
+
+**The slowdown was not uniform**, and that is the part worth carrying: this
+session's baseline is within **0.2%** of 4f58bd7's, while its nginx is 6.8% lower
+and its hyper engine 6.1% lower. Whatever cost the two TCP proxies those points
+did not cost the no-proxy baseline anything.
+
+So **+44.7% is the optimistic end of the margin rather than the middle of it.**
+Against the best committed nginx median, uring's worst round is **+28%**; against
+this session's own best nginx round, +31%. At least **28% ahead** is the figure
+that survives every pairing, and +44.7% is what you get comparing contenders
+measured in the same session on the same host.
 
 ### Why: the syscall counters
 

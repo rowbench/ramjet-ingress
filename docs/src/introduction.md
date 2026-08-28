@@ -58,7 +58,7 @@ the caveats, and the raw-data paths. The headlines:
 | Configuration churn under live traffic | ramjet-ingress kept **100 of 100** idle keep-alive connections; ingress-nginx kept **0 of 50**, reproducibly, every run, under spec churn |
 | CPU per request during churn | **+0% and +2%** against its own baseline, against ingress-nginx's +10% (reload path) and +25% (endpoint path) |
 | Raw HTTP/1.1 forwarding, hyper engine vs nginx | **level at c64** (85,908 against 86,670, inside the noise); nginx **9% ahead at c256** |
-| The `uring` engine vs nginx (Linux, io_uring) | **+44.7% at the median**, and at least +31% on a rank-order claim that survives the machine's drift |
+| The `uring` engine vs nginx (Linux, io_uring) | **+44.7% at the median** against nginx measured beside it, +31% comparing worst round to best, and **+28%** against nginx's best committed median — that last being the figure that survives every pairing |
 | Propagating a new Ingress | **~3x faster** at the median, ~6x at p95; **10x** with 500 routes already loaded |
 | **Idle-connection memory** | **ingress-nginx wins.** 4.4 KiB per idle connection against ramjet-ingress's 20.3 KiB — 4.6x, and the gap is structural |
 | **`kubectl apply` write path** | **ingress-nginx wins.** 138 ms median against 159, including `nginx -t` validation ramjet-ingress does not do |

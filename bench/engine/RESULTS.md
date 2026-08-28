@@ -1,8 +1,10 @@
 # Two engines and nginx, on the same two cores
 
-**The uring engine is ahead of nginx by 44.7% at the median and by at least 31%
-in the worst case, and it halves the latency the proxy hop adds.** The hyper
-engine and nginx are level, which is where `bench/RESULTS.md` left them.
+**The uring engine is ahead of nginx by 44.7% at the median, by at least 31%
+against every round measured beside it, and by at least 28% on the most
+conservative pairing this repository can make — and it halves the latency the
+proxy hop adds.** The hyper engine and nginx are level, which is where
+`bench/RESULTS.md` left them.
 
 That is the answer to the question `bench/PROFILE.md` ended on. It found no hot
 function to fix — the router and every header rewrite together are about 2% of a
@@ -59,33 +61,57 @@ different day. The baseline is measured in the same session against the same
 upstreams, so a host that is uniformly slow divides out of it; the absolute RPS
 is the number that cannot travel.
 
-It travels well. Against the clean-host run committed in `bench/RESULTS.md`,
-taken on a different day by a different agent on the same topology and the same
-two cores:
+`bench/RESULTS.md` holds two committed head-to-head runs, and the comparison has
+to take **both cells from the same one**. An earlier version of this section did
+not: it paired this run's nginx against one table and its baseline against the
+other, and the resulting ratio agreed "to a tenth of a percentage point". That
+agreement was an artifact of the mixing. Both tables, paired consistently:
 
-| | this run | `bench/RESULTS.md`, clean host |
-|---|---:|---:|
-| nginx, absolute | 80,790 | 86,670 |
-| baseline, absolute | 229,902 | 247,875 |
-| **nginx as % of baseline** | **35.1%** | **35.0%** |
+| | this run | 4f58bd7, after optimization | d1c08c6, first measurement |
+|---|---:|---:|---:|
+| nginx, absolute | 80,790 | 86,670 | 89,593 |
+| baseline, absolute | 229,902 | 229,400 | 247,875 |
+| **nginx as % of baseline** | **35.1%** | **37.8%** | **36.1%** |
 
-The absolutes here are about 7% low — nginx -6.8%, baseline -7.3% — which is a
-**uniform** slowdown of the whole machine, not something that happened to one
-contender. And the ratio reproduces the clean-host measurement **to a tenth of a
-percentage point**. That is the evidence that this run's ordering and margins
-mean something even though its absolute numbers were taken on a host that was
-not at its best.
+The comparator is **4f58bd7**. It is the run `bench/RESULTS.md` itself names as
+the better estimate of the gap, and it is already the run this page cites below
+for the hyper engine being level with nginx — taking this check from a different
+table than that one is exactly the mistake being corrected.
 
-**Every absolute RPS figure on this page is therefore a floor, not an estimate.**
-A quieter host would move all four rows up together, uring included. Anyone
-revisiting these numbers should expect them to rise rather than fall, and should
-not "correct" them downward on the grounds that the machine was busy — the
-busyness is already in them, and it cost uring the same 7% it cost nginx.
+Against it the ratio holds to **2.6 percentage points**, about 7% of itself;
+against the older run, to 1.0 points. So the ratio does travel across days, but
+at the **few-percent level**, not to a tenth of a point. That is enough to say
+this run's ordering and margins mean something. It is not enough to treat an
+absolute row here as interchangeable with another day's.
+
+**The slowdown was not uniform, and the corrected pairing is what shows it.**
+This session's baseline is within **0.2%** of 4f58bd7's — the machine was not
+broadly slower — while its nginx is **6.8%** lower and its hyper engine 6.1%
+lower. Whatever cost the two TCP proxies those points did not cost the no-proxy
+baseline anything, so it cannot be waved off as a busy host, and the earlier
+"uniform 7% slowdown" reading of it was wrong.
+
+**That direction matters for how the headline is read.** nginx's row here is the
+low one, so **+44.7% is the optimistic end of the margin rather than the middle
+of it.** Comparing uring's *worst* round (111,250) against the best committed
+nginx median (86,670) gives **+28%**; against this session's own best nginx round
+(84,862) it gives +31%. **At least 28% ahead** is the claim that survives every
+one of those pairings, and +44.7% is what the median reads when nginx is measured
+in the same session on the same host, which is the comparison this harness is
+built to make.
+
+Absolute RPS figures on this page should still be read as **floors** for the
+contenders measured together here, and a quieter host would move them up. What
+the corrected numbers withdraw is the stronger claim that the whole machine was
+uniformly 7% down and that every row therefore scales by one factor.
 
 The same check settles a question about the other engine. `bench/RESULTS.md` has
 the hyper engine level with nginx (0.9% apart). Here it is **0.13% apart**
-— 80,682 against 80,790, both at 35.1% of baseline. So the hyper row is not
-under-measured, and **+44.9% for uring over hyper is the same result as +44.7%
+— 80,682 against 80,790, both at 35.1% of baseline. The two moved together: both
+sit about 6% below their 4f58bd7 figures, which is the same effect the paragraphs
+above describe. So the hyper row is not under-measured **relative to nginx**,
+which is what this argument needs, and **+44.9% for uring over hyper is the same
+result as +44.7%
 over nginx** rather than an artifact of a cold hyper. An earlier 5-second smoke
 run *did* understate hyper by 7%, which is what a 2-second warmup does to the
 contender with the most per-core state to warm; that run is not quoted here and
@@ -119,6 +145,12 @@ Every measured uring round beat every measured round of both rivals. The ranges
 do not overlap, so **at least 31% ahead of nginx** is the claim that survives the
 drift, and +44.7% is the median's reading of the same thing. `report.py` makes
 this check itself and refuses the run if the ranges ever overlap.
+
+That 31% is a **within-session** floor: it compares uring's worst round to the
+best nginx round measured beside it. The cross-day check above gives a more
+conservative one — against nginx's best *committed* median, from a session where
+it read about 7% higher, the same worst uring round is **28%** ahead. Both are
+floors; 28% is the one that assumes this session's nginx was having a bad day.
 
 The hyper engine's own 28.7% spread is mostly its first round (63,672), which
 was the very first traffic after the topology started and so ran with a cold

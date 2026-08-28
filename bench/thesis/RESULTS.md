@@ -712,7 +712,7 @@ is applied to ramjet-ingress that its chart does not ship.
   still watch and discard the other's objects, but only one holds 500 compiled
   routes at any moment, so the memory figures are attributable while the
   watch-and-discard cost is shared.
-- **The VM is small.** 8 CPUs, 3.9 GiB of RAM, swap already in use before the
+- **The VM is small.** 8 CPUs, 3.8 GiB of RAM, swap already in use before the
   benchmark started.
 - **macOS, Apple Silicon, linuxkit.** Same caveat `bench/RESULTS.md` carries: the
   relative comparison is what is claimed, not the absolute figures.
