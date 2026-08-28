@@ -134,9 +134,14 @@ client, so anything that can open a connection to that port can claim any
 address it likes. Only turn this on where the balancer is the sole path in.
 
 The admin port is never covered by any of this: `/healthz` and `/readyz` come
-from the kubelet, which speaks no PROXY protocol. Nor is the `uring` engine — it
-refuses `--proxy-protocol` at startup, so a preset that sets it and an
-`--engine uring` in `controller.extraArgs` will not start together.
+from the kubelet, which speaks no PROXY protocol, and requiring the header there
+would take the probes offline the moment the flag was set.
+
+Either engine can sit behind one of these presets. The `uring` engine reads the
+header with the same parser, in the same place — ahead of the TLS record layer
+— and with the same required-not-optional answer, so a preset that sets
+`--proxy-protocol` and an `--engine uring` in `controller.extraArgs` work
+together.
 
 Cloud health checks need the same care, and the answer differs by provider. AWS
 sends the PROXY header on health check connections too once the target group

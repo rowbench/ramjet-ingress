@@ -1244,11 +1244,13 @@ model rather than of the code:
   in the completion tag, a cancelled read from a connection that ended would be
   delivered as input to whoever inherited its number.
 
-What it does not do is as important: no TLS, no HTTP/2, no protocol upgrades,
-no Kubernetes mode. Each is refused with a status code and an explanation
-naming the other engine, and the same list prints at startup, because a gap
-that behaves like a bug in whatever is on the other end is worse than a missing
-feature. `bench/engine/RESULTS.md` has the measurement.
+What it does not do is as important, and by now it is one thing: HTTP/2, at both
+ends of the hop. Downstream it does not speak it — a client that asks is handed
+to a hyper engine in the same process — and upstream it does not dial it, so a
+backend annotated `backend-protocol: GRPC` is refused with a status code and an
+explanation naming the other engine. The same list prints at startup, because a
+gap that behaves like a bug in whatever is on the other end is worse than a
+missing feature. `bench/engine/RESULTS.md` has the measurement.
 
 ## Deliberate divergences from ingress-nginx
 

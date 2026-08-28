@@ -370,6 +370,89 @@ set nginx.ingress.kubernetes.io/backend-protocol: GRPC on the Ingress\n"
         );
     }
 
+    /// Sentences about this engine that were true when written and are false
+    /// now, with what closed each one.
+    ///
+    /// Literal strings, and that is the point. The table guard above is
+    /// structural and catches a *row* that goes stale; every one of these was
+    /// prose, which is where the drift actually kept happening — four
+    /// paragraphs across four files, each written when it was correct, each
+    /// surviving the release that closed it, and each found later by somebody
+    /// reading the documentation rather than by a test.
+    ///
+    /// A phrase belongs here once it is unambiguously false. "no TLS" alone
+    /// does not qualify: `no TLS to the upstream` is a real and current
+    /// limitation about a different subject, and a guard that fired on it would
+    /// be deleted rather than fixed.
+    const RETIRED_CLAIMS: &[(&str, &str)] = &[
+        ("does not terminate TLS", "447d5a1 terminated TLS on the reactor"),
+        ("refuses `--proxy-protocol`", "6a729b1 read the PROXY protocol on it"),
+        (
+            "PROXY protocol is hyper-engine only",
+            "6a729b1 read the PROXY protocol on it",
+        ),
+        (
+            "no TLS, no HTTP/2, no protocol upgrades",
+            "447d5a1 for TLS, ed2af3f for upgrades, 68af340 for Kubernetes mode",
+        ),
+        ("no; static routes only", "68af340 added Kubernetes mode"),
+        // "engine does not drain" rather than "does not drain": an upgraded
+        // tunnel genuinely does not drain, and that sentence is one somebody
+        // should still be able to write.
+        ("engine does not drain", "the drain landed in this phase"),
+        (
+            "engine stops accepting and closes",
+            "the drain landed in this phase",
+        ),
+    ];
+
+    /// Every markdown file this repository documents itself with.
+    fn markdown_files() -> Vec<std::path::PathBuf> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let mut found = vec![root.join("README.md"), root.join("ARCHITECTURE.md")];
+        let mut pending = vec![root.join("docs").join("src")];
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+            for entry in entries {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "md") {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn no_document_repeats_a_claim_that_stopped_being_true() {
+        // The same spirit as the banner guard below, widened to the files an
+        // operator actually reads. Every entry in the list was found by hand,
+        // one release too late; the point of writing them down is that the next
+        // one is found by `cargo test` instead.
+        let mut stale = Vec::new();
+        for path in markdown_files() {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            for (claim, closed_by) in RETIRED_CLAIMS {
+                if text.contains(claim) {
+                    let name = path.file_name().unwrap_or(path.as_os_str());
+                    stale.push(format!("{:?} says {claim:?} — {closed_by}", name));
+                }
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "documentation still carries a claim about the uring engine that \
+             stopped being true:\n{}",
+            stale.join("\n")
+        );
+    }
+
     #[test]
     fn the_parity_guard_catches_the_rows_that_actually_went_stale() {
         // A guard that has never failed is not yet a guard. This is the table

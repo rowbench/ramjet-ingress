@@ -135,12 +135,25 @@ to it, because hyper panics on anything smaller.
 
 ### What `--engine uring` refuses
 
-It serves HTTP/1.1 plaintext on the ramjet reactor — io_uring on Linux, kqueue
-elsewhere. It has no TLS, no HTTP/2, no protocol upgrades and no Kubernetes
-mode, and refuses each of those with a status and an explanation naming the
-other engine rather than silently doing something else. It also refuses
-`--proxy-protocol` and `--http3` **at startup**. Everything about routing, load
-balancing, canaries, headers and `/metrics` is the same on both.
+It serves HTTP/1.1 on the ramjet reactor — io_uring on Linux, kqueue elsewhere
+— and terminates TLS, carries protocol upgrades, reads the PROXY protocol, runs
+in Kubernetes mode and drains on `SIGTERM` exactly as the other engine does.
+
+What is left is HTTP/2, at both ends of the hop:
+
+- **Downstream**, it does not speak HTTP/2 itself. A client that asks for it is
+  handed to a hyper engine in the same process, with its bytes intact, and sees
+  one connection that negotiated HTTP/2. That is on by default;
+  `--no-h2-dispatch` turns it off, at the cost of not offering HTTP/2 at all.
+- **Upstream**, it does not dial one. A backend annotated `backend-protocol:
+  GRPC` is answered **502** naming the other engine, and gRPC to it with it.
+
+`--http3` is refused **at startup** rather than ignored, because a UDP listener
+that silently did not exist is worse than one that says so.
+
+Everything about routing, load balancing, canaries, headers and `/metrics` is
+the same on both. [Engines](../operations/engines.md) has the full parity
+matrix, and the differential test that keeps it honest.
 
 ## Behind a load balancer
 

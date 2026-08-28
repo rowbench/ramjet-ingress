@@ -31,6 +31,11 @@ spec:
 The Secret is looked up in **the Ingress's own namespace**. There is no
 cross-namespace reference.
 
+Both engines terminate TLS, and through the same resolver over the same
+certificate store — so a name resolves to the same certificate, and a rotation
+reaches both, whichever `--engine` is serving. Everything below is therefore
+about this proxy rather than about one lane of it.
+
 ## SNI resolution
 
 A server name resolves to a certificate using exactly the same precedence as
@@ -142,9 +147,6 @@ certificates arrive over a watch, after the socket.
 
 ## What TLS does not do here
 
-- **`--engine uring` does not terminate TLS.** It answers 502 and names the
-  other engine. If the configuration declares certificates, it says so at
-  startup.
 - **There is no TLS to the upstream.** The upstream side speaks HTTP/1.1, or
   cleartext HTTP/2 for a backend annotated
   [`backend-protocol: GRPC`](./annotations.md#backend-protocol) — and both are
