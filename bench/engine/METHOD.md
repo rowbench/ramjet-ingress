@@ -119,6 +119,23 @@ That last one is specific to this benchmark. Two engines that serve at different
 speeds because one of them is doing less work is not a result, and comparing the
 headers is the cheapest way to notice.
 
+## Warmup, and why the smoke test is not a measurement
+
+Each core warms its own connection pool, timer set and buffers. That is more
+state than a single shared runtime has, so a short warmup measures a contender
+that is still filling it — and it penalises whichever engine has the most
+per-core state to fill, which is precisely the one under test.
+
+The signature is unmistakable once you know it: **throughput going up with
+concurrency.** A smoke run measuring 39,000 rps at c64 and 72,549 at c128
+immediately after has not discovered that the proxy likes load; it has measured
+one cold run and one warm one.
+
+So the committed protocol warms for 10 seconds, `SMOKE=1` warms for 8, and the
+script warns before printing anything if the warmup has been overridden to
+single digits. A cold first run read as a regression is a mistake this harness
+should make impossible rather than merely unlikely.
+
 ## Reading a difference
 
 The run-to-run spread table is the reader's evidence about what the measurement
@@ -131,7 +148,7 @@ statement is "the same".
 
 ```sh
 ./bench/engine/run.sh                                   # ~15 minutes
-WARMUP=2s DURATION=5s ROUNDS=1 ./bench/engine/run.sh     # smoke test
+SMOKE=1 ./bench/engine/run.sh                            # validate the harness
 python3 bench/engine/report.py                           # re-render from raw JSON
 ```
 

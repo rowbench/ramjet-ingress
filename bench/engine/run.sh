@@ -47,7 +47,13 @@
 #
 # Usage:
 #     ./bench/engine/run.sh
-#     WARMUP=2s DURATION=5s ROUNDS=1 ./bench/engine/run.sh    # smoke test
+#     SMOKE=1 ./bench/engine/run.sh        # validate the script, ~4 minutes
+#
+# SMOKE mode checks that every stage works. Its throughput numbers are NOT
+# comparable to a real run and the script says so before printing any: each
+# core warms its own pool, timer set and buffers, so a short warmup measures
+# a contender that is still filling them. The tell is throughput going *up*
+# with concurrency.
 
 set -euo pipefail
 
@@ -82,6 +88,13 @@ CPUS_LOAD="4,5,6,7"
 LOAD_THREADS=4
 
 HOST_HEADER="bench.test"
+if [ "${SMOKE:-0}" = "1" ]; then
+    # Long enough to warm the per-core pools, short enough to be a smoke test.
+    WARMUP="${WARMUP:-8s}"
+    DURATION="${DURATION:-6s}"
+    ROUNDS="${ROUNDS:-1}"
+    COOLDOWN="${COOLDOWN:-5}"
+fi
 WARMUP="${WARMUP:-10s}"
 DURATION="${DURATION:-30s}"
 ROUNDS="${ROUNDS:-3}"
@@ -336,6 +349,11 @@ rotated() {
 run_all() {
     mkdir -p "${RESULTS_DIR}"
     rm -f "${RESULTS_DIR}"/*.json
+    # Said before any number is printed, not after, because the misreading it
+    # prevents is somebody quoting a cold run as a regression.
+    case "${WARMUP}" in
+        [0-9]s|[0-9]) warn "WARMUP=${WARMUP} is too short to fill the per-core pools; these numbers validate the harness, they do not measure anything" ;;
+    esac
     log "c${CONC_MAIN}: ${ROUNDS} rotated rounds of ${DURATION} (${WARMUP} warmup, ${COOLDOWN}s cooldown each)"
     for round in $(seq 1 "${ROUNDS}"); do
         echo "  round ${round}/${ROUNDS} (starting with $(rotated $((round - 1)) | head -1))"

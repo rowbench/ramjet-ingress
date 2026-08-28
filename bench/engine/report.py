@@ -138,15 +138,22 @@ def main():
         count = len(runs_for(CONTENDERS[0][1], conc))
         note = f"median of {count} runs" if count > 1 else "single run"
         lines.append(f"### Concurrency {conc} ({note})\n")
-        lines.append("| Contender | RPS | p50 | p90 | p99 | p99.9 |")
-        lines.append("|---|---:|---:|---:|---:|---:|")
+        # "% of baseline" is the column that survives a slow machine. The
+        # baseline is measured in the same session against the same upstreams,
+        # so a host that is uniformly N% slow divides out of it — which makes
+        # this the number that can be compared against a run taken on another
+        # day, and the absolute RPS the number that cannot.
+        lines.append("| Contender | RPS | % of baseline | p50 | p90 | p99 | p99.9 |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|")
+        base_row = table.get((BASELINE, conc))
         for label, _ in CONTENDERS:
             r = table.get((label, conc))
             if not r:
                 continue
+            share = f"{r['rps'] / base_row['rps']:.1%}" if base_row else "n/a"
             lines.append(
-                f"| {label} | {fmt(r['rps'])} | {fmt(r['p50'])} us | {fmt(r['p90'])} us "
-                f"| {fmt(r['p99'])} us | {fmt(r['p999'])} us |"
+                f"| {label} | {fmt(r['rps'])} | {share} | {fmt(r['p50'])} us "
+                f"| {fmt(r['p90'])} us | {fmt(r['p99'])} us | {fmt(r['p999'])} us |"
             )
         lines.append("")
 

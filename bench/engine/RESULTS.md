@@ -22,21 +22,21 @@ with one flag different**.
 
 ### Concurrency 64 (median of 3 runs)
 
-| Contender | RPS | p50 | p90 | p99 | p99.9 |
-|---|---:|---:|---:|---:|---:|
-| ramjet (hyper) | 80,682 | 687 us | 1,030 us | 2,905 us | 7,562 us |
-| **ramjet (uring)** | **116,927** | **483 us** | **702 us** | **1,941 us** | **5,569 us** |
-| nginx | 80,790 | 696 us | 1,002 us | 2,853 us | 7,687 us |
-| baseline (no proxy) | 229,902 | 227 us | 384 us | 1,160 us | 3,868 us |
+| Contender | RPS | % of baseline | p50 | p90 | p99 | p99.9 |
+|---|---:|---:|---:|---:|---:|---:|
+| ramjet (hyper) | 80,682 | 35.1% | 687 us | 1,030 us | 2,905 us | 7,562 us |
+| **ramjet (uring)** | **116,927** | **50.9%** | **483 us** | **702 us** | **1,941 us** | **5,569 us** |
+| nginx | 80,790 | 35.1% | 696 us | 1,002 us | 2,853 us | 7,687 us |
+| baseline (no proxy) | 229,902 | 100.0% | 227 us | 384 us | 1,160 us | 3,868 us |
 
 ### Concurrency 256 (single run)
 
-| Contender | RPS | p50 | p90 | p99 | p99.9 |
-|---|---:|---:|---:|---:|---:|
-| ramjet (hyper) | 65,458 | 3,130 us | 5,217 us | 15,918 us | 52,723 us |
-| **ramjet (uring)** | **110,057** | **1,962 us** | **3,070 us** | **8,122 us** | **28,387 us** |
-| nginx | 84,480 | 2,680 us | 3,936 us | 8,465 us | 22,245 us |
-| baseline (no proxy) | 231,837 | 924 us | 1,552 us | 3,866 us | 10,629 us |
+| Contender | RPS | % of baseline | p50 | p90 | p99 | p99.9 |
+|---|---:|---:|---:|---:|---:|---:|
+| ramjet (hyper) | 65,458 | 28.2% | 3,130 us | 5,217 us | 15,918 us | 52,723 us |
+| **ramjet (uring)** | **110,057** | **47.5%** | **1,962 us** | **3,070 us** | **8,122 us** | **28,387 us** |
+| nginx | 84,480 | 36.4% | 2,680 us | 3,936 us | 8,465 us | 22,245 us |
+| baseline (no proxy) | 231,837 | 100.0% | 924 us | 1,552 us | 3,866 us | 10,629 us |
 
 ### Added latency of the proxy hop (c64, vs baseline)
 
@@ -51,6 +51,39 @@ so this is what inserting a proxy costs.
 
 **The uring engine's hop costs 255 us where nginx's costs 469 us**, and it keeps
 51% of the no-proxy throughput where the other two keep 35%.
+
+## The number that survives a slow host, and a check against another day
+
+The **% of baseline** column is the one to compare against a run taken on a
+different day. The baseline is measured in the same session against the same
+upstreams, so a host that is uniformly slow divides out of it; the absolute RPS
+is the number that cannot travel.
+
+It travels well. Against the clean-host run committed in `bench/RESULTS.md`,
+taken on a different day by a different agent on the same topology and the same
+two cores:
+
+| | this run | `bench/RESULTS.md`, clean host |
+|---|---:|---:|
+| nginx, absolute | 80,790 | 86,670 |
+| baseline, absolute | 229,902 | 247,875 |
+| **nginx as % of baseline** | **35.1%** | **35.0%** |
+
+The absolutes here are about 7% low — nginx -6.8%, baseline -7.3% — which is a
+**uniform** slowdown of the whole machine, not something that happened to one
+contender. And the ratio reproduces the clean-host measurement **to a tenth of a
+percentage point**. That is the evidence that this run's ordering and margins
+mean something even though its absolute numbers were taken on a host that was
+not at its best.
+
+The same check settles a question about the other engine. `bench/RESULTS.md` has
+the hyper engine level with nginx (0.9% apart). Here it is **0.13% apart**
+— 80,682 against 80,790, both at 35.1% of baseline. So the hyper row is not
+under-measured, and **+44.9% for uring over hyper is the same result as +44.7%
+over nginx** rather than an artifact of a cold hyper. An earlier 5-second smoke
+run *did* understate hyper by 7%, which is what a 2-second warmup does to the
+contender with the most per-core state to warm; that run is not quoted here and
+the committed protocol's 10-second warmup is why.
 
 ## The machine would not sit still, and what that does to the reading
 
@@ -205,7 +238,7 @@ Stated so a reader can discount them rather than discover them.
 
 ```sh
 ./bench/engine/run.sh                                   # ~25 minutes
-WARMUP=2s DURATION=5s ROUNDS=1 ./bench/engine/run.sh     # smoke test
+SMOKE=1 ./bench/engine/run.sh                            # validate the harness
 python3 bench/engine/report.py                           # re-render, no re-run
 ```
 
