@@ -1072,6 +1072,7 @@ mod tests {
                         errors_5xx_total: requests / 100,
                         upstream_latency_ms_sum: requests as f64 * 5.0,
                         upstream_latency_count: requests,
+                        canary_stats: None,
                         canary: Some(Canary {
                             backend: "api-v3".to_string(),
                             weight_percent: 10,
@@ -1087,6 +1088,7 @@ mod tests {
                         errors_5xx_total: 0,
                         upstream_latency_ms_sum: 14.0,
                         upstream_latency_count: 7,
+                        canary_stats: None,
                         canary: None,
                     },
                 ],
@@ -1295,6 +1297,7 @@ mod tests {
             errors_5xx_total: 0,
             upstream_latency_ms_sum: 0.0,
             upstream_latency_count: 0,
+            canary_stats: None,
             canary: None,
         });
         app.record_poll(next, Instant::now() + Duration::from_secs(2));

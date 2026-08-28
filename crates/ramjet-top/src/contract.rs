@@ -206,6 +206,32 @@ pub struct RouteEntry {
     /// The canary split, if this route has one.
     #[serde(default)]
     pub canary: Option<Canary>,
+    /// The canary-diverted share of the counters above, if this route has a
+    /// canary.
+    ///
+    /// A *subset* of them and not a sibling: a canary request is counted in
+    /// both, so the stable share is the difference. `None` on a route with no
+    /// canary, which is why it is an `Option` rather than a zeroed struct —
+    /// zeroes cannot be told apart from a canary nothing has reached yet.
+    #[serde(default)]
+    pub canary_stats: Option<CanaryStats>,
+}
+
+/// The canary-diverted share of one route's counters.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+pub struct CanaryStats {
+    /// Requests the canary backend served, cumulative.
+    #[serde(default)]
+    pub requests_total: u64,
+    /// 5xx responses from the canary backend, cumulative.
+    #[serde(default)]
+    pub errors_5xx_total: u64,
+    /// Total canary upstream latency in milliseconds, cumulative.
+    #[serde(default)]
+    pub upstream_latency_ms_sum: f64,
+    /// Observations behind that sum, cumulative.
+    #[serde(default)]
+    pub upstream_latency_count: u64,
 }
 
 /// A weighted second backend.
@@ -345,7 +371,13 @@ mod tests {
           "errors_5xx_total": 12,
           "upstream_latency_ms_sum": 51234.5,
           "upstream_latency_count": 9987,
-          "canary": {"backend": "api-v3", "weight_percent": 10}
+          "canary": {"backend": "api-v3", "weight_percent": 10},
+          "canary_stats": {
+            "requests_total": 1000,
+            "errors_5xx_total": 9,
+            "upstream_latency_ms_sum": 7200.0,
+            "upstream_latency_count": 998
+          }
         },
         {
           "host": "*",
@@ -357,7 +389,8 @@ mod tests {
           "errors_5xx_total": 0,
           "upstream_latency_ms_sum": 14.0,
           "upstream_latency_count": 7,
-          "canary": null
+          "canary": null,
+          "canary_stats": null
         }
       ]
     }"#;
@@ -413,10 +446,23 @@ mod tests {
         assert_eq!(canary.backend, "api-v3");
         assert_eq!(canary.weight_percent, 10);
 
+        let split = api.canary_stats.as_ref().expect("a canary split");
+        assert_eq!(split.requests_total, 1000);
+        assert_eq!(split.errors_5xx_total, 9);
+        assert_eq!(split.upstream_latency_count, 998);
+        assert!(
+            split.requests_total < api.requests_total,
+            "the split is a subset of the route's totals, not a sibling of them"
+        );
+
         let fallback = &parsed.routes[1];
         assert_eq!(fallback.host, "*");
         assert_eq!(fallback.path_type, PathType::ImplementationSpecific);
         assert!(fallback.canary.is_none());
+        assert!(
+            fallback.canary_stats.is_none(),
+            "no canary means no split to report"
+        );
     }
 
     #[test]

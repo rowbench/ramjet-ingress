@@ -673,6 +673,7 @@ mod tests {
             errors_5xx_total: 0,
             upstream_latency_ms_sum: 0.0,
             upstream_latency_count: 0,
+            canary_stats: None,
             canary: None,
         }
     }

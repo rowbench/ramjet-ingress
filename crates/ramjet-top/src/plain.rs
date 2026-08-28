@@ -18,6 +18,8 @@
 //! short to make a nicer-looking column would corrupt the output for its actual
 //! purpose.
 
+use std::fmt::Write as _;
+
 use crate::client::Snapshot;
 use crate::rfc3339;
 
@@ -102,9 +104,35 @@ fn routes_table(snapshot: &Snapshot) -> String {
             let mean = (route.upstream_latency_count > 0)
                 .then(|| route.upstream_latency_ms_sum / route.upstream_latency_count as f64)
                 .map_or_else(|| "-".to_string(), |ms| format!("{ms:.2}"));
+            // Cumulative here, unlike the live table's windowed rates: a
+            // single `--once` has no previous poll to difference against, and
+            // inventing a rate from one sample would be worse than reporting
+            // the totals it actually has.
             let canary = route.canary.as_ref().map_or_else(
                 || "-".to_string(),
-                |c| format!("{}%->{}", c.weight_percent, c.backend),
+                |c| {
+                    let mut label = format!("{}%->{}", c.weight_percent, c.backend);
+                    if let Some(split) = &route.canary_stats {
+                        let errors = (split.requests_total > 0).then(|| {
+                            split.errors_5xx_total as f64 * 100.0 / split.requests_total as f64
+                        });
+                        let mean = (split.upstream_latency_count > 0).then(|| {
+                            split.upstream_latency_ms_sum / split.upstream_latency_count as f64
+                        });
+                        let _ = write!(
+                            label,
+                            " {} req",
+                            split.requests_total
+                        );
+                        if let Some(errors) = errors {
+                            let _ = write!(label, " {errors:.1}%");
+                        }
+                        if let Some(mean) = mean {
+                            let _ = write!(label, " {mean:.1}ms");
+                        }
+                    }
+                    label
+                },
             );
             vec![
                 route.host.clone(),
@@ -305,6 +333,7 @@ mod tests {
                         errors_5xx_total: 12,
                         upstream_latency_ms_sum: 51_234.5,
                         upstream_latency_count: 9_987,
+                        canary_stats: None,
                         canary: Some(Canary {
                             backend: "api-v3".to_string(),
                             weight_percent: 10,
@@ -320,6 +349,7 @@ mod tests {
                         errors_5xx_total: 0,
                         upstream_latency_ms_sum: 14.0,
                         upstream_latency_count: 7,
+                        canary_stats: None,
                         canary: None,
                     },
                 ],
@@ -352,6 +382,32 @@ mod tests {
         assert!(text.contains("10000"));
         assert!(text.contains("default-http-backend"));
         assert!(text.contains("ImplSpec"));
+    }
+
+    #[test]
+    fn the_canary_split_carries_its_cumulative_health() {
+        // `--once` has no previous poll to difference against, so these are
+        // totals rather than rates — and saying so is better than inventing a
+        // rate from one sample.
+        let mut snapshot = fixture();
+        if let Some(route) = snapshot.routes.routes.get_mut(0) {
+            route.canary_stats = Some(crate::contract::CanaryStats {
+                requests_total: 400,
+                errors_5xx_total: 8,
+                upstream_latency_ms_sum: 6000.0,
+                upstream_latency_count: 400,
+            });
+        }
+        let text = routes_table(&snapshot);
+        assert!(text.contains("400 req"), "{text}");
+        assert!(text.contains("2.0%"), "{text}");
+        assert!(text.contains("15.0ms"), "{text}");
+    }
+
+    #[test]
+    fn a_canary_with_no_split_reported_still_renders() {
+        let text = routes_table(&fixture());
+        assert!(text.contains("%->"), "{text}");
     }
 
     #[test]

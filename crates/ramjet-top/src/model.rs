@@ -75,6 +75,25 @@ pub struct RouteCounters {
     pub latency_ms_sum: f64,
     /// Observations behind that sum, cumulative.
     pub latency_count: u64,
+    /// The canary-diverted share of the four above, cumulative.
+    ///
+    /// A subset of them, so the stable share is the difference. Zeroes where
+    /// the route has no canary, which is harmless: differencing zero against
+    /// zero yields no rate, and the row will not display one either way.
+    pub canary: CanaryCounters,
+}
+
+/// The canary-diverted share of one route's counters, at one instant.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CanaryCounters {
+    /// Requests the canary served, cumulative.
+    pub requests_total: u64,
+    /// 5xx responses from the canary, cumulative.
+    pub errors_5xx_total: u64,
+    /// Canary upstream latency in milliseconds, cumulative.
+    pub latency_ms_sum: f64,
+    /// Observations behind that sum, cumulative.
+    pub latency_count: u64,
 }
 
 impl RouteCounters {
@@ -85,6 +104,15 @@ impl RouteCounters {
             errors_5xx_total: entry.errors_5xx_total,
             latency_ms_sum: entry.upstream_latency_ms_sum,
             latency_count: entry.upstream_latency_count,
+            canary: entry.canary_stats.map_or_else(
+                CanaryCounters::default,
+                |split| CanaryCounters {
+                    requests_total: split.requests_total,
+                    errors_5xx_total: split.errors_5xx_total,
+                    latency_ms_sum: split.upstream_latency_ms_sum,
+                    latency_count: split.upstream_latency_count,
+                },
+            ),
         }
     }
 }
@@ -132,17 +160,43 @@ pub struct RouteRow {
     pub avg_latency_ms: Option<f64>,
     /// The canary split, if any.
     pub canary: Option<Canary>,
+    /// The canary side's 5xx percentage over the last interval.
+    ///
+    /// `None` where there is no canary, no baseline, or no canary traffic in
+    /// the window — the same rule the route-wide rate follows, and for the same
+    /// reason: 0% on a canary nothing has reached reads as "healthy" when the
+    /// truth is "no evidence either way", and that is the number somebody is
+    /// about to promote on.
+    pub canary_error_rate_percent: Option<f64>,
+    /// The canary side's mean upstream latency over the last interval.
+    pub canary_avg_latency_ms: Option<f64>,
     /// Whether this route was absent from the previous poll.
     pub is_new: bool,
 }
 
 impl RouteRow {
-    /// The canary split, rendered for a column.
+    /// The canary split, and how the canary is doing on it.
+    ///
+    /// One column rather than three. The canary's error rate and latency are
+    /// meaningless without the share beside them — 2% of what? — and appending
+    /// rather than prepending means the half a narrow terminal truncates away
+    /// is the half the row can do without. The numbers are windowed, so a
+    /// canary that started failing a minute ago says so here even on a process
+    /// that has been up for a week.
     pub fn canary_label(&self) -> String {
-        match &self.canary {
-            Some(c) => format!("{}%→{}", c.weight_percent, c.backend),
-            None => "-".to_string(),
+        use std::fmt::Write as _;
+
+        let Some(canary) = &self.canary else {
+            return "-".to_string();
+        };
+        let mut label = format!("{}%→{}", canary.weight_percent, canary.backend);
+        if let Some(rate) = self.canary_error_rate_percent {
+            let _ = write!(label, " {rate:.1}%");
         }
+        if let Some(ms) = self.canary_avg_latency_ms {
+            let _ = write!(label, " {ms:.0}ms");
+        }
+        label
     }
 
     /// What the filter box matches against.
@@ -305,6 +359,20 @@ fn usable_seconds(elapsed: Duration) -> Option<f64> {
     (seconds.is_finite() && seconds > 0.0).then_some(seconds)
 }
 
+/// One interval's rates for one route, route-wide and canary-only.
+///
+/// A named struct rather than a tuple: five `Option<f64>`s positionally is a
+/// transposition waiting to happen, and the two canary fields look exactly like
+/// the two route-wide ones.
+#[derive(Debug, Clone, Copy)]
+struct Rates {
+    rps: f64,
+    error_rate: Option<f64>,
+    avg_latency: Option<f64>,
+    canary_error_rate: Option<f64>,
+    canary_avg_latency: Option<f64>,
+}
+
 /// Computes the display rows for one poll.
 ///
 /// `baseline` is the previous poll's counters, or `None` on the very first
@@ -341,7 +409,35 @@ pub fn compute_rows(
                     .then(|| errors as f64 * 100.0 / requests as f64);
                 let avg_latency =
                     (latency_count > 0).then(|| latency_sum / latency_count as f64);
-                (rps, error_rate, avg_latency)
+
+                // The same arithmetic again on the canary subset. Windowed for
+                // the same reason the route-wide numbers are: on a process that
+                // has been up for a week, a lifetime error rate cannot move
+                // fast enough to show a canary that started failing a minute
+                // ago — which is exactly the moment somebody is watching.
+                let canary_requests =
+                    counter_delta(counters.canary.requests_total, before.canary.requests_total);
+                let canary_errors = counter_delta(
+                    counters.canary.errors_5xx_total,
+                    before.canary.errors_5xx_total,
+                );
+                let canary_latency_sum =
+                    sum_delta(counters.canary.latency_ms_sum, before.canary.latency_ms_sum);
+                let canary_latency_count =
+                    counter_delta(counters.canary.latency_count, before.canary.latency_count);
+
+                let canary_error_rate = (canary_requests > 0)
+                    .then(|| canary_errors as f64 * 100.0 / canary_requests as f64);
+                let canary_avg_latency = (canary_latency_count > 0)
+                    .then(|| canary_latency_sum / canary_latency_count as f64);
+
+                Rates {
+                    rps,
+                    error_rate,
+                    avg_latency,
+                    canary_error_rate,
+                    canary_avg_latency,
+                }
             });
 
             RouteRow {
@@ -352,10 +448,12 @@ pub fn compute_rows(
                 endpoints: entry.endpoints,
                 requests_total: counters.requests_total,
                 errors_5xx_total: counters.errors_5xx_total,
-                rps: rates.map(|(rps, _, _)| rps),
-                error_rate_percent: rates.and_then(|(_, e, _)| e),
-                avg_latency_ms: rates.and_then(|(_, _, l)| l),
+                rps: rates.map(|r| r.rps),
+                error_rate_percent: rates.and_then(|r| r.error_rate),
+                avg_latency_ms: rates.and_then(|r| r.avg_latency),
                 canary: entry.canary.clone(),
+                canary_error_rate_percent: rates.and_then(|r| r.canary_error_rate),
+                canary_avg_latency_ms: rates.and_then(|r| r.canary_avg_latency),
                 is_new,
             }
         })
@@ -420,6 +518,7 @@ mod tests {
             errors_5xx_total: errors,
             upstream_latency_ms_sum: 0.0,
             upstream_latency_count: 0,
+            canary_stats: None,
             canary: None,
         }
     }
@@ -618,6 +717,8 @@ mod tests {
                 error_rate_percent: errors,
                 avg_latency_ms: latency,
                 canary: None,
+                canary_error_rate_percent: None,
+                canary_avg_latency_ms: None,
                 is_new: false,
             }
         };
@@ -693,6 +794,8 @@ mod tests {
             error_rate_percent: None,
             avg_latency_ms: None,
             canary: None,
+            canary_error_rate_percent: None,
+            canary_avg_latency_ms: None,
             is_new: false,
         };
         let mut rows = vec![
@@ -796,6 +899,130 @@ mod tests {
             stats.error_rate_percent, None,
             "no requests is not the same as no errors"
         );
+    }
+
+    /// A route carrying a canary that has served `requests` of which `errors`
+    /// were 5xx, each taking `latency_ms`.
+    fn canaried(
+        requests: u64,
+        errors: u64,
+        canary_requests: u64,
+        canary_errors: u64,
+        canary_latency_ms: f64,
+    ) -> RouteEntry {
+        RouteEntry {
+            requests_total: requests,
+            errors_5xx_total: errors,
+            canary: Some(Canary {
+                backend: "api-v3".to_string(),
+                weight_percent: 10,
+            }),
+            canary_stats: Some(crate::contract::CanaryStats {
+                requests_total: canary_requests,
+                errors_5xx_total: canary_errors,
+                upstream_latency_ms_sum: canary_latency_ms * canary_requests as f64,
+                upstream_latency_count: canary_requests,
+            }),
+            ..route("api.example.com", "/", "api-v2", requests, errors)
+        }
+    }
+
+    #[test]
+    fn the_canary_rate_is_windowed_like_every_other_rate() {
+        // The property that makes it usable: a canary that started failing one
+        // interval ago must show it, on a process whose lifetime numbers are
+        // dominated by a week of clean traffic.
+        let before = response(vec![canaried(100_000, 0, 10_000, 0, 10.0)]);
+        let now = response(vec![canaried(100_200, 20, 10_100, 20, 10.0)]);
+
+        let rows = compute_rows(
+            &now,
+            Some(&baseline_of(&before)),
+            Duration::from_secs(10),
+        );
+        let row = &rows[0];
+
+        // 20 of the canary's 100 new requests failed.
+        assert_eq!(row.canary_error_rate_percent, Some(20.0));
+        // Against a route-wide rate of 20 in 200, which is where the stable
+        // side's health hides if you only look at one number.
+        assert_eq!(row.error_rate_percent, Some(10.0));
+    }
+
+    #[test]
+    fn a_canary_with_no_traffic_this_window_reports_no_rate() {
+        // Not a zero rate. 0% on a canary nothing has reached reads as
+        // "healthy", and that is the number somebody is about to promote on.
+        let before = response(vec![canaried(1000, 0, 100, 0, 10.0)]);
+        let now = response(vec![canaried(1200, 0, 100, 0, 10.0)]);
+
+        let rows = compute_rows(&now, Some(&baseline_of(&before)), Duration::from_secs(10));
+        assert_eq!(rows[0].canary_error_rate_percent, None);
+        assert_eq!(rows[0].canary_avg_latency_ms, None);
+        assert_eq!(rows[0].error_rate_percent, Some(0.0), "the route did serve");
+    }
+
+    #[test]
+    fn a_route_with_no_canary_has_no_canary_rate() {
+        let before = response(vec![route("api.example.com", "/", "api", 100, 0)]);
+        let now = response(vec![route("api.example.com", "/", "api", 200, 4)]);
+
+        let rows = compute_rows(&now, Some(&baseline_of(&before)), Duration::from_secs(10));
+        assert_eq!(rows[0].canary_error_rate_percent, None);
+        assert_eq!(rows[0].canary_avg_latency_ms, None);
+    }
+
+    #[test]
+    fn the_canary_latency_is_the_windowed_mean() {
+        let before = response(vec![canaried(1000, 0, 100, 0, 10.0)]);
+        let now = response(vec![canaried(1200, 0, 200, 0, 30.0)]);
+
+        let rows = compute_rows(&now, Some(&baseline_of(&before)), Duration::from_secs(10));
+        // 200 requests at 30ms is 6000ms of sum; 100 at 10ms was 1000. The
+        // window is 5000ms over 100 observations.
+        assert_eq!(rows[0].canary_avg_latency_ms, Some(50.0));
+    }
+
+    #[test]
+    fn a_server_that_omits_the_split_still_polls() {
+        // `canary_stats` was added after the fact, and a mixed-version cluster
+        // is a normal state during an upgrade.
+        let entry = RouteEntry {
+            canary: Some(Canary {
+                backend: "api-v3".to_string(),
+                weight_percent: 10,
+            }),
+            canary_stats: None,
+            ..route("api.example.com", "/", "api-v2", 100, 0)
+        };
+        let rows = compute_rows(
+            &response(vec![entry.clone()]),
+            Some(&baseline_of(&response(vec![entry]))),
+            Duration::from_secs(10),
+        );
+        assert_eq!(rows[0].canary_error_rate_percent, None);
+        assert_eq!(rows[0].canary_label(), "10%→api-v3");
+    }
+
+    #[test]
+    fn canary_health_is_appended_after_the_split() {
+        // The share is what the row is about; the health is the part a narrow
+        // terminal is allowed to cut.
+        let mut row = rows_for_sorting().remove(0);
+        row.canary = Some(Canary {
+            backend: "api-v3".to_string(),
+            weight_percent: 25,
+        });
+        assert_eq!(row.canary_label(), "25%→api-v3");
+
+        row.canary_error_rate_percent = Some(2.14);
+        row.canary_avg_latency_ms = Some(41.6);
+        assert_eq!(row.canary_label(), "25%→api-v3 2.1% 42ms");
+
+        // A canary with traffic but no upstream observations still says what
+        // it knows rather than nothing.
+        row.canary_avg_latency_ms = None;
+        assert_eq!(row.canary_label(), "25%→api-v3 2.1%");
     }
 
     #[test]
