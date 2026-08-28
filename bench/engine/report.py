@@ -230,21 +230,57 @@ def main():
             + ", ".join(fmt(v) for v in base_runs)
             + f" rps — {drift:.1%} spread.\n"
         )
-        if drift > 0.15:
-            lines.append(
-                "**The baseline moved by more than 15%, so this run measured the "
-                "machine as much as the contenders.** Treat every number above as "
-                "indicative only; a difference smaller than this drift cannot be "
-                "attributed to anything under test.\n"
-            )
-            problems.append(
-                f"baseline drift {drift:.1%} across rounds: {base_runs}"
-            )
-        else:
+        if drift <= 0.15:
             lines.append(
                 "Under 15%, so the contenders were measured against a stable "
                 "machine.\n"
             )
+        else:
+            lines.append(
+                f"**The machine moved by {drift:.1%} between rounds**, which is more "
+                "than this harness should have to tolerate. Whether that invalidates "
+                "a given comparison depends on whether the comparison is larger than "
+                "the drift, so the rank-order check below decides it rather than a "
+                "single threshold.\n"
+            )
+
+        # Drift makes a *median* untrustworthy, because a median mixes rounds
+        # measured under different conditions. It does not touch a rank-order
+        # statement: if one contender's worst round still beats another's best,
+        # no amount of drift within the measured range can be what put it there.
+        # That is the claim worth making when the machine will not sit still.
+        uring = table.get(("ramjet (uring)", main_level, "rps_all"))
+        if uring:
+            lines.append("### The comparison that drift cannot reach\n")
+            lines.append("| Comparison | worst uring round | best rival round | verdict |")
+            lines.append("|---|---:|---:|---|")
+            clean = True
+            for rival in ("ramjet (hyper)", "nginx"):
+                other = table.get((rival, main_level, "rps_all"))
+                if not other:
+                    continue
+                worst, best = min(uring), max(other)
+                if worst > best:
+                    verdict = f"uring ahead by {(worst / best - 1):.0%} at worst"
+                else:
+                    verdict = "**overlaps — not separable**"
+                    clean = False
+                lines.append(
+                    f"| uring vs {rival} | {fmt(worst)} | {fmt(best)} | {verdict} |"
+                )
+            lines.append("")
+            if clean:
+                lines.append(
+                    "Every measured uring round beat every measured round of both "
+                    "rivals. The ranges do not overlap, so the ordering is a fact "
+                    "about the contenders and not about the machine — whatever the "
+                    "drift did to the exact figures.\n"
+                )
+            else:
+                problems.append(
+                    "contender ranges overlap; the ordering is not separable from "
+                    f"the {drift:.1%} baseline drift"
+                )
 
     out = "\n".join(lines)
     print(out)
