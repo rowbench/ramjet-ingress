@@ -130,6 +130,37 @@ controller:
 proxyProtocol:
   enabled: false
 
+# HTTP/3 over QUIC, on the same port number as https but in UDP.
+#
+# EXPERIMENTAL, and off. Turning it on adds --http3, a UDP containerPort and a
+# UDP Service port, and makes every HTTPS response carry
+# `alt-svc: h3=":<port>"; ma=86400` — which is a client's only way to learn the
+# QUIC port exists.
+#
+# The advertisement names the port clients already use for TCP, so that exact
+# port number has to be reachable over UDP too, all the way through whatever
+# fronts this Service. That is the part that is not a values change:
+#
+#   - AWS NLB forwards UDP, and is the shape this was built against: one
+#     Service can carry TCP 443 and UDP 443 on one balancer.
+#   - GCP, Azure and most other managed L4 load balancers either do not forward
+#     UDP at all or need a second balancer for it — and two balancers do not
+#     share an address, so the advertisement would name a port the client
+#     cannot reach.
+#   - hostNetwork on bare metal works, because there is no balancer to ask: the
+#     node's UDP 443 is the node's UDP 443.
+#
+# A client whose QUIC attempt fails falls back to TCP on its own, so getting
+# this wrong is slow rather than broken — one wasted attempt per connection
+# until the advertisement expires. deploy/README.md has the detail.
+#
+# It also requires ports.https, because the QUIC listener takes that port
+# number and the alt-svc header rides on that listener's responses. The daemon
+# refuses the combination at startup rather than binding a UDP port that
+# nothing advertises.
+http3:
+  enabled: false
+
 ports:
   http: 8080
   # The TLS listener, or 0 to have none at all. Zero is what you want when

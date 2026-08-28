@@ -144,6 +144,48 @@ rather than aiming an HTTP check at the admin port, which would reject it and
 take every target unhealthy. DigitalOcean and Scaleway keep their default TCP
 checks for the same reason.
 
+## HTTP/3, and which load balancers can carry it
+
+`http3.enabled=true` is experimental and off by default. It adds `--http3`, a UDP
+container port and a UDP Service port — both on the **same number** as `https` —
+and makes every HTTPS response carry `alt-svc: h3=":<port>"; ma=86400`.
+
+That header is the whole mechanism, and it is also the whole constraint. A client
+that reads it retries **the same authority** over QUIC, so the port number it is
+already using for TCP has to answer UDP too, through every hop in front of this
+Service. Which is a per-provider question with mostly disappointing answers:
+
+| Shape | UDP on the same address and port? |
+|---|---|
+| AWS NLB (`aws`, `aws-nlb-proxy`) | **Yes.** One NLB carries TCP 443 and UDP 443 on one address; this is the shape it was built against |
+| `aws-nlb-tls` | **No, and not meaningfully.** ACM terminates TLS at the balancer and forwards plaintext, and there is no QUIC to a plaintext port |
+| GCP, Azure, Oracle, Exoscale, DigitalOcean, Scaleway | **Per-provider, usually not on the same address.** Where UDP is supported at all it typically needs a second load balancer, and two balancers do not share an address — so the advertisement would name a port the client cannot reach |
+| `baremetal-hostnetwork` | **Yes.** There is no balancer to ask: the node's UDP 443 is the node's UDP 443 |
+| `baremetal-nodeport` | **Partly.** The chart does not pin a UDP nodePort, so the allocated one will not match 30443; fine behind something that maps ports, not for direct access |
+
+Getting it wrong is slow rather than broken. A client whose QUIC attempt fails
+falls back to TCP by itself — the cost is one wasted attempt per connection until
+the advertisement expires, which is why `ma` is a day and not a week.
+
+The presets are deliberately unchanged: none of them turns this on, because
+whether UDP reaches the pod is a property of an account's networking rather than
+of a provider. Turn it on with `--set http3.enabled=true` on top of a preset once
+you have checked that it does.
+
+Two more things worth knowing before enabling it in production:
+
+- **The PROXY protocol does not apply.** It is a preamble on a TCP byte stream
+  and has no UDP form, so a QUIC connection's client address is whatever the IP
+  header says. On a balancer that forwards UDP without rewriting the source that
+  is the real client; on one that SNATs it, `X-Forwarded-For` on HTTP/3 requests
+  will name the balancer while the TCP path is still correct. There is no
+  configuration that fixes the difference.
+- **It is one core.** The QUIC endpoint runs on a single dedicated runtime
+  rather than one per core, for the reason set out in `crates/ramjet-proxy/src/http3.rs`:
+  sharding a UDP port across sockets with `SO_REUSEPORT` hashes by 4-tuple, and
+  a QUIC connection is deliberately not identified by its 4-tuple. HTTP/1.1 and
+  HTTP/2 keep every core they had.
+
 ## Bare metal
 
 Two shapes, and the choice is about which ports you need.

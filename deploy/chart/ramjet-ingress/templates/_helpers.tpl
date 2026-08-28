@@ -89,6 +89,9 @@ the render is the cheaper place to find out.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- if and .Values.http3.enabled (not .Values.ports.https) -}}
+{{- fail "http3.enabled needs ports.https: HTTP/3 is served on that port number in UDP, and the alt-svc header that advertises it rides on that listener's responses. The daemon refuses the combination at startup, so the pod would not start" -}}
+{{- end -}}
 {{/*
 Deliberately not validated here: proxyProtocol.enabled without a matching
 provider annotation. It looks like the same class of mistake, but an external

@@ -80,6 +80,9 @@ spec:
             - --no-https
             {{- end }}
             - --admin=:{{ .Values.ports.admin }}
+            {{- if .Values.http3.enabled }}
+            - --http3
+            {{- end }}
             {{- if .Values.proxyProtocol.enabled }}
             - --proxy-protocol
             {{- end }}
@@ -138,6 +141,15 @@ spec:
             - name: https
               containerPort: {{ .Values.ports.https }}
               protocol: TCP
+            {{- if .Values.http3.enabled }}
+            # The same port number, in UDP, and that is the requirement rather
+            # than a convention: the alt-svc header names the port the client
+            # is already talking to, so HTTP/3 has to be there or the
+            # advertisement points at nothing.
+            - name: https-quic
+              containerPort: {{ .Values.ports.https }}
+              protocol: UDP
+            {{- end }}
             {{- end }}
             - name: admin
               containerPort: {{ .Values.ports.admin }}

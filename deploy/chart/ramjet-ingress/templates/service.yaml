@@ -48,5 +48,25 @@ spec:
       {{- if and .Values.service.https.nodePort (ne (toString .Values.service.type) "ClusterIP") }}
       nodePort: {{ .Values.service.https.nodePort }}
       {{- end }}
+    {{- if .Values.http3.enabled }}
+    # HTTP/3, on the same port number as https and in UDP. A Service may carry
+    # two ports with the same number when their protocols differ, and it has to
+    # here: the alt-svc header advertises the port clients already use for TCP,
+    # so a different number would be advertising something no client would
+    # reach. Whether the load balancer in front actually forwards UDP is a
+    # per-provider question — see deploy/README.md.
+    - name: https-quic
+      port: {{ .Values.service.https.port }}
+      # Always the QUIC container port, never service.https.targetPort:
+      # repointing that one at `http` is how "the load balancer terminates TLS"
+      # is expressed, and there is no such thing as QUIC to a plaintext port.
+      targetPort: https-quic
+      protocol: UDP
+      # No nodePort. Whether a Service may reuse one across protocols is a
+      # question different Kubernetes versions answer differently, and a
+      # rejected Service is a worse outcome than an allocated UDP nodePort
+      # nobody addresses directly — LoadBalancer traffic arrives on `port`,
+      # which is the number alt-svc advertises and the one that has to match.
+    {{- end }}
   selector:
     {{- include "ramjet-ingress.selectorLabels" . | nindent 4 }}
