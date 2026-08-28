@@ -90,6 +90,7 @@ pub mod history;
 pub mod http3;
 pub mod listener;
 pub mod metrics;
+pub mod mirror;
 pub mod proxy_protocol;
 pub mod rng;
 pub mod server;
@@ -104,6 +105,7 @@ pub use history::{
 };
 pub use listener::{Listener, ListenerConfig};
 pub use metrics::Metrics;
+pub use mirror::{Mirror, DEFAULT_MIRROR_MAX_BODY, MIRROR_QUEUE_DEPTH};
 pub use server::{
     serve, ProxyConfig, Server, Shutdown, ShutdownHandle, DEFAULT_ADMIN_PORT, DEFAULT_HTTP_PORT,
     DEFAULT_HTTPS_PORT, DEFAULT_MAX_BUF_SIZE, MIN_MAX_BUF_SIZE,

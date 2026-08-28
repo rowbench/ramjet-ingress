@@ -21,6 +21,7 @@ mod args;
 mod certs;
 mod config;
 mod kubernetes;
+mod promotion;
 #[cfg(test)]
 mod testing;
 
@@ -428,6 +429,7 @@ fn proxy_config(args: &Args, https: Option<SocketAddr>) -> ProxyConfig {
         shutdown_grace: args.shutdown_grace,
         worker_threads: args.worker_threads,
         max_buf_size: args.max_buf_size,
+        mirror_max_body: args.mirror_max_body,
         history_size: args.history_size,
         proxy_protocol: args
             .proxy_protocol

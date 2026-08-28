@@ -50,6 +50,18 @@ async fn one_poll_assembles_all_three_endpoints_into_a_snapshot() {
     assert_eq!(canary.backend, "api-v3");
     assert_eq!(canary.weight_percent, 10);
 
+    // The canary's share of the same counters, over the same socket. A subset
+    // of the route's totals rather than a sibling of them, so the difference is
+    // the stable side.
+    let split = route.canary_stats.as_ref().expect("a canary split");
+    assert_eq!(split.requests_total, 1000, "a tenth of 10_007, floored");
+    assert_eq!(split.errors_5xx_total, 12);
+    assert!(split.requests_total < route.requests_total);
+    assert!(
+        snapshot.routes.routes[1].canary_stats.is_none(),
+        "a route with no canary reports no split"
+    );
+
     let newest = &snapshot.generations.generations[0];
     assert_eq!(newest.generation, 42);
     assert_eq!(newest.diff.summary, "1 route added, 1 backend changed");

@@ -281,6 +281,28 @@ impl EngineMetrics {
                 "QUIC connections that never became usable HTTP/3 connections.",
                 0,
             ),
+            // And zero again for mirroring, which is wired per TCP serving lane
+            // on the hyper engine and has no counterpart here.
+            (
+                "ramjet_mirrored_total",
+                "Requests copied to a mirror backend, which accepted the copy.",
+                0,
+            ),
+            (
+                "ramjet_mirror_dropped_total",
+                "Copies discarded because a serving runtime's mirror queue was full.",
+                0,
+            ),
+            (
+                "ramjet_mirror_skipped_total",
+                "Copies not attempted because the request body exceeded --mirror-max-body.",
+                0,
+            ),
+            (
+                "ramjet_mirror_failures_total",
+                "Copies a mirror backend refused, failed, or did not answer in time.",
+                0,
+            ),
         ] {
             let _ = writeln!(out, "# HELP {name} {help}");
             let _ = writeln!(out, "# TYPE {name} counter");

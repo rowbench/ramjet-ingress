@@ -36,6 +36,10 @@
 //!       backend: api-next
 //!       weight: 20
 //!       header: x-canary
+//!     mirror:                       # optional
+//!       backend: api-shadow
+//!       percent: 50               # default 100
+//!       host: shadow.example.com  # optional Host override
 //!
 //! tls:
 //!   - host: shop.example.com        # omit or "*" for the default certificate
@@ -55,8 +59,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ramjet_router::{
-    BuildError, CanaryRules, CertifiedKeyHandle, Endpoint, LbPolicy, PathType, RouteTable,
-    RouteTableBuilder,
+    BuildError, CanaryRules, CertifiedKeyHandle, Endpoint, LbPolicy, MirrorRules, PathType,
+    RouteOptions, RouteTable, RouteTableBuilder,
 };
 use rustls::sign::CertifiedKey;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -128,6 +132,8 @@ pub struct Summary {
     pub routes: usize,
     /// Number of certificates loaded.
     pub certificates: usize,
+    /// Number of routes carrying a mirror.
+    pub mirrors: usize,
     /// Whether a default backend was configured.
     pub default_backend: bool,
 }
@@ -169,26 +175,33 @@ pub fn build(document: Document, base: &Path) -> Result<Loaded, ConfigError> {
     }
 
     for route in &document.routes {
-        let host = route.host.as_deref();
-        match &route.canary {
-            None => builder.route(host, &route.path, route.path_type.into(), &route.backend)?,
-            Some(canary) => builder.canary_route(
-                host,
-                &route.path,
-                route.path_type.into(),
-                &route.backend,
-                &CanaryRules {
-                    backend: &canary.backend,
-                    header: canary.header.as_deref(),
-                    header_value: canary.header_value.as_deref(),
-                    header_pattern: canary.header_pattern.as_deref(),
-                    cookie: canary.cookie.as_deref(),
-                    weight: canary.weight,
-                    weight_total: canary.weight_total,
-                },
-            )?,
-        }
+        let options = RouteOptions {
+            canary: route.canary.as_ref().map(|canary| CanaryRules {
+                backend: &canary.backend,
+                header: canary.header.as_deref(),
+                header_value: canary.header_value.as_deref(),
+                header_pattern: canary.header_pattern.as_deref(),
+                cookie: canary.cookie.as_deref(),
+                weight: canary.weight,
+                weight_total: canary.weight_total,
+            }),
+            mirror: route.mirror.as_ref().map(|mirror| MirrorRules {
+                backend: &mirror.backend,
+                percent: mirror.percent,
+                host: mirror.host.as_deref(),
+            }),
+        };
+        builder.route_with(
+            route.host.as_deref(),
+            &route.path,
+            route.path_type.into(),
+            &route.backend,
+            &options,
+        )?;
         summary.routes += 1;
+        if route.mirror.is_some() {
+            summary.mirrors += 1;
+        }
     }
 
     let mut certs = HashMap::with_capacity(document.tls.len());
@@ -368,6 +381,28 @@ pub struct RouteSpec {
     /// An optional canary split.
     #[serde(default)]
     pub canary: Option<CanarySpec>,
+    /// An optional fire-and-forget copy of the request.
+    #[serde(default)]
+    pub mirror: Option<MirrorSpec>,
+}
+
+/// A mirror attached to a route, mirroring the `ramjet.dev` annotations.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MirrorSpec {
+    /// Where the copy is sent.
+    pub backend: String,
+    /// `mirror-percent`. Defaults to 100, the same as the annotation, so that
+    /// naming a backend is all it takes to see traffic arrive.
+    #[serde(default = "default_percent")]
+    pub percent: u32,
+    /// `mirror-host`: a `Host` header sent instead of the client's.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+fn default_percent() -> u32 {
+    100
 }
 
 /// Path matching, spelled as Kubernetes spells it.
@@ -552,6 +587,109 @@ routes:
     }
 
     #[test]
+    fn a_mirror_is_attached_to_its_route() {
+        let loaded = parse(
+            "
+backends:
+  - {name: prod, endpoints: [127.0.0.1:1]}
+  - {name: shadow, endpoints: [127.0.0.1:3]}
+routes:
+  - host: app.example.com
+    path: /
+    backend: prod
+    mirror:
+      backend: shadow
+      percent: 25
+      host: shadow.example.com
+",
+        )
+        .expect("valid");
+
+        let matched = loaded
+            .table
+            .match_request("app.example.com", "/")
+            .expect("a match");
+        let mirror = matched.mirror().expect("a mirror");
+        assert_eq!(mirror.percent(), 25);
+        assert_eq!(mirror.host(), Some("shadow.example.com"));
+        assert_eq!(
+            matched.backend().name(),
+            "prod",
+            "a mirror must not change where the request itself goes"
+        );
+        assert_eq!(loaded.summary.mirrors, 1);
+    }
+
+    #[test]
+    fn a_mirror_percent_defaults_to_a_hundred_like_the_annotation() {
+        let loaded = parse(
+            "
+backends:
+  - {name: prod, endpoints: [127.0.0.1:1]}
+  - {name: shadow, endpoints: [127.0.0.1:3]}
+routes: [{host: app.example.com, path: /, backend: prod, mirror: {backend: shadow}}]
+",
+        )
+        .expect("valid");
+        let percent = loaded
+            .table
+            .match_request("app.example.com", "/")
+            .and_then(|m| m.mirror())
+            .map(|m| m.percent());
+        assert_eq!(percent, Some(100));
+    }
+
+    #[test]
+    fn a_route_can_carry_a_canary_and_a_mirror_together() {
+        let loaded = parse(
+            "
+backends:
+  - {name: prod, endpoints: [127.0.0.1:1]}
+  - {name: next, endpoints: [127.0.0.1:2]}
+  - {name: shadow, endpoints: [127.0.0.1:3]}
+routes:
+  - host: app.example.com
+    path: /
+    backend: prod
+    canary: {backend: next, weight: 20}
+    mirror: {backend: shadow, percent: 10}
+",
+        )
+        .expect("valid");
+
+        let matched = loaded
+            .table
+            .match_request("app.example.com", "/")
+            .expect("a match");
+        assert_eq!(matched.canary().map(|c| c.weight()), Some(20));
+        assert_eq!(matched.mirror().map(|m| m.percent()), Some(10));
+    }
+
+    #[test]
+    fn a_mirror_naming_a_missing_backend_is_rejected() {
+        let error = parse(
+            "
+backends: [{name: prod, endpoints: [127.0.0.1:1]}]
+routes: [{host: app.example.com, path: /, backend: prod, mirror: {backend: ghost}}]
+",
+        )
+        .expect_err("an unknown backend");
+        assert!(error.to_string().contains("ghost"), "{error}");
+    }
+
+    #[test]
+    fn a_typo_in_the_mirror_block_is_rejected_rather_than_ignored() {
+        let error = parse(
+            "
+backends: [{name: prod, endpoints: [127.0.0.1:1]}]
+routes: [{host: app.example.com, path: /, backend: prod, mirror: {backend: prod, percnt: 5}}]
+",
+        )
+        .expect_err("a typo");
+        assert!(matches!(error, ConfigError::Parse { .. }), "{error}");
+    }
+
+    #[test]
     fn a_default_backend_is_recorded() {
         let loaded = parse(
             "
@@ -664,6 +802,15 @@ tls: [{host: app.example.com, cert: nope.pem, key: nope-key.pem}]
             .and_then(|m| m.canary())
             .expect("the example's canary");
         assert_eq!(canary.header_name(), Some("x-canary"));
+
+        // The example is also how somebody discovers mirroring exists.
+        let mirror = loaded
+            .table
+            .match_request("shop.example.com", "/")
+            .and_then(|m| m.mirror())
+            .expect("the example's mirror");
+        assert_eq!(mirror.percent(), 100);
+        assert_eq!(loaded.summary.mirrors, 1);
     }
 
     #[test]

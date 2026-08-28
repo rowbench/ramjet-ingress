@@ -248,6 +248,11 @@ pub fn generations_json(generation: u64, pinned: Option<u64>, _requests: u64) ->
 /// A `/admin/routes` body with two routes; the first carries the counters.
 pub fn routes_json(generation: u64, requests: u64, errors: u64) -> String {
     let latency_sum = requests as f64 * 5.0;
+    // A tenth of the traffic and all of the failures, which is what a canary
+    // going wrong looks like: the route's totals barely move while the split
+    // says exactly where the errors are coming from.
+    let canary_requests = requests / 10;
+    let canary_latency_sum = canary_requests as f64 * 9.0;
     format!(
         r#"{{
   "generation": {generation},
@@ -262,7 +267,13 @@ pub fn routes_json(generation: u64, requests: u64, errors: u64) -> String {
       "errors_5xx_total": {errors},
       "upstream_latency_ms_sum": {latency_sum},
       "upstream_latency_count": {requests},
-      "canary": {{"backend": "api-v3", "weight_percent": 10}}
+      "canary": {{"backend": "api-v3", "weight_percent": 10}},
+      "canary_stats": {{
+        "requests_total": {canary_requests},
+        "errors_5xx_total": {errors},
+        "upstream_latency_ms_sum": {canary_latency_sum},
+        "upstream_latency_count": {canary_requests}
+      }}
     }},
     {{
       "host": "*",
@@ -274,7 +285,8 @@ pub fn routes_json(generation: u64, requests: u64, errors: u64) -> String {
       "errors_5xx_total": 0,
       "upstream_latency_ms_sum": 14.0,
       "upstream_latency_count": 7,
-      "canary": null
+      "canary": null,
+      "canary_stats": null
     }}
   ]
 }}"#

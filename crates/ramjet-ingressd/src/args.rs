@@ -145,6 +145,8 @@ pub struct Args {
     pub upstream_pool_idle: usize,
     /// Ceiling on one client connection's HTTP/1 read and write buffers.
     pub max_buf_size: usize,
+    /// Largest request body copied to a mirror backend.
+    pub mirror_max_body: usize,
     /// Serving runtimes to start, or `None` for one per available core.
     pub worker_threads: Option<usize>,
     /// Which data plane serves traffic.
@@ -190,6 +192,7 @@ impl Default for Args {
             max_connect_attempts: 3,
             upstream_pool_idle: ramjet_proxy::DEFAULT_POOL_MAX_IDLE_PER_HOST,
             max_buf_size: DEFAULT_MAX_BUF_SIZE,
+            mirror_max_body: ramjet_proxy::DEFAULT_MIRROR_MAX_BODY,
             worker_threads: None,
             engine: Engine::Hyper,
             proxy_protocol: false,
@@ -362,6 +365,59 @@ SERVING:
     nginx's own 32 KiB limit would and bounds the worst case at a sixth of
     hyper's default. Requests over the ceiling are answered 431.
 
+TRAFFIC MIRRORING:
+    --mirror-max-body <BYTES> Largest request body copied to a mirror backend
+                                                         [default: 262144]
+
+    A route whose Ingress carries `ramjet.dev/mirror-backend:
+    <namespace>/<service>:<port>` gets a second, fire-and-forget copy of each
+    sampled request sent to that backend, and the answer is thrown away.
+    `ramjet.dev/mirror-percent` (0-100, default 100) samples it down, and
+    `ramjet.dev/mirror-host` overrides the Host header on the copy — which a
+    shadow deployment answering to a different name needs, and which stops a
+    copy being routed back to production by whatever is in front of it. Copies
+    carry `X-Mirrored-By: ramjet-ingress`.
+
+    Mirroring cannot slow the request the client is waiting for. Nothing is
+    awaited on the request path; each serving runtime has a bounded queue and
+    drops on overflow; responses are drained and discarded; a mirror backend
+    that is down, refusing, or wedged produces a number on /metrics and nothing
+    else. The one real cost is the body: a request with one is read up to
+    --mirror-max-body so both copies can have it, and a body over the cap is
+    forwarded whole to the real backend with the mirror skipped. A request with
+    no body -- every GET, HEAD, OPTIONS and DELETE -- is mirrored with no
+    buffering at all and keeps its endpoint failover.
+
+    Watch ramjet_mirrored_total, ramjet_mirror_dropped_total (queue full),
+    ramjet_mirror_skipped_total (body over the cap), and
+    ramjet_mirror_failures_total (the backend refused or did not answer).
+
+CANARY AUTO-PROMOTION:
+    No flags. It is annotation-driven, per canary Ingress, and off unless
+    `ramjet.dev/auto-promote: \"true\"` is set on one:
+
+      auto-promote-interval             [default: 60s]  observation window
+      auto-promote-steps       [default: 5,10,25,50,100]  weights to walk
+      auto-promote-max-5xx-percent      [default: 1]    canary error budget
+      auto-promote-max-latency-factor   [default: 1.5]  canary mean vs stable
+      auto-promote-min-requests         [default: 50]   per window, per side
+
+    Every interval the daemon takes that window's request, 5xx and latency
+    counters for the canary and stable sides of the route separately. If either
+    side saw fewer than min-requests it holds -- no traffic is not failure.
+    Otherwise it advances the canary Ingress's canary-weight to the next step,
+    or, on a breach, pulls the weight to 0 and writes `auto-promote: \"false\"`
+    plus `auto-promote-status: \"rolled-back: <reason>\"`. A rollback is one-way:
+    re-arming is a human decision. Reaching the last step writes
+    `auto-promote-status: promoted` and stops; swapping the production Ingress's
+    backend stays a human edit, deliberately.
+
+    Decisions are logged with their numbers on the `audit` target, written as
+    Events on the IngressClass (CanaryStepped, CanaryPromoted, CanaryRolledBack)
+    and POSTed to --audit-webhook. Everything is paused while a rollback pin is
+    held. RBAC: `networking.k8s.io` / `ingresses` / `patch`, which the chart's
+    ClusterRole has.
+
 SHUTDOWN:
     --shutdown-grace <SECS>   In-flight requests get this long after SIGTERM
                                                              [default: 30]
@@ -376,7 +432,8 @@ RAMJET_PUBLISH_ADDRESS, RAMJET_PUBLISH_SERVICE, RAMJET_UPDATE_STATUS,
 RAMJET_HISTORY_SIZE, RAMJET_AUDIT_WEBHOOK,
 RAMJET_HTTP, RAMJET_HTTPS, RAMJET_ADMIN, RAMJET_CONNECT_TIMEOUT,
 RAMJET_RESPONSE_TIMEOUT, RAMJET_MAX_CONNECT_ATTEMPTS, RAMJET_UPSTREAM_POOL_IDLE,
-RAMJET_MAX_BUF_SIZE, RAMJET_WORKER_THREADS, RAMJET_SHUTDOWN_GRACE,
+RAMJET_MAX_BUF_SIZE, RAMJET_MIRROR_MAX_BODY, RAMJET_WORKER_THREADS,
+RAMJET_SHUTDOWN_GRACE,
 RAMJET_ENGINE, RAMJET_PROXY_PROTOCOL, RAMJET_PROXY_PROTOCOL_TIMEOUT,
 RAMJET_HTTP3).
 A flag always beats the environment. RUST_LOG sets the log filter.
@@ -495,6 +552,7 @@ impl Args {
                 "--max-buf-size" => {
                     args.max_buf_size = number(&name, &value()?)?.max(MIN_MAX_BUF_SIZE);
                 }
+                "--mirror-max-body" => args.mirror_max_body = number(&name, &value()?)?,
                 "--worker-threads" => {
                     args.worker_threads = Some(number(&name, &value()?)?.max(1));
                 }
@@ -614,6 +672,9 @@ impl Args {
         }
         if let Some(value) = env("RAMJET_MAX_BUF_SIZE") {
             args.max_buf_size = number("RAMJET_MAX_BUF_SIZE", &value)?.max(MIN_MAX_BUF_SIZE);
+        }
+        if let Some(value) = env("RAMJET_MIRROR_MAX_BODY") {
+            args.mirror_max_body = number("RAMJET_MIRROR_MAX_BODY", &value)?;
         }
         if let Some(value) = env("RAMJET_ENGINE") {
             args.engine = engine("RAMJET_ENGINE", &value)?;
@@ -1041,6 +1102,7 @@ mod tests {
             "--shutdown-grace",
             "--max-connect-attempts",
             "--max-buf-size",
+            "--mirror-max-body",
             "--engine",
             "--proxy-protocol",
             "--proxy-protocol-timeout",
@@ -1048,6 +1110,54 @@ mod tests {
             "--audit-webhook",
         ] {
             assert!(USAGE.contains(option), "{option} is undocumented");
+        }
+    }
+
+    #[test]
+    fn the_mirror_body_cap_takes_a_flag_and_an_environment_twin() {
+        assert_eq!(
+            parse(&[]).expect("valid").mirror_max_body,
+            ramjet_proxy::DEFAULT_MIRROR_MAX_BODY
+        );
+        assert_eq!(
+            parse(&["--mirror-max-body", "1024"])
+                .expect("valid")
+                .mirror_max_body,
+            1024
+        );
+
+        let env = |name: &str| match name {
+            "RAMJET_MIRROR_MAX_BODY" => Some("4096".to_owned()),
+            _ => None,
+        };
+        let args = Args::parse(Vec::<String>::new(), env).expect("valid");
+        assert_eq!(args.mirror_max_body, 4096);
+    }
+
+    #[test]
+    fn a_mirror_body_cap_of_zero_is_a_legal_way_to_mirror_only_empty_bodies() {
+        // Not clamped up, unlike the buffer ceiling: zero means "never buffer",
+        // which still mirrors every GET and is a reasonable thing to ask for on
+        // a route that carries large uploads.
+        assert_eq!(
+            parse(&["--mirror-max-body", "0"])
+                .expect("valid")
+                .mirror_max_body,
+            0
+        );
+    }
+
+    #[test]
+    fn the_usage_text_documents_both_new_features() {
+        for phrase in [
+            "ramjet.dev/mirror-backend",
+            "X-Mirrored-By",
+            "ramjet_mirror_dropped_total",
+            "auto-promote-steps",
+            "auto-promote-max-latency-factor",
+            "rolled-back",
+        ] {
+            assert!(USAGE.contains(phrase), "{phrase} is undocumented");
         }
     }
 

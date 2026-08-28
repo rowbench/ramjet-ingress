@@ -23,14 +23,23 @@
 //!
 //! # Streaming
 //!
-//! Nothing here buffers. `poll_frame` on the `Stream` variant is a straight
-//! delegation to `Incoming`, so a response passes through frame by frame at
-//! whatever rate the slower of the two connections can take it, with hyper's
-//! flow control applying backpressure across the proxy. A 4GB download moves
-//! through a few tens of kilobytes of buffer, and the process memory of an
-//! ingress replica does not depend on what any client happens to be
+//! Nothing here buffers *on its own*. `poll_frame` on the `Stream` variant is a
+//! straight delegation to `Incoming`, so a response passes through frame by
+//! frame at whatever rate the slower of the two connections can take it, with
+//! hyper's flow control applying backpressure across the proxy. A 4GB download
+//! moves through a few tens of kilobytes of buffer, and the process memory of
+//! an ingress replica does not depend on what any client happens to be
 //! downloading. This is the behaviour ingress-nginx gets by *disabling*
 //! `proxy_buffering`; here there is no other mode to be in.
+//!
+//! [`ProxyBody::prefixed`] is the one exception, and it exists to keep that
+//! promise rather than to break it. Mirroring a request body means reading it,
+//! and a body that turns out to be larger than
+//! [`--mirror-max-body`](crate::mirror) must still reach the real upstream —
+//! whole, in order, and without waiting for the rest of it to arrive. So the
+//! bytes already read become a prefix and the remainder stays a stream: the
+//! upload resumes streaming from wherever the cap stopped it, and a body nobody
+//! is mirroring never takes this path at all.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -45,6 +54,7 @@ pin_project_lite::pin_project! {
         Empty,
         Once { data: Option<Bytes> },
         Stream { #[pin] body: Incoming },
+        Prefixed { data: Option<Bytes>, #[pin] body: Incoming },
         Http3 { data: Option<Bytes>, body: Box<crate::http3::RequestBody> },
     }
 }
@@ -135,6 +145,62 @@ impl ProxyBody {
         }
     }
 
+    /// Bytes already read from `rest`, followed by whatever is left of it.
+    ///
+    /// The two halves are one body: `prefix` is emitted as a single frame and
+    /// then `rest` continues from where the read stopped. See the module docs
+    /// for why this exists.
+    ///
+    /// Only a stream needs the extra variant. A body that was already fully
+    /// known collapses back into one chunk, so re-prefixing cannot build a
+    /// chain of wrappers each costing a frame.
+    pub fn prefixed(prefix: Bytes, rest: ProxyBody) -> Self {
+        if prefix.is_empty() {
+            return rest;
+        }
+        match rest.inner {
+            Inner::Empty => Self::once(prefix),
+            Inner::Once { data } => match data {
+                None => Self::once(prefix),
+                Some(tail) => {
+                    let mut joined = bytes::BytesMut::with_capacity(prefix.len() + tail.len());
+                    joined.extend_from_slice(&prefix);
+                    joined.extend_from_slice(&tail);
+                    Self::once(joined.freeze())
+                }
+            },
+            Inner::Stream { body } | Inner::Prefixed { data: None, body } => ProxyBody {
+                inner: Inner::Prefixed {
+                    data: Some(prefix),
+                    body,
+                },
+            },
+            Inner::Prefixed {
+                data: Some(held),
+                body,
+            } => {
+                let mut joined = bytes::BytesMut::with_capacity(prefix.len() + held.len());
+                joined.extend_from_slice(&prefix);
+                joined.extend_from_slice(&held);
+                ProxyBody {
+                    inner: Inner::Prefixed {
+                        data: Some(joined.freeze()),
+                        body,
+                    },
+                }
+            }
+            // An HTTP/3 request body carries its own prefix slot rather than
+            // borrowing `Prefixed`, which is typed to hyper's `Incoming` and
+            // cannot hold a QUIC stream.
+            Inner::Http3 { data, body } => ProxyBody {
+                inner: Inner::Http3 {
+                    data: Some(join(prefix, data)),
+                    body,
+                },
+            },
+        }
+    }
+
     /// Whether this body is known, without reading it, to carry no data.
     ///
     /// This is the question the retry logic asks: a request body that is known
@@ -146,10 +212,22 @@ impl ProxyBody {
             Inner::Empty => true,
             Inner::Once { data } => data.as_ref().is_none_or(Bytes::is_empty),
             Inner::Stream { body } => body.size_hint().exact() == Some(0),
+            // A prefix is only built from bytes that were actually read, so
+            // there is something here by construction.
+            Inner::Prefixed { .. } => false,
             Inner::Http3 { data: Some(_), .. } => false,
             Inner::Http3 { data: None, body } => body.is_known_empty(),
         }
     }
+}
+
+/// One chunk in front of another, when there is another.
+fn join(prefix: Bytes, held: Option<Bytes>) -> Bytes {
+    let Some(held) = held else { return prefix };
+    let mut joined = bytes::BytesMut::with_capacity(prefix.len() + held.len());
+    joined.extend_from_slice(&prefix);
+    joined.extend_from_slice(&held);
+    joined.freeze()
 }
 
 impl std::fmt::Debug for ProxyBody {
@@ -158,6 +236,7 @@ impl std::fmt::Debug for ProxyBody {
             Inner::Empty => "Empty",
             Inner::Once { .. } => "Once",
             Inner::Stream { .. } => "Stream",
+            Inner::Prefixed { .. } => "Prefixed",
             Inner::Http3 { .. } => "Http3",
         };
         f.debug_tuple("ProxyBody").field(&kind).finish()
@@ -179,6 +258,10 @@ impl Body for ProxyBody {
             InnerProj::Empty => Poll::Ready(None),
             InnerProj::Once { data } => Poll::Ready(data.take().map(|d| Ok(Frame::data(d)))),
             InnerProj::Stream { body } => hyper_frame(body.poll_frame(cx)),
+            InnerProj::Prefixed { data, body } => match data.take() {
+                Some(prefix) => Poll::Ready(Some(Ok(Frame::data(prefix)))),
+                None => hyper_frame(body.poll_frame(cx)),
+            },
             InnerProj::Http3 { data, body } => match data.take() {
                 Some(prefix) => Poll::Ready(Some(Ok(Frame::data(prefix)))),
                 None => body.poll_frame(cx),
@@ -191,6 +274,7 @@ impl Body for ProxyBody {
             Inner::Empty => true,
             Inner::Once { data } => data.is_none(),
             Inner::Stream { body } => body.is_end_stream(),
+            Inner::Prefixed { data, body } => data.is_none() && body.is_end_stream(),
             Inner::Http3 { data, body } => data.is_none() && body.is_end_stream(),
         }
     }
@@ -202,11 +286,22 @@ impl Body for ProxyBody {
                 SizeHint::with_exact(data.as_ref().map_or(0, |d| d.len() as u64))
             }
             Inner::Stream { body } => body.size_hint(),
+            Inner::Prefixed { data, body } => {
+                // The prefix has already been taken off `body`'s hint, so it
+                // has to be added back: hyper decides whether to send a
+                // `Content-Length` from this, and a hint that undercounts by
+                // the prefix would truncate the upload.
+                let held = data.as_ref().map_or(0, |d| d.len() as u64);
+                let rest = body.size_hint();
+                let mut hint = SizeHint::new();
+                hint.set_lower(rest.lower().saturating_add(held));
+                if let Some(upper) = rest.upper() {
+                    hint.set_upper(upper.saturating_add(held));
+                }
+                hint
+            }
             Inner::Http3 { data, body } => {
-                // The held chunk has already been taken off `body`'s hint, so
-                // it has to be added back: hyper decides the upstream framing
-                // from this, and a hint that undercounted by it would describe
-                // a shorter request than the one being sent.
+                // Same arithmetic as `Prefixed`, and for the same reason.
                 let held = data.as_ref().map_or(0, |d| d.len() as u64);
                 let rest = body.size_hint();
                 let mut hint = SizeHint::new();
@@ -250,6 +345,34 @@ mod tests {
         assert!(!body.is_known_empty());
         let collected = body.collect().await.expect("collects").to_bytes();
         assert_eq!(&collected[..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn a_prefix_over_a_known_body_collapses_into_one_chunk() {
+        // Nothing needs a wrapper here: both halves are already in memory, and
+        // a chain of them would cost a frame each for no reason.
+        let body = ProxyBody::prefixed(
+            Bytes::from_static(b"head"),
+            ProxyBody::once(Bytes::from_static(b"tail")),
+        );
+        assert_eq!(body.size_hint().exact(), Some(8));
+        let collected = body.collect().await.expect("collects").to_bytes();
+        assert_eq!(&collected[..], b"headtail");
+    }
+
+    #[tokio::test]
+    async fn a_prefix_over_nothing_is_just_the_prefix() {
+        let body = ProxyBody::prefixed(Bytes::from_static(b"only"), ProxyBody::empty());
+        assert_eq!(body.size_hint().exact(), Some(4));
+        let collected = body.collect().await.expect("collects").to_bytes();
+        assert_eq!(&collected[..], b"only");
+    }
+
+    #[tokio::test]
+    async fn an_empty_prefix_hands_back_the_body_untouched() {
+        let body = ProxyBody::prefixed(Bytes::new(), ProxyBody::once(Bytes::from_static(b"x")));
+        assert_eq!(body.size_hint().exact(), Some(1));
+        assert!(!body.is_known_empty());
     }
 
     #[test]

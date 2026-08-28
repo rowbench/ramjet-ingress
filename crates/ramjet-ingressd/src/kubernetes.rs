@@ -70,6 +70,7 @@ use tracing::{error, info, warn};
 
 use crate::args::Args;
 use crate::certs;
+use crate::promotion::{KubePatcher, Promoter};
 
 /// Turns a compiled generation's certificate material into parsed keys,
 /// reusing everything that did not rotate.
@@ -213,7 +214,22 @@ pub async fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     .await?;
     crate::watch_pins(Arc::clone(server.history()), audit.clone());
 
-    let (configs, controller) = ramjet_controller::spawn(client, opts)?;
+    let (configs, controller) = ramjet_controller::spawn(client.clone(), opts)?;
+
+    // A second reader of the same channel, rather than a second watch or a
+    // periodic `list`: the controller has already read every Ingress and parsed
+    // every annotation, so the promotion loop's candidates arrive with the
+    // generation that compiled them and cost no API traffic at all. With nobody
+    // opted in the list is empty and the loop is a timer that does nothing.
+    let promoter = tokio::spawn(
+        Promoter::new(
+            KubePatcher::new(client),
+            audit.clone(),
+            Arc::clone(&routes),
+            Arc::clone(server.history()),
+        )
+        .run(configs.clone()),
+    );
 
     // The server's own signal handling is replaced by a channel this process
     // can also fire, so a control plane that stops taking us down with it goes
@@ -244,8 +260,10 @@ pub async fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Aborting the controller handle stops all five watches: they live inside
     // that one task by construction.
     applier.abort();
+    promoter.abort();
     controller.abort();
     let _ = applier.await;
+    let _ = promoter.await;
     let _ = controller.await;
 
     let code = crate::finish(result)?;
@@ -363,6 +381,7 @@ mod tests {
         CompiledConfig {
             table: Arc::new(builder.build().expect("builds")),
             certs,
+            promotions: Vec::new(),
             digest: u64::from(port),
         }
     }
@@ -634,6 +653,7 @@ mod tests {
         pipeline.apply(&CompiledConfig {
             table: Arc::new(builder.build().expect("builds")),
             certs: Vec::new(),
+            promotions: Vec::new(),
             digest: 2,
         });
 
@@ -658,6 +678,7 @@ mod tests {
         Arc::new(CompiledConfig {
             table: Arc::new(builder.build().expect("builds")),
             certs: Vec::new(),
+            promotions: Vec::new(),
             digest: generation,
         })
     }
@@ -782,6 +803,7 @@ mod tests {
         let (applied, published) = pipeline.apply(&CompiledConfig {
             table: Arc::new(second),
             certs: Vec::new(),
+            promotions: Vec::new(),
             digest: 0,
         });
         assert!(published);

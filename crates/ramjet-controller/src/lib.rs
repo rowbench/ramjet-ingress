@@ -71,6 +71,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod annotate;
 mod annotations;
 mod audit;
 mod class;
@@ -84,6 +85,7 @@ mod tls;
 mod translate;
 mod watch;
 
+pub use annotate::patch_ingress_annotations;
 pub use annotations::{
     CanaryAnnotations, MirrorAnnotations, PromotionAnnotations, ANNOTATION_AUTO_PROMOTE,
     ANNOTATION_AUTO_PROMOTE_INTERVAL, ANNOTATION_AUTO_PROMOTE_MAX_5XX,

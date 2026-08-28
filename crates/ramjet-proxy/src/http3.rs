@@ -79,6 +79,7 @@ use tokio::task::JoinSet;
 use crate::body::{BodyError, ProxyBody};
 use crate::forward::{self, ConnInfo, ProxyState, Scheme};
 use crate::metrics::Metrics;
+use crate::mirror::Mirror;
 use crate::server::Shutdown;
 use crate::tls::{self, SniResolver};
 use crate::upstream::{Upstream, UpstreamConfig};
@@ -189,6 +190,8 @@ pub(crate) struct ServeConfig {
     /// Upstream timeouts and pooling. The pool built from it is this runtime's
     /// own, exactly as each TCP serving runtime has its own.
     pub(crate) upstream: UpstreamConfig,
+    /// Largest request body copied to a mirror backend.
+    pub(crate) mirror_max_body: usize,
     /// How long in-flight requests get after the shutdown signal.
     pub(crate) grace: Duration,
     /// Which per-route counter shard this runtime writes to.
@@ -272,12 +275,20 @@ async fn serve(listener: Listener, config: ServeConfig, mut shutdown: Shutdown) 
     };
 
     // Built inside the runtime and owned by it: this is the upstream pool the
-    // module docs are about.
+    // module docs are about. The mirror worker is started here for the same
+    // reason each TCP lane starts its own — so the copies go out on the thread
+    // the traffic is served on — and having one at all is what keeps a route's
+    // mirror annotation meaning the same thing whether the request arrived over
+    // QUIC or over TCP.
+    let upstream = Upstream::new(&config.upstream);
+    let mirror = Mirror::spawn(upstream.clone(), Arc::clone(&config.metrics))
+        .with_max_body(config.mirror_max_body);
     let state = Arc::new(ProxyState {
         routes: config.routes,
-        upstream: Upstream::new(&config.upstream),
+        upstream,
         metrics: config.metrics,
         shard: config.shard,
+        mirror: Some(mirror),
     });
 
     let mut connections = JoinSet::new();

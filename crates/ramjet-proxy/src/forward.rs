@@ -75,17 +75,20 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderValue};
+use http::request::Parts;
 use http::{Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use ramjet_router::{
-    select_endpoint, Backend, RouteCounters, RouteTable, SharedRouteTable,
+    select_endpoint, Backend, MirrorSpec, RouteCounters, RouteSlot, RouteTable, SharedRouteTable,
+    MIRROR_PERCENT_TOTAL,
 };
 
 use crate::body::ProxyBody;
 use crate::headers;
 use crate::metrics::Metrics;
+use crate::mirror::{self, Buffered, Mirror, MIRRORED_BY, MIRRORED_BY_VALUE};
 use crate::rng;
 use crate::upstream::{endpoint_uri, Upstream, UpstreamError};
 
@@ -137,6 +140,15 @@ pub struct ProxyState {
     /// remainder against the shard count is taken inside the router, so this
     /// is just the runtime's index.
     pub shard: usize,
+    /// This runtime's mirror queue, or `None` where mirroring is not wired up.
+    ///
+    /// One per serving runtime, so a shadow backend that cannot keep up fills
+    /// one runtime's bounded queue rather than contending with every other
+    /// core for a shared one. `None` in the tests and in any embedding that
+    /// never starts a worker; a route with a mirror annotation then simply
+    /// makes no copies, which is the correct behaviour for a data plane that
+    /// has nowhere to put them.
+    pub mirror: Option<Mirror>,
 }
 
 /// Per-connection facts that every request on it inherits.
@@ -172,7 +184,7 @@ async fn forward(
         return static_response(StatusCode::NOT_FOUND, BODY_NO_ROUTE);
     };
 
-    // Resolved once, here, and passed down as a plain reference into the
+    // Resolved once, here, and passed down as plain references into the
     // snapshot this request is already holding. That is the whole per-route
     // accounting cost on the request path: one indexed load now, and a handful
     // of relaxed adds later. There is no map, no label set, and no `Arc` clone
@@ -183,16 +195,54 @@ async fn forward(
     // A request answered by the default backend has no `route` and so is
     // counted only in the process-wide series: it matched no rule, and
     // attributing it to one would invent a route that is not in the table.
-    let route = matched
+    let slot = matched
         .route
-        .and_then(|index| snapshot.route_stats().slot(index))
-        .map(|slot| slot.shard(state.shard));
+        .and_then(|index| snapshot.route_stats().slot(index));
+    let recorder = Recorder::new(slot, state.shard, matched.canaried);
 
-    let response = dispatch(state, conn, request, &snapshot, matched.backend, route).await;
-    if let Some(counters) = route {
-        counters.record_response(response.status().as_u16());
-    }
+    let response = dispatch(state, conn, request, &snapshot, &matched, recorder).await;
+    recorder.record_response(response.status().as_u16());
     response
+}
+
+/// The counter blocks one request writes to.
+///
+/// Always the route's own block; additionally the route's canary block when the
+/// canary took this request. Both, rather than one or the other — see
+/// [`RouteSlot`] for why the totals have to stay the totals.
+#[derive(Debug, Clone, Copy, Default)]
+struct Recorder<'t> {
+    route: Option<&'t RouteCounters>,
+    canary: Option<&'t RouteCounters>,
+}
+
+impl<'t> Recorder<'t> {
+    fn new(slot: Option<&'t RouteSlot>, shard: usize, canaried: bool) -> Self {
+        Recorder {
+            route: slot.map(|slot| slot.shard(shard)),
+            canary: canaried.then(|| slot.map(|slot| slot.canary_shard(shard))).flatten(),
+        }
+    }
+
+    #[inline]
+    fn record_response(&self, status: u16) {
+        if let Some(counters) = self.route {
+            counters.record_response(status);
+        }
+        if let Some(counters) = self.canary {
+            counters.record_response(status);
+        }
+    }
+
+    #[inline]
+    fn record_upstream_latency(&self, elapsed: std::time::Duration) {
+        if let Some(counters) = self.route {
+            counters.record_upstream_latency(elapsed);
+        }
+        if let Some(counters) = self.canary {
+            counters.record_upstream_latency(elapsed);
+        }
+    }
 }
 
 /// Everything after the route is known: header rewriting, endpoint selection,
@@ -202,13 +252,14 @@ async fn dispatch(
     conn: ConnInfo,
     request: Request<ProxyBody>,
     snapshot: &RouteTable,
-    backend: &Backend,
-    route: Option<&RouteCounters>,
+    matched: &Matched<'_>,
+    recorder: Recorder<'_>,
 ) -> Response<ProxyBody> {
     if is_grpc(request.headers()) {
         return static_response(StatusCode::BAD_GATEWAY, BODY_GRPC);
     }
 
+    let backend = matched.backend;
     let endpoints = backend.endpoints();
     if endpoints.is_empty() {
         return static_response(StatusCode::SERVICE_UNAVAILABLE, BODY_NO_ENDPOINT);
@@ -247,6 +298,22 @@ async fn dispatch(
     parts.version = Version::HTTP_11;
 
     let path_and_query = parts.uri.path_and_query().cloned();
+
+    // Mirroring happens here, after the forwarded headers are on and before the
+    // request target is rewritten to an endpoint: the copy should carry exactly
+    // the headers the real backend will see, and its own URI.
+    //
+    // The order relative to the primary's dispatch is not observable. Queueing
+    // is a `try_send` into a bounded channel — no await, no allocation past the
+    // job itself — so the only part of this that can cost the primary anything
+    // is reading a body, which has to happen before the primary is dispatched
+    // in any case because the primary needs those same bytes.
+    let body = match mirror_target(state, snapshot, matched) {
+        None => body,
+        Some(target) => {
+            mirror_request(state, snapshot, &target, &parts, path_and_query.as_ref(), body).await
+        }
+    };
 
     // See the module docs: only a body we can reproduce may be re-dispatched.
     let retryable = body.is_known_empty();
@@ -301,9 +368,7 @@ async fn dispatch(
             Ok(response) => {
                 let elapsed = started.elapsed();
                 state.metrics.record_upstream_latency(elapsed);
-                if let Some(counters) = route {
-                    counters.record_upstream_latency(elapsed);
-                }
+                recorder.record_upstream_latency(elapsed);
                 return relay(response, downstream_upgrade, upgrade.as_ref());
             }
             Err(error) => {
@@ -334,7 +399,7 @@ async fn dispatch(
     }
 }
 
-/// What the router said, in the two pieces the request path needs.
+/// What the router said, in the pieces the request path needs.
 struct Matched<'t> {
     /// Where to forward, after any canary decision.
     backend: &'t Backend,
@@ -342,26 +407,54 @@ struct Matched<'t> {
     /// when the default backend answered and there is no rule to attribute the
     /// request to.
     route: Option<u32>,
+    /// Whether the canary took this request.
+    ///
+    /// Only the *attribution* depends on this. Which route the request counts
+    /// against does not — see [`select_backend`].
+    canaried: bool,
+    /// The rule's mirror, present only when this request was sampled for it.
+    ///
+    /// The roll happens during matching, alongside the canary's, so that the
+    /// snapshot is consulted exactly once and the request path never has to ask
+    /// the table a second question.
+    mirror: Option<&'t MirrorSpec>,
 }
 
-/// Matches the request and applies any canary attached to the matched rule.
+/// Where a sampled copy is going.
+struct MirrorTarget<'t> {
+    mirror: &'t Mirror,
+    backend: &'t Backend,
+    host: Option<&'t str>,
+}
+
+/// Matches the request and applies any canary and mirror on the matched rule.
 ///
 /// The returned references borrow the snapshot, not the request, so the caller
 /// is free to take the request apart afterwards.
 ///
 /// A canary that diverts a request does **not** change which route it is
-/// counted against: the request matched that rule, and splitting one route's
-/// numbers in two the moment somebody starts a canary would break the graph an
-/// operator is watching precisely then. Which share went to the canary is a
-/// property of the rule, and `/admin/routes` reports it as one.
+/// counted against: the request matched that rule, and moving its numbers to a
+/// second route the moment somebody starts a canary would break the graph an
+/// operator is watching precisely then. What the canary decision does change is
+/// which *blocks* of that one route are written — the route's own always, and
+/// the route's canary block as well when the canary took it — so the split is
+/// available without the totals ever moving.
 fn select_backend<'t>(table: &'t RouteTable, request: &Request<ProxyBody>) -> Option<Matched<'t>> {
     let matched = table.match_request(request_authority(request), request.uri().path())?;
     let route = matched.rule().map(|rule| rule.stats_index());
+
+    // Independent of the canary: a mirror belongs to the rule, so a request the
+    // canary diverted is sampled on exactly the same terms as a stable one.
+    let mirror = matched
+        .mirror()
+        .filter(|spec| spec.sample(rng::below(MIRROR_PERCENT_TOTAL)));
 
     let Some(canary) = matched.canary() else {
         return Some(Matched {
             backend: matched.backend(),
             route,
+            canaried: false,
+            mirror,
         });
     };
 
@@ -376,14 +469,106 @@ fn select_backend<'t>(table: &'t RouteTable, request: &Request<ProxyBody>) -> Op
         .and_then(|name| headers::cookie_value(request.headers(), name));
     let roll = rng::below(canary.weight_total());
 
-    let backend = if canary.decide(header_value, cookie_value, roll) {
-        // A canary naming a backend the table does not hold is a controller
-        // bug, not a reason to fail the request: serve production instead.
-        table.backend(canary.backend()).unwrap_or(matched.backend())
+    let diverted = canary.decide(header_value, cookie_value, roll);
+    // A canary naming a backend the table does not hold is a controller bug,
+    // not a reason to fail the request: serve production instead. It is also
+    // not canary traffic, because it did not reach the canary.
+    let canary_backend = diverted.then(|| table.backend(canary.backend())).flatten();
+    Some(Matched {
+        backend: canary_backend.unwrap_or(matched.backend()),
+        route,
+        canaried: canary_backend.is_some(),
+        mirror,
+    })
+}
+
+/// Resolves a sampled request's mirror into the backend it goes to.
+///
+/// `None` — and so no copy — when the route has no mirror, this request was not
+/// sampled, or the runtime has no mirror worker. A mirror whose backend has no
+/// ready endpoints is counted as a failure rather than ignored: an operator who
+/// configured a mirror and sees no copies arriving should be able to tell "the
+/// shadow Service has no ready pods" from "the annotation never took effect".
+fn mirror_target<'t>(
+    state: &'t ProxyState,
+    snapshot: &'t RouteTable,
+    matched: &Matched<'t>,
+) -> Option<MirrorTarget<'t>> {
+    let spec = matched.mirror?;
+    let mirror = state.mirror.as_ref()?;
+    let backend = snapshot.backend(spec.backend())?;
+    if backend.endpoints().is_empty() {
+        state.metrics.record_mirror_failure();
+        return None;
+    }
+    Some(MirrorTarget {
+        mirror,
+        backend,
+        host: spec.host(),
+    })
+}
+
+/// Builds the copy and hands it to the queue, returning the body the primary
+/// should now send.
+///
+/// The return is the whole reason this is not simply a `spawn`: reading a body
+/// consumes it, so whatever was read has to come back out and go to the real
+/// upstream. A body that fit the cap comes back as the bytes both copies share;
+/// one that did not comes back as those bytes followed by the rest of the
+/// stream, with no copy made.
+async fn mirror_request(
+    state: &ProxyState,
+    snapshot: &RouteTable,
+    target: &MirrorTarget<'_>,
+    parts: &Parts,
+    path_and_query: Option<&http::uri::PathAndQuery>,
+    body: ProxyBody,
+) -> ProxyBody {
+    // The common case by a wide margin, and the only one that costs nothing: a
+    // request with no body needs no buffering, so a mirrored `GET` also keeps
+    // the endpoint failover that buffering would have taken away.
+    let (primary, copy) = if body.is_known_empty() {
+        (body, Some(Bytes::new()))
     } else {
-        matched.backend()
+        match mirror::buffer(body, target.mirror.max_body()).await {
+            Buffered::Complete(bytes) => (ProxyBody::once(bytes.clone()), Some(bytes)),
+            Buffered::TooLarge(prefix, rest) => {
+                state.metrics.record_mirror_skipped();
+                (ProxyBody::prefixed(prefix, rest), None)
+            }
+        }
     };
-    Some(Matched { backend, route })
+
+    let Some(copy) = copy else {
+        return primary;
+    };
+
+    let Some((index, _)) = select_endpoint(target.backend, snapshot.stats(), rng::next_u64())
+    else {
+        state.metrics.record_mirror_failure();
+        return primary;
+    };
+    let Some(endpoint) = target.backend.endpoints().get(index) else {
+        state.metrics.record_mirror_failure();
+        return primary;
+    };
+    let Some(uri) = endpoint_uri(endpoint.addr, path_and_query) else {
+        state.metrics.record_mirror_failure();
+        return primary;
+    };
+
+    let mut copy_parts = parts.clone();
+    copy_parts.uri = uri;
+    copy_parts.headers.insert(MIRRORED_BY, MIRRORED_BY_VALUE);
+    if let Some(host) = target.host.and_then(|h| HeaderValue::from_str(h).ok()) {
+        copy_parts.headers.insert(header::HOST, host);
+    }
+    // Whatever is in here describes the downstream connection, and an upgrade
+    // handle in particular must not be duplicated into a request nobody reads.
+    copy_parts.extensions.clear();
+
+    target.mirror.enqueue(&state.metrics, copy_parts, copy);
+    primary
 }
 
 /// The host the client addressed.

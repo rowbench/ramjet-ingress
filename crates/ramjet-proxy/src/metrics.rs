@@ -105,6 +105,10 @@ pub struct Metrics {
     upstream_retries: AtomicU64,
     upstream_timeouts: AtomicU64,
     route_misses: AtomicU64,
+    mirrored: AtomicU64,
+    mirror_dropped: AtomicU64,
+    mirror_skipped: AtomicU64,
+    mirror_failures: AtomicU64,
     h3_connections: AtomicU64,
     h3_requests: AtomicU64,
     h3_handshake_failures: AtomicU64,
@@ -212,6 +216,50 @@ impl Metrics {
     #[inline]
     pub fn record_h3_handshake_failure(&self) {
         self.h3_handshake_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a mirrored copy the mirror backend accepted.
+    #[inline]
+    pub fn record_mirrored(&self) {
+        self.mirrored.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a copy discarded because the runtime's mirror queue was full.
+    #[inline]
+    pub fn record_mirror_dropped(&self) {
+        self.mirror_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a copy not attempted because the request body was over the cap.
+    #[inline]
+    pub fn record_mirror_skipped(&self) {
+        self.mirror_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a copy the mirror backend refused, failed, or did not answer.
+    #[inline]
+    pub fn record_mirror_failure(&self) {
+        self.mirror_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Copies the mirror backend accepted.
+    pub fn mirrored(&self) -> u64 {
+        self.mirrored.load(Ordering::Relaxed)
+    }
+
+    /// Copies discarded because a mirror queue was full.
+    pub fn mirror_dropped(&self) -> u64 {
+        self.mirror_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Copies not attempted because the request body was over the cap.
+    pub fn mirror_skipped(&self) -> u64 {
+        self.mirror_skipped.load(Ordering::Relaxed)
+    }
+
+    /// Copies the mirror backend refused, failed, or did not answer.
+    pub fn mirror_failures(&self) -> u64 {
+        self.mirror_failures.load(Ordering::Relaxed)
     }
 
     /// Connections currently being served.
@@ -354,6 +402,26 @@ impl Metrics {
                 "QUIC connections that never became usable HTTP/3 connections.",
                 &self.h3_handshake_failures,
             ),
+            (
+                "ramjet_mirrored_total",
+                "Requests copied to a mirror backend, which accepted the copy.",
+                &self.mirrored,
+            ),
+            (
+                "ramjet_mirror_dropped_total",
+                "Copies discarded because a serving runtime's mirror queue was full.",
+                &self.mirror_dropped,
+            ),
+            (
+                "ramjet_mirror_skipped_total",
+                "Copies not attempted because the request body exceeded --mirror-max-body.",
+                &self.mirror_skipped,
+            ),
+            (
+                "ramjet_mirror_failures_total",
+                "Copies a mirror backend refused, failed, or did not answer in time.",
+                &self.mirror_failures,
+            ),
         ] {
             let _ = writeln!(out, "# HELP {name} {help}");
             let _ = writeln!(out, "# TYPE {name} counter");
@@ -449,6 +517,35 @@ mod tests {
         let m = Metrics::new();
         assert!(m.render_prometheus(42, false).contains("ramjet_pinned 0"));
         assert!(m.render_prometheus(42, true).contains("ramjet_pinned 1"));
+    }
+
+    #[test]
+    fn the_four_mirror_outcomes_are_told_apart() {
+        // They have four different fixes — a slow shadow, a shallow queue, a
+        // body cap set too low, and a backend that is simply down — so folding
+        // them into one counter would make the metric unactionable.
+        let m = Metrics::new();
+        m.record_mirrored();
+        m.record_mirror_dropped();
+        m.record_mirror_dropped();
+        m.record_mirror_skipped();
+        m.record_mirror_failure();
+
+        assert_eq!(
+            (
+                m.mirrored(),
+                m.mirror_dropped(),
+                m.mirror_skipped(),
+                m.mirror_failures()
+            ),
+            (1, 2, 1, 1)
+        );
+
+        let text = m.render_prometheus(0, false);
+        assert!(text.contains("ramjet_mirrored_total 1"));
+        assert!(text.contains("ramjet_mirror_dropped_total 2"));
+        assert!(text.contains("ramjet_mirror_skipped_total 1"));
+        assert!(text.contains("ramjet_mirror_failures_total 1"));
     }
 
     #[test]

@@ -26,6 +26,9 @@
 #     curl -H 'Host: anything.else'    http://127.0.0.1:8080/          # default backend
 #     curl -H 'Host: shop.example.com' -H 'x-canary: always' \
 #          http://127.0.0.1:8080/api/                                  # always upstream-b
+#     curl -H 'Host: shop.example.com' http://127.0.0.1:8080/          # also copied to
+#                                                                      # upstream-b, whose
+#                                                                      # answer is discarded
 #     curl http://127.0.0.1:10254/readyz
 #     curl http://127.0.0.1:10254/metrics
 #
@@ -62,6 +65,13 @@ backends:
     endpoints:
       - 127.0.0.1:9001
 
+  # The mirror target below. It happens to be one of the same two servers, which
+  # is fine: a mirror is an ordinary backend and nothing stops it overlapping
+  # with a real one.
+  - name: shadow
+    endpoints:
+      - 127.0.0.1:9002
+
 routes:
   # Exact beats prefix, and a longer prefix beats a shorter one, regardless of
   # the order rules appear in here.
@@ -85,6 +95,13 @@ routes:
     path: /
     pathType: Prefix
     backend: web
+    # Every request served here is also copied, fire and forget, to `shadow`.
+    # The client never waits for it and never sees it fail: watch
+    # `ramjet_mirrored_total` on :10254/metrics, and note that killing the
+    # shadow upstream changes nothing about the response you get.
+    mirror:
+      backend: shadow
+      percent: 100
 
   # A wildcard replaces exactly one label: `a.example.com` matches,
   # `a.b.example.com` does not.

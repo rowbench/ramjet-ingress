@@ -85,7 +85,7 @@ trap cleanup EXIT
 
 step "Preflight"
 
-for tool in docker kubectl helm openssl curl; do
+for tool in docker kubectl helm openssl curl python3; do
   command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
 
@@ -234,6 +234,38 @@ spec:
             httpGet: { path: /, port: http }
             periodSeconds: 2
 ---
+# The mirror target. A third backend that receives a copy of everything the
+# production route serves and whose answers are thrown away.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-shadow
+  namespace: $APP_NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: echo-shadow }
+  template:
+    metadata:
+      labels: { app: echo-shadow }
+    spec:
+      containers:
+        - name: echo
+          image: ealen/echo-server:latest
+          ports: [{ containerPort: 80, name: http }]
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-shadow
+  namespace: $APP_NS
+spec:
+  selector: { app: echo-shadow }
+  ports: [{ name: http, port: 8080, targetPort: http }]
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -260,6 +292,11 @@ kind: Ingress
 metadata:
   name: demo
   namespace: $APP_NS
+  annotations:
+    # Mirroring is a property of the route, so it goes on the production
+    # Ingress. The prefix is ramjet.dev because ingress-nginx has no equivalent
+    # annotation to be compatible with.
+    ramjet.dev/mirror-backend: $APP_NS/echo-shadow:8080
 spec:
   ingressClassName: ramjet
   tls:
@@ -311,6 +348,7 @@ step "Waiting for readiness"
 K -n "$SYS_NS" rollout status "deploy/$FULLNAME" --timeout=3m
 K -n "$APP_NS" rollout status deploy/echo-stable --timeout=2m
 K -n "$APP_NS" rollout status deploy/echo-canary --timeout=2m
+K -n "$APP_NS" rollout status deploy/echo-shadow --timeout=2m
 
 # Port-forwards rather than the LoadBalancer address. The controller Service is
 # a LoadBalancer and Docker Desktop may or may not give it an external address,
@@ -485,12 +523,150 @@ fi
 #    the JSON API is wired to the request path, and deliberately does not
 #    exercise /admin/rollback, which mutates what the pod is serving and would
 #    make every assertion above it depend on the order they run in.
+#
+#    Parsed rather than scraped. This used to be a sed expression matching
+#    "host":"…" then [^}]* then "requests_total", which worked only because no
+#    nested object happened to sort between those two keys — serde_json orders
+#    them alphabetically, so adding "mirror" put a `}` in the middle and the
+#    pattern silently matched nothing. A regex over JSON was going to break on
+#    the first additive field either way.
 ROUTES="$(curl -s -m 5 "http://127.0.0.1:$ADMIN_PORT/admin/routes" || true)"
-ROUTE_REQS="$(sed -n 's/.*"host":"'"$HOST"'"[^}]*"requests_total":\([0-9]*\).*/\1/p' <<<"$ROUTES")"
-if [[ -n "$ROUTE_REQS" ]] && (( ROUTE_REQS > 0 )); then
-  pass "per-route stats: /admin/routes counted $ROUTE_REQS requests for $HOST"
+ROUTE_STATS="$(printf '%s' "$ROUTES" | python3 -c '
+import json, sys
+host = sys.argv[1]
+reqs = canary = 0
+for r in json.load(sys.stdin).get("routes", []):
+    if r.get("host") == host:
+        reqs += r.get("requests_total", 0)
+        canary += (r.get("canary_stats") or {}).get("requests_total", 0)
+print(reqs, canary)
+' "$HOST" || true)"
+read -r ROUTE_REQS CANARY_REQS <<<"$ROUTE_STATS"
+
+# The canary share is asserted as a *subset*: the route's totals must still
+# count every request whoever served it, or every dashboard of that route steps
+# down the moment somebody starts a canary.
+if (( ${ROUTE_REQS:-0} > 0 )) && (( ${CANARY_REQS:-0} > 0 )) && (( CANARY_REQS < ROUTE_REQS )); then
+  pass "per-route stats: $ROUTE_REQS requests for $HOST, of which $CANARY_REQS were the canary's"
 else
-  fail "per-route stats: no counted requests for $HOST in /admin/routes"
+  fail "per-route stats: total=${ROUTE_REQS:-<none>} canary=${CANARY_REQS:-<none>} for $HOST"
+fi
+
+# 8. Traffic mirroring. Everything above already sent well over a hundred
+#    requests through the production route, and every one of them should have
+#    been copied to echo-shadow. Two halves are asserted, because either alone
+#    could be true while the feature is broken: the copies actually arrived at
+#    the shadow backend, and none of them cost the client anything.
+MIRRORED="$(awk '/^ramjet_mirrored_total / {print $2}' <<<"$METRICS")"
+MIRROR_FAILED="$(awk '/^ramjet_mirror_failures_total / {print $2}' <<<"$METRICS")"
+MIRROR_DROPPED="$(awk '/^ramjet_mirror_dropped_total / {print $2}' <<<"$METRICS")"
+# The shadow's own view, so this is not just the proxy marking its own homework:
+# the echo image logs every request it serves.
+SHADOW_SAW="$(K -n "$APP_NS" logs deploy/echo-shadow --tail=-1 2>/dev/null | grep -c 'GET' || true)"
+if (( ${MIRRORED:-0} > 0 )) && (( ${MIRROR_FAILED:-0} == 0 )) && (( SHADOW_SAW > 0 )); then
+  pass "mirroring: ${MIRRORED} copies sent, ${SHADOW_SAW} seen by echo-shadow, ${MIRROR_FAILED} failed, ${MIRROR_DROPPED} dropped"
+else
+  fail "mirroring: sent=${MIRRORED:-<absent>} shadow_saw=${SHADOW_SAW} failed=${MIRROR_FAILED:-<absent>} dropped=${MIRROR_DROPPED:-<absent>}"
+fi
+
+# 9. The mirroring invariant: with the shadow backend gone, the production
+#    route must keep answering. A mirror that is awaited, retried, or allowed
+#    to fail a request would show up here as 5xx responses or as a wall-clock
+#    blowout.
+#
+#    Measured in *steady state*, not across the churn. Scaling a Deployment to
+#    zero removes a pod, empties an EndpointSlice, and makes the controller
+#    compile and publish a new generation; sampling while all of that is in
+#    flight measures Docker Desktop's networking as much as it measures this
+#    proxy, and an earlier version of this assertion was flaky for exactly that
+#    reason. So wait for the shadow's addresses to go and for a publish to land,
+#    then measure. The tight, deterministic form of this property — a mirror
+#    backend that accepts connections and then never answers — is
+#    `a_catatonic_mirror_backend_does_not_slow_the_primary` in
+#    crates/ramjet-proxy/tests/mirroring.rs.
+K -n "$APP_NS" scale deploy/echo-shadow --replicas=0 >/dev/null
+for _ in $(seq 1 30); do
+  ADDRS="$(K -n "$APP_NS" get endpointslice -l kubernetes.io/service-name=echo-shadow \
+    -o jsonpath='{.items[*].endpoints[*].addresses[*]}' 2>/dev/null || true)"
+  [[ -z "$ADDRS" ]] && break
+  sleep 2
+done
+# The rebuild is debounced and then published; a few seconds covers both.
+sleep 3
+
+BEFORE_5XX="$(curl -s -m 5 "http://127.0.0.1:$ADMIN_PORT/metrics" | awk '/^ramjet_requests_total\{code="5xx"\}/ {print $2}')"
+DEAD_START=$SECONDS
+DEAD_OK=0
+for _ in $(seq 1 40); do
+  c="$(curl -s -o /dev/null -w '%{http_code}' -m 5 -H "Host: $HOST" "http://127.0.0.1:$HTTP_PORT/" || true)"
+  [[ "$c" == "200" ]] && DEAD_OK=$((DEAD_OK + 1))
+done
+DEAD_ELAPSED=$((SECONDS - DEAD_START))
+AFTER_5XX="$(curl -s -m 5 "http://127.0.0.1:$ADMIN_PORT/metrics" | awk '/^ramjet_requests_total\{code="5xx"\}/ {print $2}')"
+# Every request answering 200 is the assertion that matters: `curl -m 5` means a
+# proxy that waited on the mirror would produce empty codes rather than slow
+# ones. The wall clock is a second, looser net — if the mirror were awaited these
+# 40 would cost at least its 5s deadline each, so around 200s; 60s leaves room
+# for a port-forward having a bad minute while still catching that.
+if (( DEAD_OK == 40 )) && (( DEAD_ELAPSED < 60 )) && (( ${AFTER_5XX:-1} == ${BEFORE_5XX:-0} )); then
+  pass "mirroring invariant: 40/40 served in ${DEAD_ELAPSED}s with the shadow backend gone, no new 5xx"
+else
+  fail "mirroring invariant: ${DEAD_OK}/40 ok in ${DEAD_ELAPSED}s, 5xx ${BEFORE_5XX:-0} -> ${AFTER_5XX:-?}"
+fi
+
+K -n "$APP_NS" scale deploy/echo-shadow --replicas=1 >/dev/null
+
+# 10. Canary auto-promotion, the whole loop: arm the canary with a short
+#     interval and a low request floor, drive traffic through it, and watch the
+#     controller step canary-weight up on its own. Both backends are healthy, so
+#     the expected outcome is advancement rather than a rollback.
+#
+#     The floors are lowered from their defaults because an e2e cannot afford a
+#     60-second window and 50 requests per side; the machine being exercised is
+#     the same one either way, and its thresholds are annotations precisely so
+#     that they can be set to what a given situation can supply.
+K -n "$APP_NS" annotate ingress demo-canary --overwrite \
+  ramjet.dev/auto-promote=true \
+  ramjet.dev/auto-promote-interval=5s \
+  ramjet.dev/auto-promote-min-requests=5 \
+  ramjet.dev/auto-promote-steps=30,60,100 >/dev/null
+
+PROMOTED=""
+START_WEIGHT="$(K -n "$APP_NS" get ingress demo-canary \
+  -o jsonpath='{.metadata.annotations.nginx\.ingress\.kubernetes\.io/canary-weight}')"
+# Two windows' worth of chances. Each pass needs traffic on both sides within
+# one interval, so traffic is driven *inside* the loop rather than up front.
+for _ in $(seq 1 12); do
+  for _ in $(seq 1 30); do
+    curl -s -o /dev/null -m 5 -H "Host: $HOST" "http://127.0.0.1:$HTTP_PORT/" || true
+  done
+  W="$(K -n "$APP_NS" get ingress demo-canary \
+    -o jsonpath='{.metadata.annotations.nginx\.ingress\.kubernetes\.io/canary-weight}')"
+  if [[ -n "$W" ]] && [[ "$W" != "$START_WEIGHT" ]]; then
+    PROMOTED="$W"
+    break
+  fi
+  sleep 3
+done
+
+STATUS_ANN="$(K -n "$APP_NS" get ingress demo-canary \
+  -o jsonpath='{.metadata.annotations.ramjet\.dev/auto-promote-status}' 2>/dev/null || true)"
+if [[ -n "$PROMOTED" ]] && (( PROMOTED > START_WEIGHT )); then
+  pass "auto-promotion: canary-weight advanced ${START_WEIGHT} -> ${PROMOTED} on healthy traffic"
+elif [[ "$STATUS_ANN" == promoted ]]; then
+  pass "auto-promotion: canary reached its last step (status: promoted)"
+else
+  fail "auto-promotion: weight stayed at ${START_WEIGHT}, status '${STATUS_ANN:-<none>}'"
+fi
+
+# 11. The audit trail for that decision. A promotion that happened but that
+#     nobody can find out about afterwards is half a feature.
+EVENT="$(K -n default get events \
+  --field-selector reason=CanaryStepped -o jsonpath='{.items[0].note}' 2>/dev/null || true)"
+if [[ -n "$EVENT" ]]; then
+  pass "auto-promotion audit: Event CanaryStepped — ${EVENT}"
+else
+  note "no CanaryStepped Event found; this is a soft check (Events need RBAC and are best-effort)"
 fi
 
 # ----------------------------------------------------------------- summary ---

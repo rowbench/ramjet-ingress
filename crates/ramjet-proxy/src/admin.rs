@@ -47,6 +47,12 @@
 //! forever, whether or not anybody looks at them. Here `/metrics` keeps its
 //! fixed, small set of series and the per-route numbers are fetched by
 //! something that asked for them.
+//!
+//! The shape of that JSON is a contract `ramjet-top` parses, so it grows
+//! additively and never otherwise: `canary_stats` and `mirror` were added
+//! after the fact and are `null` on a route that has neither, which is a case
+//! every existing reader already handles because `canary` has always been
+//! nullable.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -55,7 +61,7 @@ use bytes::Bytes;
 use http::{header, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
-use ramjet_router::{RouteTable, SharedRouteTable};
+use ramjet_router::{RouteSlot, RouteTable, SharedRouteTable};
 use serde_json::{json, Value};
 
 use crate::body::ProxyBody;
@@ -212,14 +218,40 @@ fn routes(state: &AdminState) -> Value {
         .routes()
         .map(|(host, rule)| {
             let host = host.to_string();
-            let totals = stats.slot(rule.stats_index()).map(|slot| slot.totals());
-            let totals = totals.unwrap_or_default();
+            let slot = stats.slot(rule.stats_index());
+            let totals = slot.map(RouteSlot::totals).unwrap_or_default();
             let backend = table.backend(rule.backend());
 
             let canary = rule.canary().map(|canary| {
                 json!({
                     "backend": table.backend(canary.backend()).map(|b| b.name()).unwrap_or(""),
                     "weight_percent": canary.weight_percent(),
+                })
+            });
+
+            // Reported only for a route that has a canary. On a route without
+            // one the block is unconditionally zero, and a reader cannot tell
+            // "no canary" from "a canary nothing has reached yet" if both come
+            // back as the same object full of zeroes.
+            //
+            // These are a *subset* of the fields above, not a sibling of them:
+            // a canary request is counted in both, so stable traffic is the
+            // difference. See `RouteSlot` for why it is arranged that way.
+            let canary_stats = rule.canary().and(slot).map(|slot| {
+                let totals = slot.canary_totals();
+                json!({
+                    "requests_total": totals.requests,
+                    "errors_5xx_total": totals.errors_5xx,
+                    "upstream_latency_ms_sum": totals.upstream_latency_ms(),
+                    "upstream_latency_count": totals.upstream_latency_count,
+                })
+            });
+
+            let mirror = rule.mirror().map(|mirror| {
+                json!({
+                    "backend": table.backend(mirror.backend()).map(|b| b.name()).unwrap_or(""),
+                    "percent": mirror.percent(),
+                    "host": mirror.host(),
                 })
             });
 
@@ -234,6 +266,8 @@ fn routes(state: &AdminState) -> Value {
                 "upstream_latency_ms_sum": totals.upstream_latency_ms(),
                 "upstream_latency_count": totals.upstream_latency_count,
                 "canary": canary,
+                "canary_stats": canary_stats,
+                "mirror": mirror,
             });
             (host, rule.path(), value)
         })
@@ -465,6 +499,8 @@ mod tests {
         assert_eq!(listed[0]["canary"]["backend"], "prod/api-canary:80");
         assert_eq!(listed[0]["canary"]["weight_percent"], 25);
 
+        assert_eq!(listed[0]["canary_stats"]["requests_total"], 0);
+
         assert_eq!(listed[1]["host"], "example.com");
         assert_eq!(listed[1]["path_type"], "Prefix");
         assert_eq!(listed[1]["canary"], Value::Null);
@@ -472,6 +508,108 @@ mod tests {
         assert_eq!(listed[1]["errors_5xx_total"], 0);
         assert_eq!(listed[1]["upstream_latency_ms_sum"], 0.0);
         assert_eq!(listed[1]["upstream_latency_count"], 0);
+        assert_eq!(
+            listed[1]["canary_stats"],
+            Value::Null,
+            "a route with no canary has no split to report, and an object full \
+             of zeroes could not be told apart from a canary nothing has reached"
+        );
+        assert_eq!(listed[1]["mirror"], Value::Null);
+    }
+
+    #[test]
+    fn the_canary_split_is_a_subset_of_the_route_totals() {
+        // The property the whole arrangement rests on: starting a canary must
+        // not make an existing graph of a route's request rate step down.
+        let state = state(table(7));
+        let table = state.routes.load_full();
+        let (_, rule) = table
+            .routes()
+            .find(|(_, rule)| rule.canary().is_some())
+            .expect("the canary route is in the table");
+        let slot = table
+            .route_stats()
+            .slot(rule.stats_index())
+            .expect("a counter block");
+
+        // Three stable requests, one of them a 5xx.
+        slot.shard(0).record_response(200);
+        slot.shard(0).record_response(200);
+        slot.shard(0).record_response(500);
+        // One canary request, also a 5xx, recorded in both blocks.
+        slot.shard(1).record_response(503);
+        slot.canary_shard(1).record_response(503);
+        slot.shard(1)
+            .record_upstream_latency(std::time::Duration::from_micros(4000));
+        slot.canary_shard(1)
+            .record_upstream_latency(std::time::Duration::from_micros(4000));
+
+        let body = routes(&state);
+        let route = body["routes"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .find(|route| route["path"] == "/v2")
+            .expect("the canary route is listed");
+
+        assert_eq!(route["requests_total"], 4, "the totals are still the totals");
+        assert_eq!(route["errors_5xx_total"], 2);
+        assert_eq!(route["canary_stats"]["requests_total"], 1);
+        assert_eq!(route["canary_stats"]["errors_5xx_total"], 1);
+        assert_eq!(route["canary_stats"]["upstream_latency_ms_sum"], 4.0);
+        assert_eq!(route["canary_stats"]["upstream_latency_count"], 1);
+
+        // Which is what makes the interesting number computable: three stable
+        // requests, one of them failing, against one canary request that failed.
+        let stable_requests = route["requests_total"].as_u64().unwrap_or_default()
+            - route["canary_stats"]["requests_total"]
+                .as_u64()
+                .unwrap_or_default();
+        let stable_errors = route["errors_5xx_total"].as_u64().unwrap_or_default()
+            - route["canary_stats"]["errors_5xx_total"]
+                .as_u64()
+                .unwrap_or_default();
+        assert_eq!((stable_requests, stable_errors), (3, 1));
+    }
+
+    #[test]
+    fn a_mirror_is_reported_with_its_target_and_sample() {
+        let mut builder = RouteTableBuilder::new();
+        builder.generation(3);
+        builder
+            .backend("prod/api:80", LbPolicy::RoundRobin, vec![])
+            .expect("registers");
+        builder
+            .backend("prod/shadow:80", LbPolicy::RoundRobin, vec![])
+            .expect("registers");
+        builder
+            .route_with(
+                Some("example.com"),
+                "/",
+                PathType::Prefix,
+                "prod/api:80",
+                &ramjet_router::RouteOptions {
+                    mirror: Some(ramjet_router::MirrorRules {
+                        backend: "prod/shadow:80",
+                        percent: 25,
+                        host: Some("shadow.internal"),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("drafts");
+        let state = state(Arc::new(builder.build().expect("builds")));
+
+        let body = routes(&state);
+        let route = &body["routes"].as_array().expect("an array")[0];
+        assert_eq!(route["mirror"]["backend"], "prod/shadow:80");
+        assert_eq!(route["mirror"]["percent"], 25);
+        assert_eq!(route["mirror"]["host"], "shadow.internal");
+        assert_eq!(
+            route["canary_stats"],
+            Value::Null,
+            "a mirror is not a canary and reports no split"
+        );
     }
 
     #[test]

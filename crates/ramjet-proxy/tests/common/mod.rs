@@ -212,6 +212,8 @@ pub struct ProxyOptions {
     pub proxy_protocol: Option<Duration>,
     /// Generations the rollback ring keeps.
     pub history_size: usize,
+    /// Largest request body copied to a mirror backend.
+    pub mirror_max_body: usize,
     /// Also serve HTTP/3 on an ephemeral UDP port.
     pub http3: bool,
 }
@@ -226,6 +228,7 @@ impl Default for ProxyOptions {
             workers: Some(1),
             proxy_protocol: None,
             history_size: ramjet_proxy::DEFAULT_HISTORY_SIZE,
+            mirror_max_body: ramjet_proxy::DEFAULT_MIRROR_MAX_BODY,
             http3: false,
         }
     }
@@ -262,6 +265,7 @@ impl TestProxy {
             worker_threads: options.workers,
             proxy_protocol: options.proxy_protocol,
             history_size: options.history_size,
+            mirror_max_body: options.mirror_max_body,
             // Port 0: the kernel picks, and `http3_addr` reports what it
             // picked, exactly as it does for the TCP listeners.
             http3: options.http3.then(loopback),

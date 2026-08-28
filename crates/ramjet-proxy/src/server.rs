@@ -137,6 +137,7 @@ use crate::history::{GenerationHistory, DEFAULT_HISTORY_SIZE};
 use crate::http3;
 use crate::listener::{Listener, ListenerConfig};
 use crate::metrics::{ConnectionGuard, Metrics};
+use crate::mirror::{Mirror, DEFAULT_MIRROR_MAX_BODY};
 use crate::proxy_protocol;
 use crate::tls::{self, CertStore, SniResolver};
 use crate::upstream::{Upstream, UpstreamConfig};
@@ -208,6 +209,14 @@ pub struct ProxyConfig {
     /// this is the knob that trades memory for how far back an operator can
     /// roll. Clamped up to one; see [`GenerationHistory`].
     pub history_size: usize,
+    /// Largest request body copied to a mirror backend.
+    ///
+    /// A route with `ramjet.dev/mirror-backend` reads up to this many bytes in
+    /// order to send the same body twice; a request over the cap is forwarded
+    /// normally and not mirrored. See [`mirror`](crate::mirror) for why the
+    /// number is small and why exceeding it costs the primary nothing.
+    pub mirror_max_body: usize,
+
     /// Require a PROXY protocol header on the traffic listeners, waiting this
     /// long for it. `None` — the default — disables it.
     ///
@@ -251,6 +260,7 @@ impl Default for ProxyConfig {
             worker_threads: None,
             max_buf_size: DEFAULT_MAX_BUF_SIZE,
             history_size: DEFAULT_HISTORY_SIZE,
+            mirror_max_body: DEFAULT_MIRROR_MAX_BODY,
             // Off, and it has to be: a listener that requires the header
             // refuses every connection that does not carry one, so defaulting
             // it on would mean a fresh deployment serves nothing.
@@ -296,6 +306,7 @@ pub struct Server {
     readiness: ReadinessFlag,
     grace: Duration,
     max_buf_size: usize,
+    mirror_max_body: usize,
     proxy_protocol: Option<Duration>,
     http3: Option<http3::Listener>,
 }
@@ -386,6 +397,7 @@ impl Server {
             readiness,
             grace: config.shutdown_grace,
             max_buf_size: config.max_buf_size,
+            mirror_max_body: config.mirror_max_body,
             proxy_protocol: config.proxy_protocol,
             http3,
         })
@@ -451,6 +463,7 @@ impl Server {
             metrics,
             grace,
             max_buf_size,
+            mirror_max_body,
             proxy_protocol,
             http3,
             ..
@@ -474,6 +487,7 @@ impl Server {
                 acceptor: acceptor.clone(),
                 grace,
                 max_buf_size,
+                mirror_max_body,
                 proxy_protocol,
                 alt_svc,
             },
@@ -491,6 +505,7 @@ impl Server {
                         routes: Arc::clone(&routes),
                         metrics: Arc::clone(&metrics),
                         upstream,
+                        mirror_max_body,
                         grace,
                         shard: worker_threads,
                     },
@@ -550,11 +565,10 @@ impl Server {
         // Step two: let what is already running finish. The serving runtimes
         // drain in parallel with the admin listener rather than after it —
         // they are the ones holding client requests, and making them wait for
-        // a metrics scrape to finish would be the wrong order.
-        // The QUIC endpoint drains alongside them for the same reason, and
-        // closes its own socket: it has no listener to drop, because the
-        // endpoint is what keeps delivering packets to connections that are
-        // still finishing.
+        // a metrics scrape to finish would be the wrong order. The QUIC
+        // endpoint drains alongside them for the same reason, and closes its
+        // own socket: it has no listener to drop, because the endpoint is what
+        // keeps delivering packets to connections that are still finishing.
         let (drained, admin_drained, h3_drained) = tokio::join!(
             workers.drain(),
             tokio::time::timeout(grace, graceful.shutdown()),
@@ -620,6 +634,7 @@ struct LaneConfig {
     acceptor: Option<TlsAcceptor>,
     grace: Duration,
     max_buf_size: usize,
+    mirror_max_body: usize,
     proxy_protocol: Option<Duration>,
     /// The `alt-svc` value advertising the QUIC listener, when there is one.
     alt_svc: Option<HeaderValue>,
@@ -753,19 +768,27 @@ fn serve_lane(
         acceptor,
         grace,
         max_buf_size,
+        mirror_max_body,
         proxy_protocol,
         alt_svc,
     } = config;
     runtime.block_on(async move {
         // Built inside the runtime, and one per lane: this is the pool the
         // module docs are about.
+        let upstream = Upstream::new(&upstream);
+        // One mirror worker per lane, started inside this runtime so the copies
+        // are sent on the same thread the traffic is served on rather than
+        // queueing behind everything else on a shared pool.
+        let mirror = Mirror::spawn(upstream.clone(), Arc::clone(&metrics))
+            .with_max_body(mirror_max_body);
         let lane = Arc::new(Lane {
             builder: connection_builder(max_buf_size),
             state: Arc::new(ProxyState {
                 routes,
-                upstream: Upstream::new(&upstream),
+                upstream,
                 metrics,
                 shard: index,
+                mirror: Some(mirror),
             }),
             acceptor,
             proxy_protocol,

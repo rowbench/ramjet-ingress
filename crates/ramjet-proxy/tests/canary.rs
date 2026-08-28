@@ -231,3 +231,83 @@ async fn a_cookie_diverts_when_no_header_rule_decides() {
         "the cookie must be found among the others in the header"
     );
 }
+
+/// The split, read back the way an operator reads it.
+///
+/// Everything above proves the *routing* decision. This proves the accounting
+/// that hangs off it, over real sockets and through the real admin endpoint,
+/// because an automatic promotion is going to make a decision from these
+/// numbers and a split that silently records nothing looks exactly like a
+/// canary nobody has sent traffic to.
+#[tokio::test]
+async fn the_canary_split_is_recorded_and_served() {
+    const REQUESTS: usize = 200;
+
+    let production = spawn_echo("prod").await;
+    // Every canary response is a 5xx and every production one is a 200, so the
+    // two sides are distinguishable in the counters and not only in the routing.
+    let canary = spawn_http(|_request| async move {
+        let mut response = http::Response::new(full("down"));
+        *response.status_mut() = http::StatusCode::INTERNAL_SERVER_ERROR;
+        response
+            .headers_mut()
+            .insert("x-upstream", http::HeaderValue::from_static("canary"));
+        response
+    })
+    .await;
+
+    let proxy = TestProxy::start(canary_table(
+        production,
+        canary,
+        CanaryRules {
+            backend: "canary",
+            weight: 50,
+            ..Default::default()
+        },
+    ))
+    .await;
+
+    let replies = send_many(proxy.http, "app.example.com", "/", REQUESTS).await;
+    let diverted = replies.iter().filter(|r| r.upstream() == "canary").count() as u64;
+
+    let reply = get(proxy.admin, "admin", "/admin/routes").await;
+    let body: serde_json::Value =
+        serde_json::from_slice(&reply.body).expect("/admin/routes returns JSON");
+    let route = &body["routes"].as_array().expect("an array")[0];
+
+    assert_eq!(
+        route["requests_total"].as_u64(),
+        Some(REQUESTS as u64),
+        "the route's totals must still count every request, canary or not"
+    );
+    assert_eq!(
+        route["canary_stats"]["requests_total"].as_u64(),
+        Some(diverted),
+        "the canary block must count exactly what the canary answered"
+    );
+    assert_eq!(
+        route["canary_stats"]["errors_5xx_total"].as_u64(),
+        Some(diverted),
+        "every canary response was a 500"
+    );
+    assert_eq!(
+        route["errors_5xx_total"].as_u64(),
+        Some(diverted),
+        "and none of production's were, so the route's 5xx are all the canary's"
+    );
+    assert!(
+        route["canary_stats"]["upstream_latency_count"]
+            .as_u64()
+            .is_some_and(|count| count == diverted),
+        "latency has to be attributed too, or the promotion gate has nothing to compare"
+    );
+
+    // The number the promotion loop actually acts on.
+    let stable = REQUESTS as u64 - diverted;
+    let stable_errors = route["errors_5xx_total"].as_u64().unwrap_or_default()
+        - route["canary_stats"]["errors_5xx_total"]
+            .as_u64()
+            .unwrap_or_default();
+    assert!(stable > 0, "the 50% split sent nothing to production");
+    assert_eq!(stable_errors, 0, "production served no errors");
+}
