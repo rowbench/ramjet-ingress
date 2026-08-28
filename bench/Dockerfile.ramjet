@@ -17,9 +17,17 @@ FROM rust:1-slim-bookworm AS builder
 WORKDIR /src
 
 # `ring` compiles C, so the toolchain image's gcc is a build requirement rather
-# than an accident. Copying the manifests and sources in one layer is fine here:
-# this image is built once per benchmark run, so a dependency cache layer would
-# buy nothing and risk serving a stale binary.
+# than an accident. jemalloc — the global allocator, see the `ALLOCATOR` static
+# in ramjet-ingressd — wants `make` on top of that, and the slim image does not
+# carry one. It is a builder-stage tool only: nothing below the second FROM
+# knows it existed.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends make \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copying the manifests and sources in one layer is fine here: this image is
+# built once per benchmark run, so a dependency cache layer would buy nothing
+# and risk serving a stale binary.
 #
 # The two repositories keep their real names and their real relative positions,
 # which is the whole trick: `../enhance-socket` resolves inside the image for

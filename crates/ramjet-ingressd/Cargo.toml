@@ -35,6 +35,11 @@ tracing.workspace = true
 # The controller logs through `tracing`, and without a subscriber a daemon whose
 # job is reacting to a cluster it does not control would react silently.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# The global allocator; the `ALLOCATOR` static in main.rs says what it is for
+# and what was measured. `background_threads` is the feature that matters:
+# without it memory comes back only while the process is still allocating, and
+# the case this exists for is a pod that has just lost its traffic.
+tikv-jemallocator = { version = "0.7.0", features = ["background_threads"] }
 
 [dev-dependencies]
 rcgen.workspace = true

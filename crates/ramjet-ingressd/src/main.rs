@@ -36,6 +36,48 @@ use tracing_subscriber::EnvFilter;
 
 use crate::args::{ArgError, Args, Engine, USAGE};
 
+/// The allocator, and why it is not glibc's.
+///
+/// This is a *retention* fix, not a footprint one, and the distinction is the
+/// whole reason it is here. Ten thousand idle keep-alive connections opened and
+/// then closed left glibc's malloc holding almost every byte it had taken:
+/// `bench/thesis/RESULTS.md`'s benchmark 4 measured 266 MiB at peak falling to
+/// only 230 MiB when every connection had gone, and a second cycle rising again
+/// from there. Nothing there is leaked — the blocks are free — but glibc's heap
+/// is contiguous and cannot hand a page back to the kernel unless everything
+/// above it is free too, and after ten thousand interleaved connections nothing
+/// ever is. A process meant to run for months grows across every traffic cycle,
+/// and a memory limit does not care that the bytes are technically free.
+///
+/// jemalloc's extents are independent, so freeing a connection's blocks makes
+/// whole runs purgeable, and its background thread `madvise`s them away on a
+/// timer whether or not the process is still allocating. That last part matters
+/// more than it sounds: the pathological case is a pod that has just *lost* its
+/// traffic, and an allocator that only reclaims while it is being called would
+/// sit on the memory precisely then.
+///
+/// Measured on benchmark 4's topology, the two-pass cycle that grew
+/// monotonically under glibc returns to its idle level after every pass here.
+/// The cost is about 300 KiB of binary and jemalloc's `configure`/`make` in the
+/// builder stage.
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc's configuration, read by the allocator before `main` runs.
+///
+/// Compiled in rather than set through `MALLOC_CONF` in the image or the chart,
+/// so that a binary run outside its container behaves the same way. The symbol
+/// carries `tikv-jemalloc-sys`'s `_rjem_` prefix: exported under the unprefixed
+/// name, jemalloc never reads it and every option here silently does nothing.
+///
+/// One second of decay rather than zero: purging is a `madvise` per run, and at
+/// zero the background thread does that work continuously under load for no
+/// benefit a second's delay does not also give.
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8] =
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+
 /// One worker thread, deliberately.
 ///
 /// This runtime does not serve traffic. Requests are served by the data
