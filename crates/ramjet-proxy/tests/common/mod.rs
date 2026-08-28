@@ -212,6 +212,8 @@ pub struct ProxyOptions {
     pub proxy_protocol: Option<Duration>,
     /// Generations the rollback ring keeps.
     pub history_size: usize,
+    /// Also serve HTTP/3 on an ephemeral UDP port.
+    pub http3: bool,
 }
 
 impl Default for ProxyOptions {
@@ -224,6 +226,7 @@ impl Default for ProxyOptions {
             workers: Some(1),
             proxy_protocol: None,
             history_size: ramjet_proxy::DEFAULT_HISTORY_SIZE,
+            http3: false,
         }
     }
 }
@@ -232,6 +235,7 @@ impl Default for ProxyOptions {
 pub struct TestProxy {
     pub http: SocketAddr,
     pub https: Option<SocketAddr>,
+    pub http3: Option<SocketAddr>,
     pub admin: SocketAddr,
     pub routes: Arc<SharedRouteTable>,
     pub certs: Arc<CertStore>,
@@ -258,6 +262,9 @@ impl TestProxy {
             worker_threads: options.workers,
             proxy_protocol: options.proxy_protocol,
             history_size: options.history_size,
+            // Port 0: the kernel picks, and `http3_addr` reports what it
+            // picked, exactly as it does for the TCP listeners.
+            http3: options.http3.then(loopback),
             ..ProxyConfig::default()
         };
 
@@ -272,6 +279,7 @@ impl TestProxy {
 
         let http = server.http_addr().expect("an http port");
         let https = server.https_addr();
+        let http3 = server.http3_addr();
         let admin = server.admin_addr().expect("an admin port");
         let metrics = Arc::clone(server.metrics());
         let history = Arc::clone(server.history());
@@ -282,6 +290,7 @@ impl TestProxy {
         TestProxy {
             http,
             https,
+            http3,
             admin,
             routes,
             certs: options.certs,
