@@ -68,7 +68,7 @@ use rustls::sign::CertifiedKey;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use crate::args::Args;
+use crate::args::{Args, Engine};
 use crate::certs;
 use crate::promotion::{KubePatcher, Promoter};
 
@@ -187,8 +187,15 @@ pub async fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         readiness.clone(),
     )?;
 
+    // `engine` is named here even though this function only ever runs one of
+    // them. An operator reading the log has to be able to tell which engine is
+    // serving by reading a field, not by noticing that a field is absent —
+    // absence is also what a truncated line, a log shipper dropping a key, and
+    // an older build all look like. The uring path logs the same field, so the
+    // answer is in the same place whichever engine won.
     info!(
         version = env!("CARGO_PKG_VERSION"),
+        engine = Engine::Hyper.as_str(),
         ingress_class = %args.ingress_class,
         namespace = args.watch_namespace.as_deref().unwrap_or("<all>"),
         http = ?server.http_addr(),
@@ -384,7 +391,10 @@ pub async fn run_uring(args: &Args) -> Result<ExitCode, Box<dyn std::error::Erro
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        engine = "uring",
+        // The engine that is serving, which is not the flag that was passed:
+        // `uring-strict` serves on the reactor and says `uring` here, because
+        // the question this field answers is what is moving the bytes.
+        engine = Engine::Uring.as_str(),
         ingress_class = %args.ingress_class,
         namespace = args.watch_namespace.as_deref().unwrap_or("<all>"),
         http = ?engine.http_addr(),

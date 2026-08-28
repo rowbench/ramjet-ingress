@@ -242,9 +242,16 @@ async fn dev_mode(
         readiness.clone(),
     )?;
 
+    // The engine is named even though this function serves only one of them,
+    // for the reason the Kubernetes path names it: an operator tells the
+    // engines apart by reading a field, never by noticing one is missing. A
+    // replica that fell back from `uring` lands here, and this line is where it
+    // says so.
     println!(
-        "ramjet-ingressd {} — {} backend(s), {} endpoint(s), {} route(s), {} certificate(s){}",
+        "ramjet-ingressd {} — engine {}, {} backend(s), {} endpoint(s), {} route(s), \
+         {} certificate(s){}",
         env!("CARGO_PKG_VERSION"),
+        Engine::Hyper.as_str(),
         summary.backends,
         summary.endpoints,
         summary.routes,

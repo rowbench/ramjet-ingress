@@ -203,6 +203,14 @@ fn uring_falls_back_to_hyper_when_the_reactor_will_not_start() {
         output.contains(ramjet_engine::engine::UNAVAILABLE_ENV),
         "the fallback must name the reason, not just the outcome:\n{output}"
     );
+    // The banner, not only the warning. An operator who arrives after the
+    // fallback — or whose log shipper kept the last line and dropped the one
+    // above it — still has to be able to read which engine is serving, and the
+    // banner is the line that is always there.
+    assert!(
+        output.contains("engine hyper"),
+        "the banner must name the engine that ended up serving:\n{output}"
+    );
 }
 
 #[test]
@@ -261,5 +269,12 @@ fn hyper_never_probes_the_reactor() {
     assert!(
         !output.contains("falling back"),
         "hyper was asked for and hyper is what runs:\n{output}"
+    );
+    // Symmetric with `uring_serves_on_a_host_where_the_reactor_works`, and the
+    // point of the pair: both engines name themselves the same way, so nothing
+    // reading these logs has to infer an engine from a missing field.
+    assert!(
+        output.contains("engine hyper"),
+        "the banner should say which engine is serving:\n{output}"
     );
 }
