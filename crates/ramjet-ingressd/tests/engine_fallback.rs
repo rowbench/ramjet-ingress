@@ -13,7 +13,18 @@
 use std::io::Read;
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// Distinguishes one run's scratch directory from another's.
+///
+/// The engine name is not enough: two tests here ask for `uring` and differ
+/// only in whether the reactor is available, so naming the directory after the
+/// engine gave them the same one — and each deletes it on the way out, so under
+/// enough load one test removed the other's routes file mid-run. That failed as
+/// "the daemon should be serving", which points at the daemon rather than at
+/// the test that broke it.
+static RUN: AtomicUsize = AtomicUsize::new(0);
 
 /// A routes file with one host and one endpoint nothing is listening on.
 ///
@@ -44,9 +55,10 @@ fn free_port() -> u16 {
 /// the engine decision goes to the log, so both are collected.
 fn run_until_serving(engine: &str, unavailable: bool) -> (bool, String) {
     let dir = std::env::temp_dir().join(format!(
-        "ramjet-engine-fallback-{}-{}",
+        "ramjet-engine-fallback-{}-{}-{}",
         std::process::id(),
-        engine.replace('-', "_")
+        engine.replace('-', "_"),
+        RUN.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     let routes = routes_file(&dir);
