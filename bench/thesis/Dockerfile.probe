@@ -1,0 +1,34 @@
+# The probe container.
+#
+# The measured entry point is a NodePort on the Kubernetes node's own bridge
+# address, which is reachable from a container on the `kind` docker network and
+# from nowhere on the macOS host. So anything that has to *watch* the data
+# plane runs in here.
+#
+# kubectl is in the image because the propagation benchmark times
+# `kubectl apply` against the first correct response through the data plane,
+# and splitting those two across a container boundary would have made the
+# measurement a comparison of two machines' clocks. The kubeconfig mounted at
+# runtime is generated fresh, contains only the local cluster, and points at
+# the API server's in-network address — so this container has no path to any
+# other cluster in the developer's real kubeconfig.
+
+FROM python:3.12-alpine
+
+ARG KUBECTL_VERSION=v1.36.1
+
+RUN apk add --no-cache curl ca-certificates \
+ && arch="$(uname -m)" \
+ && case "$arch" in \
+      aarch64) karch=arm64 ;; \
+      x86_64)  karch=amd64 ;; \
+      *) echo "unsupported arch $arch" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /usr/local/bin/kubectl \
+      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${karch}/kubectl" \
+ && chmod +x /usr/local/bin/kubectl \
+ && kubectl version --client=true
+
+COPY probe.py /probe.py
+
+ENTRYPOINT ["python3", "/probe.py"]

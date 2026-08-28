@@ -1,0 +1,19 @@
+[1;34m==>[0m Benchmark 1: config churn under load
+    window 120s, settle 10s, oha c64 for 100s, churn every 2s
+    50 idle keep-alive connections held throughout, probed every 10s
+    context docker-desktop, node desktop-control-plane, load path: docker network kind -> NodePort
+[1;34m==>[0m round 1/2 (order: ramjet nginx)
+    ramjet-baseline-r1          98,072 rps  p99     4.1 ms  err    0  idle 50/50  reloads 0
+    nginx-baseline-r1           91,038 rps  p99     4.6 ms  err    0  idle 50/50  reloads 0
+    ramjet-spec-r1             105,088 rps  p99     3.7 ms  err    0  idle 50/50  reloads 49
+    nginx-spec-r1               73,388 rps  p99     5.9 ms  err  864  idle 0/50  reloads 33
+    ramjet-endpoint-r1         100,780 rps  p99     3.9 ms  err    0  idle 50/50  reloads 49
+    nginx-endpoint-r1           72,526 rps  p99     6.0 ms  err    0  idle 50/50  reloads 0
+[1;34m==>[0m round 2/2 (order: nginx ramjet)
+    nginx-baseline-r2           84,692 rps  p99     4.7 ms  err    0  idle 50/50  reloads 0
+    ramjet-baseline-r2         111,617 rps  p99     3.5 ms  err    0  idle 50/50  reloads 0
+    nginx-spec-r2               83,348 rps  p99     4.8 ms  err  858  idle 0/50  reloads 33
+    ramjet-spec-r2             109,984 rps  p99     3.5 ms  err    0  idle 50/50  reloads 49
+    nginx-endpoint-r2           56,084 rps  p99     7.5 ms  err    0  idle 50/50  reloads 0
+    ramjet-endpoint-r2         105,817 rps  p99     3.7 ms  err    0  idle 50/50  reloads 49
+[1;34m==>[0m Benchmark 1 complete — raw output in /Users/hamdallah/dev/my-plays/ramjet/ramjet-ingress/bench/thesis/results/b1

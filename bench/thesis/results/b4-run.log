@@ -1,0 +1,12 @@
+[1;34m==>[0m Benchmark 4: 10000 idle keep-alive connections (docker only, no Kubernetes)
+    context docker-desktop, node desktop-control-plane, load path: docker network kind -> NodePort
+    machine quiet (40% idle) after 10s
+[1;34m==>[0m starting upstream and both proxies
+    both proxies serve 200 through the shared upstream
+[1;34m==>[0m holding connections (interleaved is not possible: the holder is one process)
+    ramjet   10000/10000 established in 5s     1.5 ->  266.1 ->  229.6 MiB    27746.2 B/conn
+    nginx    10000/10000 established in 6s    16.3 ->   58.9 ->   16.5 MiB     4466.9 B/conn
+[1;34m==>[0m second pass, reversed order
+    nginx    10000/10000 established in 2s    16.5 ->   58.8 ->   16.5 MiB     4435.5 B/conn
+    ramjet   10000/10000 established in 4s   229.6 ->  329.0 ->  292.3 MiB    10422.8 B/conn
+[1;34m==>[0m Benchmark 4 complete — raw output in /Users/hamdallah/dev/my-plays/ramjet/ramjet-ingress/bench/thesis/results/b4

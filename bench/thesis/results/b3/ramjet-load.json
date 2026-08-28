@@ -1,0 +1,1 @@
+{"routes_requested": 500, "routes_created": 500, "apply_ms": 10704.9, "converge_ms": 10915.4, "timed_out": false, "controller_cpu_seconds": 0.66, "controller_mem_bytes_before": 22151168, "controller_mem_bytes_after": 21774336, "nginx_reloads_during_load": 0}

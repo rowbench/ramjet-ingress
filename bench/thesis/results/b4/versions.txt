@@ -1,0 +1,2 @@
+ramjet: ramjet-ingressd 0.1.0
+nginx:  nginx version: nginx/1.31.4

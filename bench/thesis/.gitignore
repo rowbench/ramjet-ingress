@@ -1,0 +1,7 @@
+# Scratch shared into the probe container: a generated kubeconfig (which holds
+# the cluster's client certificate) and the manifests the benchmarks apply.
+# Regenerated on every run; never committed.
+.work/
+
+# Python bytecode from the report and probe scripts.
+__pycache__/

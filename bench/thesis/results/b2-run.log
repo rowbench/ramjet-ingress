@@ -1,0 +1,27 @@
+[1;34m==>[0m Benchmark 2: propagation latency (apply -> served)
+    10 trials of each shape per contender, contenders interleaved
+    context docker-desktop, node desktop-control-plane, load path: docker network kind -> NodePort
+    machine quiet (94% idle) after 10s
+[1;34m==>[0m new Ingress (unique host, poll until first 200)
+    trial 1    ramjet=380.0ms  nginx=302.1ms
+    trial 2    nginx=522.2ms  ramjet=491.5ms
+    trial 3    ramjet=370.7ms  nginx=652.5ms
+    trial 4    nginx=3638.2ms  ramjet=352.2ms
+    trial 5    ramjet=337.5ms  nginx=1373.3ms
+    trial 6    nginx=3562.1ms  ramjet=565.7ms
+    trial 7    ramjet=354.9ms  nginx=553.9ms
+    trial 8    nginx=2892.9ms  ramjet=388.5ms
+    trial 9    ramjet=354.4ms  nginx=929.6ms
+    trial 10   nginx=3579.3ms  ramjet=324.0ms
+[1;34m==>[0m backend swap (existing host, poll until the NEW backend answers)
+    trial 1    ramjet=337.5ms  nginx=1311.3ms
+    trial 2    nginx=395.5ms  ramjet=461.4ms
+    trial 3    ramjet=321.8ms  nginx=1723.0ms
+    trial 4    nginx=384.3ms  ramjet=555.9ms
+    trial 5    ramjet=331.3ms  nginx=411.4ms
+    trial 6    nginx=412.8ms  ramjet=544.5ms
+    trial 7    ramjet=331.8ms  nginx=414.2ms
+    trial 8    nginx=503.7ms  ramjet=370.4ms
+    trial 9    ramjet=374.6ms  nginx=2111.9ms
+    trial 10   nginx=3656.6ms  ramjet=336.5ms
+[1;34m==>[0m Benchmark 2 complete — raw output in /Users/hamdallah/dev/my-plays/ramjet/ramjet-ingress/bench/thesis/results/b2

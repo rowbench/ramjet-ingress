@@ -1,0 +1,19 @@
+[1;34m==>[0m Benchmark 1: config churn under load
+    window 120s, settle 10s, oha c64 for 100s, churn every 2s
+    50 idle keep-alive connections held throughout, probed every 10s
+    context docker-desktop, node desktop-control-plane, load path: docker network kind -> NodePort
+[1;34m==>[0m round 3/4 (contenders: ramjet nginx; arms: endpoint spec baseline)
+    ramjet-endpoint-r3          28,811 rps  p99    17.7 ms  err    0  idle 50/50  reloads 47
+    nginx-endpoint-r3           28,536 rps  p99    20.2 ms  err    0  idle 50/50  reloads 0
+    ramjet-spec-r3              35,887 rps  p99    14.1 ms  err    0  idle 50/50  reloads 47
+    nginx-spec-r3               27,875 rps  p99    19.7 ms  err  889  idle 0/50  reloads 33
+    ramjet-baseline-r3          96,365 rps  p99     4.2 ms  err    0  idle 50/50  reloads 0
+    nginx-baseline-r3          100,530 rps  p99     4.1 ms  err    0  idle 50/50  reloads 0
+[1;34m==>[0m round 4/4 (contenders: nginx ramjet; arms: endpoint spec baseline)
+    nginx-endpoint-r4           49,490 rps  p99     9.2 ms  err    0  idle 50/50  reloads 0
+    ramjet-endpoint-r4          95,627 rps  p99     4.2 ms  err    0  idle 50/50  reloads 49
+    nginx-spec-r4               68,253 rps  p99     6.4 ms  err  883  idle 0/50  reloads 34
+    ramjet-spec-r4              36,753 rps  p99    13.3 ms  err    0  idle 50/50  reloads 44
+    nginx-baseline-r4           41,983 rps  p99    12.7 ms  err    0  idle 50/50  reloads 0
+    ramjet-baseline-r4          94,797 rps  p99     4.4 ms  err    0  idle 50/50  reloads 0
+[1;34m==>[0m Benchmark 1 complete — raw output in /Users/hamdallah/dev/my-plays/ramjet/ramjet-ingress/bench/thesis/results/b1

@@ -1,0 +1,1 @@
+{"host": "new-nginx-8.thesis.test", "target": "172.24.0.3:31081", "expect": "", "apply_ms": 112.9, "serve_ms": 2892.9, "post_apply_ms": 2780.0, "polls": 132, "timed_out": false}

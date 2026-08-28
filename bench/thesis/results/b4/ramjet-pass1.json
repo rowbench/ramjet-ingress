@@ -1,0 +1,1 @@
+{"contender": "ramjet", "requested": 10000, "established": 10000, "failed": 0, "open_seconds": 4.6, "mem_before_bytes": 1564475, "mem_at_peak_bytes": 279026073, "mem_after_close_bytes": 240753049, "bytes_per_connection": 27746.2, "retained_after_close_bytes": 239188574}

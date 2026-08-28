@@ -1,0 +1,31 @@
+[1;34m==>[0m Benchmark 3: 500 routes
+    context docker-desktop, node desktop-control-plane, load path: docker network kind -> NodePort
+[1;34m==>[0m ramjet: loading 500 Ingresses
+    waiting for a quiet machine: 26% VM CPU idle, 2 docker build(s) running
+    waiting for a quiet machine: 22% VM CPU idle, 0 docker build(s) running
+    machine quiet (38% idle) after 140s
+    ramjet: 500/500 created, apply 10.7s, converge 10.9s, cpu 0.66s, mem 21.1 -> 20.8 MiB, nginx reloads 0
+[1;34m==>[0m ramjet: propagation with 500 routes present (5 trials)
+    trial 1   723.4 ms
+    trial 2   441.2 ms
+    trial 3   517.7 ms
+    trial 4   413.5 ms
+    trial 5   506.6 ms
+[1;34m==>[0m ramjet: throughput on the stable route with 500 routes present
+    47,535 rps, p99 9.2 ms
+[1;34m==>[0m ramjet: removing the 500 routes
+    deleted in 105s; 0 remain
+[1;34m==>[0m nginx: loading 500 Ingresses
+    machine quiet (25% idle) after 10s
+    nginx: 500/500 created, apply 58.5s, converge 61.7s, cpu 66.74s, mem 115.8 -> 214.0 MiB, nginx reloads 19
+[1;34m==>[0m nginx: propagation with 500 routes present (5 trials)
+    trial 1   3373.7 ms
+    trial 2   5850.7 ms
+    trial 3   4399.7 ms
+    trial 4   5005.9 ms
+    trial 5   5963.9 ms
+[1;34m==>[0m nginx: throughput on the stable route with 500 routes present
+    16,109 rps, p99 35.8 ms
+[1;34m==>[0m nginx: removing the 500 routes
+    deleted in 106s; 0 remain
+[1;34m==>[0m Benchmark 3 complete — raw output in /Users/hamdallah/dev/my-plays/ramjet/ramjet-ingress/bench/thesis/results/b3

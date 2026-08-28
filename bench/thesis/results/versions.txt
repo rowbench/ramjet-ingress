@@ -1,0 +1,15 @@
+date:            2026-08-28T00:47:12Z
+host:            Darwin 25.5.0 arm64, 12 host CPUs
+docker:          29.7.2
+docker VM:       8 CPUs, 3.8 GiB, kernel 7.0.12-linuxkit
+kubernetes:      v1.36.1
+node runtime:    containerd://2.3.1
+helm:            v3.18.0
+
+ramjet-ingress:  ramjet-ingressd 0.1.0
+  image:         ramjet-thesis:8078948 (sha256:a9d3ac608dac3c4d9452c1d2073577d8adbe3421ae7b537d5542b8a64b3fe5c7)
+  built from:    807894819a3efb2c54672ec240fbbbc6aa381845 (fix(deploy): load the image into the node, keep imagePullPolicy Never)
+  repo HEAD now: b09aa5d (bench: rotate round order, add a cooldown, document the host gate) — moved during the run, not measured
+  chart:         deploy/chart/ramjet-ingress version 0.1.0
+  flags:         --http=:8080 --https=:8443 --admin=:10254 --ingress-class=ramjet-thesis-ramjet --publish-service=ramjet-thesis-ramjet/ramjet-thesis-ramjet --publish-address=127.0.0.1 --connect-timeout=5 --response-timeout=60 --max-connect-attempts=3 --shutdown-grace=30 
+  resources:     {"limits":{"memory":"256Mi"},"requests":{"cpu":"100m","memory":"64Mi"}}
