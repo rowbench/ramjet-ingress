@@ -392,3 +392,189 @@ async fn a_route_with_no_mirror_makes_no_copies() {
 fn _metrics_are_shared(proxy: &TestProxy) -> Arc<ramjet_proxy::Metrics> {
     Arc::clone(&proxy.metrics)
 }
+
+// ---------------------------------------------------------------------------
+// A shadow backend on the other protocol
+// ---------------------------------------------------------------------------
+
+/// Waits, briefly and boundedly, for `ready` to hold.
+async fn settle(ready: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ready() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The same recorder, behind a cleartext HTTP/2 listener.
+async fn spawn_h2c_recorder() -> (SocketAddr, mpsc::UnboundedReceiver<Seen>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let addr = spawn_h2c(move |request: Request<Incoming>| {
+        let tx = tx.clone();
+        async move {
+            let method = request.method().to_string();
+            let path = request
+                .uri()
+                .path_and_query()
+                .map_or_else(|| "/".to_owned(), |p| p.to_string());
+            let header = |name: &str| {
+                request
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
+            // `x-forwarded-host` rather than `host`: an h2 request carries its
+            // authority in `:authority`, which names the endpoint, so the client's
+            // name arrives in the forwarded header. Recorded into the same field
+            // so the assertions below read like the HTTP/1.1 ones.
+            let host = header("x-forwarded-host");
+            let marker = header("x-mirrored-by");
+            let body = request
+                .into_body()
+                .collect()
+                .await
+                .map(|c| String::from_utf8_lossy(&c.to_bytes()).into_owned())
+                .unwrap_or_default();
+            let _ = tx.send(Seen {
+                method,
+                path,
+                host,
+                marker,
+                body,
+            });
+            Response::new(full("recorded"))
+        }
+    })
+    .await;
+    (addr, rx)
+}
+
+/// A table whose primary is HTTP/1.1 and whose shadow is dialled over h2c.
+fn crossed_table(primary: SocketAddr, shadow: SocketAddr) -> RouteTable {
+    use ramjet_router::{BackendOptions, BackendProtocol};
+
+    let mut builder = RouteTableBuilder::new();
+    builder
+        .backend("prod", LbPolicy::RoundRobin, vec![Endpoint::new(primary)])
+        .expect("backend");
+    builder
+        .backend_with(
+            "shadow",
+            vec![Endpoint::new(shadow)],
+            &BackendOptions {
+                policy: LbPolicy::RoundRobin,
+                protocol: BackendProtocol::H2c,
+            },
+        )
+        .expect("backend");
+    builder
+        .route_with(
+            Some("app.example.com"),
+            "/",
+            PathType::Prefix,
+            "prod",
+            &RouteOptions {
+                mirror: Some(to_shadow(100)),
+                ..Default::default()
+            },
+        )
+        .expect("route");
+    builder.build().expect("table")
+}
+
+#[tokio::test]
+async fn a_copy_is_sent_with_the_shadows_own_protocol_not_the_primarys() {
+    // A shadow Service is annotated independently of the production one, so the
+    // copy has to be re-versioned for its own backend rather than inheriting
+    // the primary's. This is the case that breaks if it is not: an HTTP/1.1
+    // primary and an h2c shadow, where the copy was built from a request head
+    // already rewritten for HTTP/1.1.
+    let primary = spawn_echo("prod").await;
+    let (shadow, mut seen) = spawn_h2c_recorder().await;
+    let proxy = TestProxy::start(crossed_table(primary, shadow)).await;
+
+    let reply = send(
+        proxy.http,
+        request("app.example.com", "/orders")
+            .method("POST")
+            .body(full("the payload"))
+            .expect("a request"),
+    )
+    .await;
+
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.upstream(), "prod", "the primary is untouched");
+
+    let copy = next_seen(&mut seen).await;
+    assert_eq!(copy.method, "POST");
+    assert_eq!(copy.path, "/orders");
+    assert_eq!(copy.body, "the payload");
+    assert_eq!(copy.marker.as_deref(), Some("ramjet-ingress"));
+    assert_eq!(
+        copy.host.as_deref(),
+        Some("app.example.com"),
+        "the client's name reaches an h2c shadow as X-Forwarded-Host"
+    );
+
+    // The counter, not just the arrival, because only the counter says the h2
+    // *exchange* completed: the recorder reports on receipt, while the worker
+    // records after it has drained the response and put the connection back.
+    // Bounded wait rather than an immediate read — the two are legitimately a
+    // few microseconds apart, and asserting on the gap would be a flake.
+    settle(|| proxy.metrics.mirrored() == 1).await;
+    assert_eq!(proxy.metrics.mirrored(), 1);
+    assert_eq!(proxy.metrics.mirror_failures(), 0);
+}
+
+#[tokio::test]
+async fn a_mirror_host_override_reaches_an_h2c_shadow_as_forwarded_host() {
+    // `mirror-host` writes the override into `Host`, which an h2c backend must
+    // not receive — so it has to be moved rather than dropped, or the override
+    // silently stops working the moment the shadow is annotated.
+    use ramjet_router::{BackendOptions, BackendProtocol};
+
+    let primary = spawn_echo("prod").await;
+    let (shadow, mut seen) = spawn_h2c_recorder().await;
+
+    let mut builder = RouteTableBuilder::new();
+    builder
+        .backend("prod", LbPolicy::RoundRobin, vec![Endpoint::new(primary)])
+        .expect("backend");
+    builder
+        .backend_with(
+            "shadow",
+            vec![Endpoint::new(shadow)],
+            &BackendOptions {
+                policy: LbPolicy::RoundRobin,
+                protocol: BackendProtocol::H2c,
+            },
+        )
+        .expect("backend");
+    builder
+        .route_with(
+            Some("app.example.com"),
+            "/",
+            PathType::Prefix,
+            "prod",
+            &RouteOptions {
+                mirror: Some(MirrorRules {
+                    backend: "shadow",
+                    percent: 100,
+                    host: Some("shadow.example.com"),
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("route");
+    let proxy = TestProxy::start(builder.build().expect("table")).await;
+
+    let reply = get(proxy.http, "app.example.com", "/").await;
+    assert_eq!(reply.status, 200);
+
+    let copy = next_seen(&mut seen).await;
+    assert_eq!(
+        copy.host.as_deref(),
+        Some("shadow.example.com"),
+        "the override survives the crossing to h2c"
+    );
+}
