@@ -15,6 +15,13 @@ does not give the memory back when the connections close. At 10,000 idle
 connections ramjet-ingress measured 266 MiB — above the 256Mi limit its own
 Helm chart ships by default.
 
+That measurement stands as written, and the work it prompted is recorded in
+[benchmark 4 after the fix](#benchmark-4-after-the-fix-commit-d86269e). The
+short version: the memory now comes back — a full connect/close cycle returns
+to 11.5 MiB and the next one does not start higher — and the peak fell to 200.7
+MiB, under the chart's limit. Per connection it is 20.3 KiB against 4.4, so
+ingress-nginx still wins this benchmark, by 4.6x rather than 6x.
+
 <!-- Tables are rendered by report.py from results/; the prose is not. -->
 
 ## Why this document exists
@@ -517,6 +524,134 @@ idle keep-alive connections would be OOM-killed by its own default manifest.
 that is a real cost", 33.1 MiB against nginx's 12.6 MiB under load — and this
 benchmark shows where that trend ends up.
 
+## Benchmark 4 after the fix, commit d86269e
+
+Benchmark 4 is the one ingress-nginx won, and it found two separate problems: an
+idle keep-alive connection cost ramjet-ingress 27.1 KiB against nginx's 4.4, and
+the memory did not come back when the connections closed. This section is the
+identical harness re-run against an image that addresses both. The table above
+is left exactly as it was — its raw JSON is still in `results/b4/`, this one's is
+in `results/b4-after/` — because a benchmark that overwrites the evidence it was
+judged against cannot be checked afterwards.
+
+### Container memory across 10,000 idle keep-alive connections, after the fix
+
+| Contender | Pass | Established | Idle before | At 10k | After close | Per connection | Retained |
+|---|---|---:|---:|---:|---:|---:|---:|
+| ramjet | 1 | 10,000/10,000 | 2.5 MiB | 200.7 MiB | 11.6 MiB | 20.3 KiB | +9.1 MiB |
+| ramjet | 2 | 10,000/10,000 | 11.6 MiB | 201.1 MiB | 11.5 MiB | 19.4 KiB | -0.2 MiB |
+| nginx | 1 | 10,000/10,000 | 16.3 MiB | 58.8 MiB | 16.5 MiB | 4.4 KiB | +0.2 MiB |
+| nginx | 2 | 10,000/10,000 | 16.5 MiB | 58.8 MiB | 16.5 MiB | 4.3 KiB | +0.0 MiB |
+
+### Reading it
+
+**The retention problem is gone.** Ten thousand connections took the process to
+200.7 MiB; closing them brought it back to 11.6, and a second full cycle peaked
+at 201.1 and settled at 11.5 — *below* where the first pass left it. The figure
+that mattered most in the original run was not the peak but the +228.1 MiB that
+never came back and the +62.7 MiB the next cycle added on top; both are now
+noise. ramjet-ingress now also idles lower than nginx does, 11.5 MiB against
+16.5.
+
+**The per-connection cost improved by a quarter and ingress-nginx still wins
+it.** 27.1 KiB to 20.3 is real, and 20.3 against 4.4 is still 4.6x. The gap is
+structural and the rest of this section is about where it lives, because
+"ingress-nginx is more memory-efficient per connection" is a true sentence that
+explains nothing.
+
+### What was changed
+
+**The response future no longer lives inside the connection.** hyper's HTTP/1
+dispatcher keeps the in-flight response future in a `Pin<Box<Option<S::Future>>>`
+that it allocates when the connection is created and holds for the connection's
+whole life. Left unboxed that box is the size of the entire forwarding state
+machine — 2.9 KiB — charged to every idle keep-alive connection that is serving
+nothing at all. Boxing it in the service makes hyper's box eight bytes and moves
+the cost to one allocation per request, paid by traffic instead of by silence.
+Measured at 2,000 connections: **3.1 KiB less per connection.**
+
+**The global allocator is jemalloc**, configured
+`background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000` and compiled
+into the binary rather than set through the image or the chart. This is the
+retention fix and it does almost nothing for the footprint. Under glibc, freeing
+ten thousand connections' blocks does not let the heap shrink: the heap is
+contiguous and cannot return a page unless everything above it is free too,
+which after ten thousand interleaved connections nothing is. jemalloc's extents
+are independent, and its background thread `madvise`s free runs away on a timer
+whether or not the process is still allocating — which is the property that
+matters, because the case this exists for is a replica that has just *lost* its
+traffic, and an allocator that reclaims only while it is being called would hold
+on precisely then. mimalloc measured slightly better on footprint (19.9 KiB
+against 20.8 at 2,000 connections) and needs `MIMALLOC_PURGE_DELAY=0` in the
+environment to return anything at all, which a binary run outside its container
+would not have.
+
+**`--max-buf-size`, default 64 KiB.** Listed for completeness: it changes nothing
+in the table above, because the requests here are 90 bytes. hyper's own ceiling
+on a connection's HTTP/1 buffers is 408 KiB and it never shrinks one it grew, so
+a client that sends a 400 KiB header block pins 400 KiB until it disconnects.
+nginx bounds the same thing at 32 KiB. What this bounds is the tail.
+
+### Where the remaining 20.3 KiB goes
+
+Measured on the same topology at 2,000 connections, sampling both the cgroup
+working set and the process's own `VmRSS`, so the kernel's share is separable
+from the process's:
+
+| What the connection has done | Per connection, cgroup | Per connection, VmRSS |
+|---|---:|---:|
+| Accepted, never sent a byte | 6.1 KiB | 1.7 KiB |
+| One request, answered by the proxy itself | 20.1 KiB | 16.2 KiB |
+| One request, forwarded to the upstream | 20.8 KiB | 16.9 KiB |
+
+The gap between the columns on a connection that has only been accepted — about
+4.4 KiB — is kernel socket memory, which cgroup v2 charges to the container.
+That is very nearly nginx's *entire* per-connection cost, which is the sharpest
+way to state the difference: **nginx's 4.4 KiB is, to a first approximation, the
+socket and nothing else.** It hands a connection's request buffers back to its
+pool when the connection goes idle and keeps only the connection object. There
+is no equivalent in hyper.
+
+What ramjet-ingress keeps instead is hyper's. Creating the HTTP/1 connection
+allocates two buffers of `INIT_BUFFER_SIZE` — 8 KiB to read into, 8 KiB to write
+response heads from — and hyper neither shrinks nor drops either one while the
+connection lives. Two checks establish that this is where the remaining 16.9 KiB
+sits, rather than somewhere in this codebase:
+
+- Sending 6 KiB of request headers instead of 90 bytes moved the figure by two
+  bytes, 16,927 against 16,929 per connection. The read buffer is resident
+  whether or not anything is read into it.
+- Patching hyper's `INIT_BUFFER_SIZE` from 8192 down to 1024 and re-running the
+  same measurement gave **11.3 KiB cgroup and 7.3 KiB RSS** per connection. Two
+  8 KiB buffers becoming two 1 KiB ones accounts for 9.6 KiB, and nothing else
+  moved.
+
+There is no public API that lowers it: `max_buf_size` caps how far the read
+buffer may *grow*, and hyper refuses to set it below `INIT_BUFFER_SIZE`. So
+**16 KiB per idle keep-alive connection is this engine's floor** until hyper's
+initial allocation follows its configured maximum instead of a constant. The
+patched measurement above is what that change would be worth: roughly 2.5x
+nginx instead of 4.6x. It is a one-line change in a dependency, and the right
+place to make it is upstream.
+
+The experimental `uring` engine was measured opportunistically on the same
+harness and is not cheaper — 23.2 KiB per connection, because it allocates
+per-connection buffers of its own. Its footprint is its own phase's problem.
+
+### The chart's memory limit, revisited
+
+The original reading said a ramjet-ingress replica holding 10,000 idle
+keep-alive connections would be OOM-killed by its own default manifest, because
+the peak was 266 MiB against a `resources.limits.memory` of 256Mi. That is no
+longer true: the peak is 200.7 MiB, and the growth across cycles that made the
+limit a matter of time rather than of load is gone.
+
+The limit stays at 256Mi, and the values file now carries the arithmetic instead
+of leaving it to be rediscovered — about 20 KiB per idle keep-alive connection,
+so 256Mi is roughly twelve thousand of them. Raising the default to make room
+for a per-connection cost that is still 4.6x nginx's would have hidden the
+finding rather than fixed it.
+
 ## Where ingress-nginx won or tied
 
 Collected in one place, because a report that only lists the other side's losses
@@ -524,7 +659,7 @@ is not a measurement.
 
 | | Result |
 |---|---|
-| **Idle-connection memory** | **Won, heavily.** 4.4 KiB/connection against 27.1, and it returns all of it on close while ramjet-ingress retains and grows. |
+| **Idle-connection memory** | **Won, heavily.** 4.4 KiB/connection against 27.1, and it returns all of it on close while ramjet-ingress retains and grows. Still won after the fix, by less: 4.4 against 20.3, and both now return what they took. |
 | **`kubectl apply` write path (single Ingress)** | **Won.** 138 ms median against 159, *including* `nginx -t` validation of the whole configuration through an admission webhook that ramjet-ingress does not have. |
 | **Endpoint-only churn: connection safety** | **Tied.** 50/50 idle connections survived, zero errors, zero reloads. Its Lua balancer does exactly what it claims and the reload argument does not apply to endpoint changes. |
 | **Deleting 500 Ingresses** | **Tied.** ~105 s each; the API server is the bottleneck, not either controller. |

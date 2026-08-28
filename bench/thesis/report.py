@@ -304,6 +304,33 @@ def b4():
                   f"{d['retained_after_close_bytes'] / 1048576:+.1f} MiB |")
 
 
+def b4_after():
+    """Benchmark 4 re-run against the image that fixed it.
+
+    Rendered from `results/b4-after/` and printed beside the original rather
+    than instead of it: the first measurement is what the fix was judged
+    against, and a table that quietly replaced it would leave the claim
+    unfalsifiable.
+    """
+    data = load("b4-after/*.json")
+    if not data:
+        return
+    print("### Container memory across 10,000 idle keep-alive connections, after the fix\n")
+    print("| Contender | Pass | Established | Idle before | At 10k | After close | Per connection | Retained |")
+    print("|---|---|---:|---:|---:|---:|---:|---:|")
+    for c in ("ramjet", "nginx"):
+        for p in ("pass1", "pass2"):
+            d = data.get(f"{c}-{p}.json")
+            if not d:
+                continue
+            print(f"| {c} | {p[-1]} | {d['established']:,}/{d['requested']:,} | "
+                  f"{d['mem_before_bytes'] / 1048576:.1f} MiB | "
+                  f"{d['mem_at_peak_bytes'] / 1048576:.1f} MiB | "
+                  f"{d['mem_after_close_bytes'] / 1048576:.1f} MiB | "
+                  f"{fmt(d['bytes_per_connection'] / 1024, ' KiB', 1) if d['bytes_per_connection'] else '—'} | "
+                  f"{d['retained_after_close_bytes'] / 1048576:+.1f} MiB |")
+
+
 def b1_contended():
     """Rounds 3 and 4, which are kept apart from the headline table on purpose.
 
@@ -319,7 +346,14 @@ def b1_contended():
 
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
-    stages = (("b1", b1), ("b1-contended", b1_contended), ("b2", b2), ("b3", b3), ("b4", b4))
+    stages = (
+        ("b1", b1),
+        ("b1-contended", b1_contended),
+        ("b2", b2),
+        ("b3", b3),
+        ("b4", b4),
+        ("b4-after", b4_after),
+    )
     for name, fn in stages:
         if which in ("all", name):
             if not glob.glob(os.path.join(RES, name.split("-")[0] if name == "b1" else name, "*")):

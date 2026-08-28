@@ -1,0 +1,4 @@
+ramjet: ramjet-ingressd 0.1.0
+nginx:  nginx version: nginx/1.31.4
+image:  ramjet-thesis:d86269e
+built from: d86269e (ingressd: jemalloc, so the memory an idle connection took comes back)

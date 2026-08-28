@@ -18,7 +18,11 @@
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
-OUT="$RESULTS_DIR/b4"
+# Overridable so a re-run against a fixed image can be recorded beside the
+# original rather than on top of it. The first measurement is the reason the
+# fix exists, and a benchmark that overwrites the evidence it was judged
+# against cannot be checked afterwards.
+OUT="${B4_OUT:-$RESULTS_DIR/b4}"
 NET="${PREFIX}-b4-net"
 SUBNET="172.31.97.0/24"
 IP_UP="172.31.97.11"
