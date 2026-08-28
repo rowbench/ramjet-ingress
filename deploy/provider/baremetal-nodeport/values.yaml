@@ -1,0 +1,51 @@
+# Bare metal — a NodePort Service on fixed ports.
+#
+#   helm install ramjet deploy/chart/ramjet-ingress \
+#     --namespace ramjet-ingress --create-namespace \
+#     -f deploy/provider/baremetal-nodeport/values.yaml
+#
+# Works on any cluster, including one with no load balancer controller at all,
+# which is what makes it the right thing to reach for when testing. Traffic
+# arrives at <any node>:30080 and <any node>:30443.
+#
+# The ports are fixed rather than allocated. An allocated NodePort changes
+# whenever the Service is recreated, and every firewall rule and upstream
+# config naming it goes stale silently; 30080 and 30443 are inside the default
+# 30000-32767 range, so no API server flag has to change to use them.
+#
+# Two things this shape cannot do:
+#
+#  1. Serve :80 and :443. That is what baremetal-hostnetwork is for, or an
+#     edge — MetalLB, HAProxy, a hardware balancer — in front of these ports.
+#
+#  2. Populate Ingress status. A NodePort Service has no .status.loadBalancer
+#     to read an address from, so set controller.publishAddress to whatever
+#     address clients actually use, or the status field stays empty. Routing is
+#     unaffected either way; the field is advertising, not configuration.
+
+service:
+  type: NodePort
+  http:
+    nodePort: 30080
+  https:
+    nodePort: 30443
+
+  # Left at Cluster (the Kubernetes default), unlike every cloud preset here,
+  # and the difference is worth understanding before changing it.
+  #
+  # Cluster means any node accepts the packet and forwards it to whichever node
+  # holds a pod — which SNATs the client address away, so X-Forwarded-For
+  # carries a node IP. Local keeps the address, but then only nodes running a
+  # ready pod answer at all, and the rest drop the packet with no reply. On a
+  # cloud that is fine, because the balancer health-checks nodes and stops
+  # sending to the ones that are silent. Here there is no balancer doing that:
+  # DNS round-robin or a hand-written upstream list would keep sending traffic
+  # to nodes that have quietly stopped answering.
+  #
+  # So: Local is right once something in front is health-checking these ports.
+  # Until then, Cluster costs the client address and nothing else.
+  externalTrafficPolicy: ""
+
+# See the note above — without this, managed Ingresses show an empty address.
+controller:
+  publishAddress: ""

@@ -1,0 +1,46 @@
+# DigitalOcean — a managed load balancer speaking PROXY protocol.
+#
+#   helm install ramjet deploy/chart/ramjet-ingress \
+#     --namespace ramjet-ingress --create-namespace \
+#     -f deploy/provider/digitalocean/values.yaml
+
+# The two halves of one setting: the annotation makes the balancer send the
+# header, this makes the listeners require it. DigitalOcean's balancer does not
+# preserve the source address any other way, so this is how the client IP gets
+# in at all.
+proxyProtocol:
+  enabled: true
+
+service:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+
+  annotations:
+    # Must be the string "true", not the boolean. DigitalOcean's own docs call
+    # this out: a bare `true` here trips a Kubernetes bug that discards every
+    # annotation on the Service, and the balancer then comes up without proxy
+    # protocol while the listeners still demand it — so every connection is
+    # rejected and nothing in the Service spec says why.
+    service.beta.kubernetes.io/do-loadbalancer-enable-proxy-protocol: "true"
+
+    # Uncomment once a hostname of yours resolves to this balancer's address.
+    #
+    # This is the workaround for kubernetes/kubernetes#66607: kube-proxy adds
+    # the balancer's external IP to node-local iptables rules, so a pod in the
+    # cluster that connects to that IP is short-circuited straight to a backend
+    # and never traverses the balancer. With proxy protocol on, that connection
+    # arrives with no header at a listener that requires one, and is rejected —
+    # in-cluster clients break while everything from outside works, which is a
+    # miserable thing to debug.
+    #
+    # The bypass only happens when the Service status reports an IP. This
+    # annotation makes the cloud controller report a hostname instead, so the
+    # rule is never installed. The order matters: install, wait for the external
+    # IP, point a DNS record at it, then set this and re-apply.
+    # service.beta.kubernetes.io/do-loadbalancer-hostname: "ingress.example.com"
+
+    # The health check stays at its default (TCP against the traffic port). A
+    # TCP check completes the handshake and closes, which a listener expecting
+    # a PROXY header is happy to accept — an HTTP check aimed at this data
+    # plane would get a 404, since it routes by Ingress rule and serves
+    # /healthz only on the admin port, which is not on this balancer.

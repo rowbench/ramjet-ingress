@@ -1,0 +1,28 @@
+# Oracle Cloud Infrastructure — a flexible-shape OCI load balancer.
+#
+#   helm install ramjet deploy/chart/ramjet-ingress \
+#     --namespace ramjet-ingress --create-namespace \
+#     -f deploy/provider/oracle/values.yaml
+#
+# The shape annotations are the ones ingress-nginx ships, and they are the ones
+# that matter: a shape is billed bandwidth, and `flexible` with a min and max
+# is the only shape that scales rather than being bought outright. The full
+# annotation set lives with the OCI cloud controller manager:
+#   https://github.com/oracle/oci-cloud-controller-manager/blob/master/docs/load-balancer-annotations.md
+#
+# PROXY protocol is not enabled here. OCI's load balancer can send it, but only
+# in TCP mode and with per-listener configuration that has no Service
+# annotation, so wiring it up is a console or Terraform job — turn on
+# proxyProtocol.enabled once you have.
+
+service:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+
+  annotations:
+    service.beta.kubernetes.io/oci-load-balancer-shape: "flexible"
+    service.beta.kubernetes.io/oci-load-balancer-shape-flex-min: "10"
+    service.beta.kubernetes.io/oci-load-balancer-shape-flex-max: "100"
+
+    # An internal load balancer instead of a public one:
+    # service.beta.kubernetes.io/oci-load-balancer-internal: "true"

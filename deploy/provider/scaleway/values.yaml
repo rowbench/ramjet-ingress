@@ -1,0 +1,29 @@
+# Scaleway — a managed load balancer speaking PROXY protocol v2.
+#
+#   helm install ramjet deploy/chart/ramjet-ingress \
+#     --namespace ramjet-ingress --create-namespace \
+#     -f deploy/provider/scaleway/values.yaml
+
+# The annotation makes the balancer send the header; this makes the listeners
+# require it. Both, or neither.
+proxyProtocol:
+  enabled: true
+
+service:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+
+  annotations:
+    service.beta.kubernetes.io/scw-loadbalancer-proxy-protocol-v2: "true"
+
+    # Scaleway has the same in-cluster problem DigitalOcean does — a pod that
+    # dials the balancer's external IP is short-circuited past it by kube-proxy
+    # and arrives with no PROXY header, at a listener that requires one. The
+    # cloud controller's answer is to report a hostname rather than an IP in
+    # the Service status, which stops the bypass rule from being installed:
+    # service.beta.kubernetes.io/scw-loadbalancer-use-hostname: "true"
+
+    # The health check stays at its default TCP check against the traffic port,
+    # for the same reason as the DigitalOcean preset: a completed handshake is
+    # all it asks, and an HTTP check would be answered by a data plane that
+    # routes by Ingress rule and has no /healthz on these ports.

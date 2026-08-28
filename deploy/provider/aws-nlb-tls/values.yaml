@@ -1,0 +1,68 @@
+# AWS — TLS terminated at the Network Load Balancer.
+#
+#   helm install ramjet deploy/chart/ramjet-ingress \
+#     --namespace ramjet-ingress --create-namespace \
+#     -f deploy/provider/aws-nlb-tls/values.yaml \
+#     --set-string service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-ssl-cert"=arn:aws:acm:...
+#
+# The certificate lives in ACM and the NLB does the handshake. What reaches the
+# pod is plaintext HTTP on :8080, for both listeners.
+#
+# Read this before choosing it — three consequences, none of them obvious from
+# the annotations:
+#
+#  1. There is no TLS listener in the pod at all (ports.https is 0 below, and
+#     the daemon is given --no-https). The `tls:` block on an Ingress is
+#     therefore inert: certificates come from ACM, not from Secrets, and a
+#     Secret named in an Ingress is simply never read.
+#
+#  2. The backend cannot tell that the request was HTTPS. An NLB forwards TCP;
+#     it adds no X-Forwarded-Proto, and the hop that knew the scheme does not
+#     say so. The proxy sets X-Forwarded-Proto from its own listener, so an
+#     application behind this sees `http` and will build `http://` absolute
+#     URLs and mark cookies non-secure unless it is told otherwise out of band.
+#
+#  3. Nothing redirects :80 to :443. ingress-nginx solves this with an nginx
+#     http-snippet that listens on a third port and returns 308; there is no
+#     equivalent here. Either drop the :80 listener from the balancer or accept
+#     that plaintext is served on it.
+#
+# Needs the AWS Load Balancer Controller.
+
+ports:
+  # No TLS listener. Opening one with no certificate to offer would fail every
+  # handshake on a port the balancer believes is healthy, which is worse than
+  # not listening.
+  https: 0
+
+service:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+
+  https:
+    # The Service port stays named `https` — that name is what the ssl-ports
+    # annotation below selects on — but it now forwards to the plaintext
+    # container port, which is where the balancer's decrypted output goes.
+    targetPort: http
+
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+    service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: preserve_client_ip.enabled=true,deregistration_delay.timeout_seconds=60
+
+    # Replace before installing. Left as the placeholder, the LBC rejects the
+    # Service and writes the reason as an event on it — which is the failure
+    # mode to want, since the alternative is a listener that silently serves
+    # the wrong certificate.
+    service.beta.kubernetes.io/aws-load-balancer-ssl-cert: "arn:aws:acm:us-west-2:XXXXXXXXXXXX:certificate/XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+
+    # Which Service *port names* get the TLS listener. `https` only, so :80
+    # stays a plain TCP listener.
+    service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "https"
+
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: "http"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: "/healthz"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "10254"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-success-codes: "200"

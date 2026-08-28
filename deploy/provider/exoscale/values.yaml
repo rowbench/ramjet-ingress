@@ -1,0 +1,38 @@
+# Exoscale — a managed load balancer in front of a DaemonSet.
+#
+#   helm install ramjet deploy/chart/ramjet-ingress \
+#     --namespace ramjet-ingress --create-namespace \
+#     -f deploy/provider/exoscale/values.yaml
+#
+# Annotations are the set ingress-nginx ships for Exoscale, checked against
+# their current manifest rather than remembered. The Exoscale cloud controller
+# manager documents the rest:
+#   https://github.com/exoscale/exoscale-cloud-controller-manager
+
+# A DaemonSet, as ingress-nginx has it, so the balancer finds an instance on
+# every node in the pool.
+#
+# The price, stated because it is easy to miss: status writeback has no leader
+# election, so every node runs its own writer and each patches every managed
+# Ingress on its own debounce. They agree on the value — same address, same
+# field manager — so nothing is corrupted, but the API traffic is nodes times
+# Ingresses. On a large pool, set controller.updateStatus=false.
+kind: DaemonSet
+
+service:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+
+  annotations:
+    service.beta.kubernetes.io/exoscale-loadbalancer-description: "ramjet-ingress load balancer"
+    service.beta.kubernetes.io/exoscale-loadbalancer-service-strategy: "source-hash"
+
+    # An HTTP check against "/" rather than the admin port, which is what
+    # ingress-nginx configures. Read it for what it is: proof that a listener
+    # answers, not that this replica has a route table. If nothing is serving
+    # "/" the check needs a path that is, or the strategy needs to be tcp.
+    service.beta.kubernetes.io/exoscale-loadbalancer-service-healthcheck-mode: "http"
+    service.beta.kubernetes.io/exoscale-loadbalancer-service-healthcheck-uri: "/"
+    service.beta.kubernetes.io/exoscale-loadbalancer-service-healthcheck-interval: "10s"
+    service.beta.kubernetes.io/exoscale-loadbalancer-service-healthcheck-timeout: "3s"
+    service.beta.kubernetes.io/exoscale-loadbalancer-service-healthcheck-retries: "1"

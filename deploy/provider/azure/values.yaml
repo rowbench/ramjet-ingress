@@ -1,0 +1,38 @@
+# Azure — the Standard Load Balancer AKS provisions for a LoadBalancer Service.
+#
+#   helm install ramjet deploy/chart/ramjet-ingress \
+#     --namespace ramjet-ingress --create-namespace \
+#     -f deploy/provider/azure/values.yaml
+#
+# PROXY protocol is not available: the Azure L4 balancer does not prepend the
+# header, so proxyProtocol.enabled stays false and the client address survives
+# by way of externalTrafficPolicy below.
+
+service:
+  type: LoadBalancer
+
+  # Azure's balancer is a passthrough, so the packet reaches the node with its
+  # original source address and only the extra node-to-node hop under Cluster
+  # policy would SNAT it away. Local removes that hop, at the price of the
+  # balancer needing to know which nodes hold a ready pod — which is exactly
+  # what the healthCheckNodePort below is for.
+  externalTrafficPolicy: Local
+
+  annotations:
+    # Worth understanding rather than copying, because what it does depends on
+    # the line above it.
+    #
+    # Under externalTrafficPolicy: Local, cloud-provider-azure already probes
+    # HTTP /healthz against the node health port kube-proxy serves — not
+    # against this data plane. So this annotation agrees with what would happen
+    # anyway, and is here to survive an edit rather than to change behaviour.
+    #
+    # Under Cluster it becomes live, and then it is wrong: the probe would go
+    # to a Service port, 80 or 443, and this data plane answers /healthz on
+    # neither — it routes by Ingress rule and would return 404, the probe would
+    # fail, and the balancer would drop every backend. If you switch to
+    # Cluster, delete this line and let the probe fall back to TCP.
+    service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path: /healthz
+
+    # An internal balancer instead of a public IP:
+    # service.beta.kubernetes.io/azure-load-balancer-internal: "true"

@@ -1,0 +1,71 @@
+# AWS — Network Load Balancer, plaintext from the client to the pod.
+#
+#   helm install ramjet deploy/chart/ramjet-ingress \
+#     --namespace ramjet-ingress --create-namespace \
+#     -f deploy/provider/aws/values.yaml
+#
+# These are the AWS Load Balancer Controller's annotations, not the in-tree
+# cloud provider's. ingress-nginx's committed manifest still uses the in-tree
+# spelling (`aws-load-balancer-type: nlb`), which their own page now calls
+# legacy; that controller is gone from Kubernetes mainline and AWS points new
+# clusters at the LBC. Install it before this, or the Service sits <pending>
+# forever with no event explaining why nothing is reconciling it:
+#   https://kubernetes-sigs.github.io/aws-load-balancer-controller/
+
+service:
+  type: LoadBalancer
+
+  # Kept for the same reason ingress-nginx keeps it, but read the note on
+  # preserve_client_ip below before assuming this is what saves the client
+  # address: with `ip` targets there is no second hop for it to be lost at, so
+  # this setting is doing almost nothing here. It becomes load-bearing the
+  # moment nlb-target-type is changed to `instance`.
+  externalTrafficPolicy: Local
+
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+
+    # Pod IPs as targets. The NLB reaches the pod directly, skipping the node's
+    # kube-proxy hop entirely — one less place for the source address to be
+    # rewritten, and one less place for a packet to be dropped.
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+
+    # Cross-zone is off by default on an NLB, and what that costs is a partial
+    # failure rather than an obvious one: each zonal address only reaches
+    # targets in its own zone, so a zone holding no ready pod blackholes its
+    # share of the traffic instead of failing over to a zone that has one.
+    service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+
+    # preserve_client_ip is the annotation that actually saves the client
+    # address here, and it is not the default: AWS ships IP-type target groups
+    # with TCP listeners with client IP preservation *disabled*, so without
+    # this line the pod sees the load balancer's private address and every
+    # X-Forwarded-For it writes is that address. Wrong quietly, which is the
+    # worst way to be wrong.
+    #
+    # Two things it costs. Targets must sit in the same VPC or a peered one.
+    # And hairpinning stops working — a pod behind this NLB that dials the NLB
+    # can be routed back to itself and the connection errors. Where either
+    # matters, use the aws-nlb-proxy preset, which reads the client address out
+    # of a PROXY header instead of off the socket.
+    #
+    # The deregistration delay is set just above terminationGracePeriodSeconds
+    # (45s) so a rolling pod finishes its own drain rather than having the
+    # default 300s hold connections open long after the process is gone.
+    service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: preserve_client_ip.enabled=true,deregistration_delay.timeout_seconds=60
+
+    # An HTTP check against the admin port. The default — a TCP check on the
+    # traffic port — proves only that something accepted a connection, which a
+    # controller with no compiled route table would also do. /healthz answers
+    # as soon as the process does, and readiness keeps an un-compiled replica
+    # out of the target group in the first place.
+    #
+    # This needs the backend security group to admit the NLB on 10254. The LBC
+    # writes that rule itself unless backend security group management has been
+    # turned off, in which case add it by hand or drop these four lines and
+    # take the TCP check.
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: "http"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: "/healthz"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "10254"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-success-codes: "200"

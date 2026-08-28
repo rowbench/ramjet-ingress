@@ -1,0 +1,38 @@
+# Google Cloud — the regional external passthrough L4 load balancer.
+#
+#   helm install ramjet deploy/chart/ramjet-ingress \
+#     --namespace ramjet-ingress --create-namespace \
+#     -f deploy/provider/gcp/values.yaml
+#
+# No annotations: a LoadBalancer Service on GKE gets a passthrough L4 balancer
+# from the built-in controller, and the defaults are the right ones. What the
+# preset is really doing is setting externalTrafficPolicy and telling you the
+# three things that bite here.
+#
+#  1. PROXY protocol is not available. GKE's default L4 balancer does not
+#     prepend the header, so proxyProtocol.enabled must stay false. The client
+#     address survives by way of externalTrafficPolicy: Local below instead —
+#     this is a passthrough balancer, so the packet arrives with its original
+#     source address and it is only the extra node hop that would lose it.
+#
+#  2. On a private cluster, the control plane must be allowed to reach the
+#     nodes on the admin port. The firewall rule GKE creates for a private
+#     cluster covers only the ports it knows about, so add 10254/tcp (this
+#     chart's admin port) to it, or the API server cannot reach anything that
+#     needs it and the failure looks like an unresponsive controller.
+#
+#  3. Container-native load balancing through standalone NEGs — the
+#     cloud.google.com/neg annotation and a backend service in front — is a
+#     different and better shape for L7, and out of scope here. It replaces
+#     this Service rather than decorating it.
+
+service:
+  type: LoadBalancer
+
+  # A passthrough balancer hands the node the client's own packet. Cluster
+  # policy then lets any node accept it and forward it to a pod on another
+  # node, and that forwarding hop is a SNAT — the client address becomes the
+  # first node's. Local keeps the address by making only nodes that already
+  # have a ready pod valid targets, which the healthCheckNodePort Kubernetes
+  # allocates alongside it is what tells the balancer.
+  externalTrafficPolicy: Local

@@ -1,0 +1,50 @@
+# AWS — Network Load Balancer speaking PROXY protocol v2.
+#
+#   helm install ramjet deploy/chart/ramjet-ingress \
+#     --namespace ramjet-ingress --create-namespace \
+#     -f deploy/provider/aws-nlb-proxy/values.yaml
+#
+# The aws preset gets the client address by asking the NLB not to rewrite it
+# (preserve_client_ip). This one gets it out of a header the NLB prepends
+# instead. Prefer this where preserve_client_ip's conditions do not hold —
+# targets outside the VPC or its peers, or a pod behind this NLB that needs to
+# dial the NLB, which hairpins and fails under client IP preservation.
+#
+# Needs the AWS Load Balancer Controller, as the aws preset does.
+
+# The two halves of one setting. The annotation below makes the balancer send
+# the header; this makes the listeners require it. Neither is useful alone: the
+# first without the second means the daemon reads "PROXY TCP4 ..." as a request
+# line, the second without the first means every connection is rejected.
+proxyProtocol:
+  enabled: true
+
+service:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+
+    # proxy_protocol_v2 rather than preserve_client_ip: the two answer the same
+    # question and there is no reason to pay for both.
+    service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: proxy_protocol_v2.enabled=true,deregistration_delay.timeout_seconds=60
+
+    # Deliberately no healthcheck-path/port here, unlike the aws preset, and
+    # this is the part worth not "fixing" later.
+    #
+    # AWS: "After you enable proxy protocol, the proxy protocol header is also
+    # included in health check connections from the load balancer... Targets
+    # can fail health checks if they can't parse the proxy protocol header."
+    # The admin listener is the one listener that never expects the header —
+    # it answers the kubelet, which does not speak PROXY protocol — so aiming
+    # the NLB's health check at :10254 would send it a header it would reject,
+    # every target would go unhealthy, and the outage would be total.
+    #
+    # So the default TCP check on the traffic port stands. It establishes a
+    # connection to a listener that does expect the header, and that is all a
+    # TCP check asks. Readiness still keeps a replica with no route table out
+    # of the target group.

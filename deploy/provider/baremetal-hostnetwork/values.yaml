@@ -1,0 +1,63 @@
+# Bare metal — a DaemonSet on the host network, serving :80 and :443 directly.
+#
+#   helm install ramjet deploy/chart/ramjet-ingress \
+#     --namespace ramjet-ingress --create-namespace \
+#     -f deploy/provider/baremetal-hostnetwork/values.yaml
+#
+# No NodePort translation and no balancer: the listeners bind the node's own
+# interfaces, so a client reaching any node on :80 reaches this directly and
+# the source address on the socket is the client's. That is the whole appeal,
+# and it is the only shape here that gets the real client address on bare metal
+# without something in front prepending a PROXY header.
+#
+# What it costs:
+#
+#  * The ports belong to the node. A second copy on the same node cannot bind
+#    them, which is why this is a DaemonSet — exactly one per node — and why
+#    anything else already holding :80 (another ingress controller, a host
+#    process) makes the pod crash-loop with a bind error rather than anything
+#    Kubernetes reports as a scheduling failure.
+#
+#  * The admin port is on the host too, on every node. It carries /metrics and
+#    the probes and is not a thing to leave reachable from outside; the node
+#    firewall is now the only thing keeping :10254 private.
+#
+#  * Ingress status has nothing to read. There is no LoadBalancer Service, so
+#    set controller.publishAddress to the address clients actually use — the
+#    VIP, the DNS name, whatever fronts the nodes.
+#
+# For a cluster that wants a real address rather than a set of node IPs, put
+# MetalLB in front instead and use the generic install with
+# service.type=LoadBalancer: MetalLB assigns an address out of an IPAddressPool
+# and the Service behaves like a cloud one, status writeback included.
+#   https://metallb.universe.tf/
+
+kind: DaemonSet
+hostNetwork: true
+
+ports:
+  http: 80
+  https: 443
+
+# Binding below 1024 as uid 65532 needs the capability back. The pod stays
+# non-root and still drops everything else — this adds one capability to a set
+# that is otherwise empty, rather than relaxing the security context.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+    add:
+      - NET_BIND_SERVICE
+
+service:
+  # A ClusterIP Service, kept only so in-cluster clients have a name to resolve
+  # and so the chart's own objects stay consistent. External traffic does not
+  # go through it — it arrives at the node ports directly — and a NodePort or
+  # LoadBalancer here would allocate ports nothing would ever use.
+  type: ClusterIP
+
+# Nothing to read an address from; see the note above.
+controller:
+  publishAddress: ""
