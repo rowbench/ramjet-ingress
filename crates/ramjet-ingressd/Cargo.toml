@@ -36,10 +36,13 @@ tracing.workspace = true
 # job is reacting to a cluster it does not control would react silently.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # The global allocator; the `ALLOCATOR` static in main.rs says what it is for
-# and what was measured. `background_threads` is the feature that matters:
-# without it memory comes back only while the process is still allocating, and
-# the case this exists for is a pod that has just lost its traffic.
-tikv-jemallocator = { version = "0.7.0", features = ["background_threads"] }
+# and what was measured. Default features are right: they include
+# `background_threads_runtime_support`, which is the capability. The
+# `background_threads` feature would be the wrong way to ask for it — it bakes
+# `background_thread:true` into jemalloc's compile-time configuration, and on a
+# platform that cannot honour it that is a warning on stderr at every startup.
+# `MALLOC_CONF` in main.rs turns it on where it works instead.
+tikv-jemallocator = "0.7.0"
 
 [dev-dependencies]
 rcgen.workspace = true

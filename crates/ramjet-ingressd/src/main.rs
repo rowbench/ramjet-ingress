@@ -73,10 +73,18 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// One second of decay rather than zero: purging is a `madvise` per run, and at
 /// zero the background thread does that work continuously under load for no
 /// benefit a second's delay does not also give.
+///
+/// `background_thread` is asked for on Linux only. jemalloc supports it on
+/// pthread platforms only and says so on stderr at every startup otherwise,
+/// which on a developer's macOS laptop is a warning about a setting that was
+/// never going to apply there. The decay settings still do.
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8] =
-    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+pub static MALLOC_CONF: &[u8] = if cfg!(target_os = "linux") {
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0"
+} else {
+    b"dirty_decay_ms:1000,muzzy_decay_ms:1000\0"
+};
 
 /// One worker thread, deliberately.
 ///
