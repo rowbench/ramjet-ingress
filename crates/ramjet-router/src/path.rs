@@ -31,6 +31,16 @@ impl PathType {
             PathType::ImplementationSpecific => 2,
         }
     }
+
+    /// The spelling the Ingress API uses, which is also what the admin API
+    /// reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PathType::Exact => "Exact",
+            PathType::Prefix => "Prefix",
+            PathType::ImplementationSpecific => "ImplementationSpecific",
+        }
+    }
 }
 
 /// Normalizes a `Prefix` path into the number of leading bytes that must match.
@@ -83,6 +93,10 @@ pub struct PathRule {
     /// keep the common Exact/Prefix rule small.
     regex: Option<Box<Regex>>,
     backend: BackendId,
+    /// Index into this table's [`RouteStats`](crate::RouteStats). Assigned
+    /// after the precedence sort, because that is the order the rules end up
+    /// in; counters survive a rebuild by identity, not by index.
+    stats_index: u32,
     /// Boxed because canaries are rare and this field would otherwise widen
     /// every rule in the table.
     canary: Option<Box<CanarySpec>>,
@@ -106,8 +120,14 @@ impl PathRule {
             path_type,
             regex,
             backend,
+            stats_index: 0,
             canary,
         }
+    }
+
+    /// Assigns the rule's place in the table's counter slab.
+    pub(crate) fn set_stats_index(&mut self, index: u32) {
+        self.stats_index = index;
     }
 
     /// Does this rule match `path`?
@@ -142,6 +162,12 @@ impl PathRule {
     /// The backend this rule routes to when no canary diverts the request.
     pub fn backend(&self) -> BackendId {
         self.backend
+    }
+
+    /// This rule's index into the table's
+    /// [`RouteStats`](crate::RouteStats).
+    pub fn stats_index(&self) -> u32 {
+        self.stats_index
     }
 
     /// The canary attached to this route, if any.

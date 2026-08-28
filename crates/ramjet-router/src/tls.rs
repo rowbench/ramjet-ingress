@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::host::{self, FxHashMap, Scan, MAX_HOST_LEN};
+use crate::table::RouteHost;
 
 /// An opaque reference to a certificate and its private key.
 ///
@@ -102,6 +103,30 @@ impl SniMap {
     /// The certificate served when no name matches.
     pub fn default_key(&self) -> Option<&Arc<CertifiedKeyHandle>> {
         self.default.as_ref()
+    }
+
+    /// Every name this map answers for, with the handle id it resolves to.
+    ///
+    /// The default certificate appears as [`RouteHost::CatchAll`] — it is not
+    /// attached to a name, and `*` is how the rest of this crate spells "no
+    /// host in particular".
+    ///
+    /// Order is unspecified. This is for reporting what the table contains, not
+    /// for resolution; nothing on the request path calls it.
+    pub fn entries(&self) -> impl Iterator<Item = (RouteHost<'_>, u64)> {
+        self.exact
+            .iter()
+            .map(|(name, key)| (RouteHost::Exact(name), key.id()))
+            .chain(
+                self.wildcard
+                    .iter()
+                    .map(|(parent, key)| (RouteHost::Wildcard(parent), key.id())),
+            )
+            .chain(
+                self.default
+                    .as_ref()
+                    .map(|key| (RouteHost::CatchAll, key.id())),
+            )
     }
 }
 

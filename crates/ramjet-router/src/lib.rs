@@ -75,8 +75,13 @@ pub use backend::{select_endpoint, Backend, BackendId, Endpoint, LbPolicy};
 pub use builder::{BuildError, CanaryRules, RouteTableBuilder};
 pub use canary::CanarySpec;
 pub use path::{PathRule, PathType};
-pub use stats::{BackendSlot, BackendStats, InflightGuard};
-pub use table::{HostMatch, MatchResult, RouteTable, SharedRouteTable, VirtualHost};
+pub use stats::{
+    BackendSlot, BackendStats, InflightGuard, RouteCounters, RouteIdentity, RouteSlot, RouteStats,
+    RouteTotals, ROUTE_STAT_SHARDS,
+};
+pub use table::{
+    HostMatch, MatchResult, RouteHost, RouteTable, SharedRouteTable, VirtualHost,
+};
 pub use tls::{CertifiedKeyHandle, SniMap};
 
 #[cfg(test)]

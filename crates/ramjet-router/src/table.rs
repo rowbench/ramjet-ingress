@@ -8,7 +8,7 @@ use crate::backend::{Backend, BackendId};
 use crate::canary::CanarySpec;
 use crate::host::{self, FxHashMap, Scan, MAX_HOST_LEN};
 use crate::path::PathRule;
-use crate::stats::BackendStats;
+use crate::stats::{BackendStats, RouteStats};
 use crate::tls::SniMap;
 
 /// The routes served for one host name.
@@ -41,6 +41,32 @@ impl VirtualHost {
     /// Every rule, in precedence order.
     pub fn routes(&self) -> &[PathRule] {
         &self.routes
+    }
+}
+
+/// How a [`VirtualHost`] is keyed, and how it is spelled back to a human.
+///
+/// The table stores a wildcard under its parent domain, so `*.example.com`
+/// lives at `example.com` — printing the key as it is stored would name a host
+/// the table does not actually serve. Anything reporting the table's contents
+/// (the admin API, the audit diff) goes through this instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteHost<'t> {
+    /// An exact name.
+    Exact(&'t str),
+    /// A `*.{parent}` wildcard, carrying its parent domain.
+    Wildcard(&'t str),
+    /// Rules from Ingress objects with no `host` field.
+    CatchAll,
+}
+
+impl std::fmt::Display for RouteHost<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RouteHost::Exact(name) => f.write_str(name),
+            RouteHost::Wildcard(parent) => write!(f, "*.{parent}"),
+            RouteHost::CatchAll => f.write_str("*"),
+        }
     }
 }
 
@@ -107,6 +133,7 @@ pub struct RouteTable {
     default_backend: Option<BackendId>,
     backends: Vec<Backend>,
     stats: Arc<BackendStats>,
+    routes: Arc<RouteStats>,
     tls: SniMap,
     generation: u64,
 }
@@ -120,6 +147,7 @@ impl RouteTable {
         default_backend: Option<BackendId>,
         backends: Vec<Backend>,
         stats: Arc<BackendStats>,
+        routes: Arc<RouteStats>,
         tls: SniMap,
         generation: u64,
     ) -> Self {
@@ -130,6 +158,7 @@ impl RouteTable {
             default_backend,
             backends,
             stats,
+            routes,
             tls,
             generation,
         }
@@ -241,6 +270,41 @@ impl RouteTable {
     /// shared with neighbouring generations; see [`BackendStats`].
     pub fn stats(&self) -> &Arc<BackendStats> {
         &self.stats
+    }
+
+    /// The per-route counters for this table.
+    ///
+    /// Indexed by [`PathRule::stats_index`], and shared with neighbouring
+    /// generations the same way [`BackendStats`] is; see [`RouteStats`].
+    pub fn route_stats(&self) -> &Arc<RouteStats> {
+        &self.routes
+    }
+
+    /// Every virtual host, with the name it should be reported under.
+    ///
+    /// Order is unspecified — the maps are hashed — so a caller that needs a
+    /// stable listing sorts what comes out. Used by the admin API and the audit
+    /// diff, never on the request path.
+    pub fn virtual_hosts(&self) -> impl Iterator<Item = (RouteHost<'_>, &VirtualHost)> {
+        self.hosts
+            .iter()
+            .map(|(name, vhost)| (RouteHost::Exact(name), vhost))
+            .chain(
+                self.wildcard_hosts
+                    .iter()
+                    .map(|(parent, vhost)| (RouteHost::Wildcard(parent), vhost)),
+            )
+            .chain(
+                self.catch_all
+                    .as_ref()
+                    .map(|vhost| (RouteHost::CatchAll, vhost)),
+            )
+    }
+
+    /// Every path rule in the table, with the host it is served under.
+    pub fn routes(&self) -> impl Iterator<Item = (RouteHost<'_>, &PathRule)> {
+        self.virtual_hosts()
+            .flat_map(|(host, vhost)| vhost.routes().iter().map(move |rule| (host, rule)))
     }
 
     /// Certificate lookup for TLS handshakes.

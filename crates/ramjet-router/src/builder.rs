@@ -18,7 +18,7 @@ use crate::backend::{Backend, BackendId, Endpoint, LbPolicy};
 use crate::canary::{CanarySpec, HeaderSpec};
 use crate::host::{FxHashMap, FxHashSet, MAX_HOST_LEN};
 use crate::path::{PathRule, PathType};
-use crate::stats::BackendStats;
+use crate::stats::{BackendStats, RouteIdentity, RouteStats};
 use crate::table::{RouteTable, VirtualHost};
 use crate::tls::{CertifiedKeyHandle, SniMap};
 
@@ -197,6 +197,7 @@ struct RouteDraft {
 pub struct RouteTableBuilder {
     generation: u64,
     previous: Option<Arc<BackendStats>>,
+    previous_routes: Option<Arc<RouteStats>>,
     backends: Vec<(Box<str>, LbPolicy, Vec<Endpoint>)>,
     backend_ids: FxHashMap<Box<str>, BackendId>,
     routes: Vec<RouteDraft>,
@@ -218,10 +219,14 @@ impl RouteTableBuilder {
     /// counters forward, so backends that survive the rebuild keep their
     /// in-flight accounting and round-robin position. This is the call that
     /// makes a configuration change invisible to traffic already in progress.
+    ///
+    /// The per-route counters travel the same way, keyed by route identity
+    /// rather than by position; see [`RouteStats`].
     pub fn from_previous(previous: &RouteTable) -> Self {
         RouteTableBuilder {
             generation: previous.generation().saturating_add(1),
             previous: Some(Arc::clone(previous.stats())),
+            previous_routes: Some(Arc::clone(previous.route_stats())),
             ..Self::default()
         }
     }
@@ -430,6 +435,7 @@ impl RouteTableBuilder {
         let RouteTableBuilder {
             generation,
             previous,
+            previous_routes,
             backends,
             backend_ids,
             routes,
@@ -499,11 +505,33 @@ impl RouteTableBuilder {
 
         // Bake the precedence order in, so matching never has to compare
         // candidates. A stable sort keeps regex rules in controller order.
+        //
+        // Counter indices are handed out here, after the sort, because this is
+        // the order the rules are stored in. Which number a route gets does not
+        // matter across generations — `RouteStats` carries counters forward by
+        // identity — so the arbitrary map order is not a determinism problem.
         let mut hosts = FxHashMap::default();
         let mut wildcard_hosts = FxHashMap::default();
         let mut catch_all = None;
+        let mut identities: Vec<RouteIdentity> = Vec::new();
         for (slot, mut rules) in buckets {
             rules.sort_by_key(PathRule::sort_key);
+            let host: Box<str> = match &slot {
+                HostSlot::Exact(h) => h.clone(),
+                HostSlot::Wildcard(h) => format!("*.{h}").into(),
+                HostSlot::CatchAll => "*".into(),
+            };
+            for rule in &mut rules {
+                rule.set_stats_index(identities.len() as u32);
+                identities.push(RouteIdentity {
+                    host: host.clone(),
+                    path: rule.path().into(),
+                    path_type: rule.path_type(),
+                    backend: built_backends
+                        .get(rule.backend().0 as usize)
+                        .map_or_else(|| Box::from(""), |b| Box::from(b.name())),
+                });
+            }
             match slot {
                 HostSlot::Exact(h) => {
                     hosts.insert(h, VirtualHost::new(rules));
@@ -514,6 +542,7 @@ impl RouteTableBuilder {
                 HostSlot::CatchAll => catch_all = Some(VirtualHost::new(rules)),
             }
         }
+        let route_stats = Arc::new(RouteStats::rebuild(&identities, previous_routes.as_deref()));
 
         let default_backend = match default_backend {
             Some(name) => Some(backend_ids.get(name.as_ref()).copied().ok_or_else(|| {
@@ -532,6 +561,7 @@ impl RouteTableBuilder {
             default_backend,
             built_backends,
             stats,
+            route_stats,
             SniMap::new(tls_exact, tls_wildcard, tls_default),
             generation,
         ))
