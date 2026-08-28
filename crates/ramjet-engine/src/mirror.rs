@@ -37,6 +37,7 @@ use http::request::Parts;
 use ramjet_proxy::mirror::{MIRRORED_BY, MIRRORED_BY_VALUE};
 use ramjet_proxy::upstream::endpoint_uri;
 use ramjet_proxy::{Metrics, Mirror};
+use ramjet_router::BackendProtocol;
 
 use crate::codec::{parse_request_head, Head, StartLine};
 
@@ -80,12 +81,17 @@ impl MirrorLane {
         self.metrics.record_mirror_failure();
     }
 
-    /// Queue one copy.
+    /// Queue one copy, to be sent with the protocol its own backend declares.
+    ///
+    /// The protocol is the *mirror* backend's, not the primary's. The worker
+    /// draining this queue lives on the tokio side and can dial either, so a
+    /// shadow Service annotated `h2c` is reached the way it asked to be even
+    /// though the engine that sampled the request speaks HTTP/1.1.
     ///
     /// Never blocks and never fails: a full queue is a counted drop, which is
     /// the whole point of the bound.
-    pub fn enqueue(&self, parts: Parts, body: Bytes) {
-        self.mirror.enqueue(&self.metrics, parts, body);
+    pub fn enqueue(&self, parts: Parts, body: Bytes, protocol: BackendProtocol) {
+        self.mirror.enqueue(&self.metrics, parts, body, protocol);
     }
 }
 

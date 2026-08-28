@@ -163,6 +163,16 @@ pub struct Config {
     pub backlog: i32,
     /// How often the helper thread ticks, which sets timeout resolution.
     pub tick: Duration,
+    /// How long in-flight requests get to finish after [`Shutdown::stop`].
+    ///
+    /// The same `--shutdown-grace` the hyper engine takes, meaning the same
+    /// thing: the listeners close at once, and what is already being served has
+    /// until this deadline to end. Past it the remaining connections are closed
+    /// and [`Engine::run`] reports `TimedOut`.
+    ///
+    /// The drain itself is [`worker`]'s state machine; that module's
+    /// documentation is where the per-connection rules live.
+    pub shutdown_grace: Duration,
 }
 
 /// Environment variable that makes [`probe`] report the reactor as
@@ -230,6 +240,12 @@ impl Default for Config {
             peer_metrics: None,
             backlog: 1024,
             tick: Duration::from_millis(100),
+            // Kubernetes' default `terminationGracePeriodSeconds` is 30, so a
+            // longer drain would be interrupted by SIGKILL — and the same
+            // number as the hyper engine's, because an operator changing
+            // `--engine` should not also be changing how long a rolling update
+            // waits.
+            shutdown_grace: Duration::from_secs(30),
         }
     }
 }
@@ -249,13 +265,20 @@ impl Config {
 ///
 /// Cloneable and safe to call from anywhere, including a signal handler's
 /// thread: it sets a flag that every core reads on its next tick.
+///
+/// Stopping starts a *drain* rather than a close. Every core shuts its
+/// listeners immediately, closes what it is not serving — idle keep-alive
+/// connections, pooled upstreams, tunnels — and keeps running until the
+/// requests it is already carrying have finished or
+/// [`Config::shutdown_grace`] has passed. The rules are
+/// [`worker`]'s, and its module documentation is where they are written down.
 #[derive(Debug, Clone)]
 pub struct Shutdown {
     flag: Arc<AtomicBool>,
 }
 
 impl Shutdown {
-    /// Ask every core to stop after finishing what it is doing.
+    /// Ask every core to stop accepting and drain what it is already serving.
     pub fn stop(&self) {
         self.flag.store(true, Ordering::Relaxed);
     }
@@ -404,7 +427,15 @@ impl Engine {
         Arc::clone(&self.metrics)
     }
 
-    /// Serve until [`Shutdown::stop`] is called. Blocks the calling thread.
+    /// Serve until [`Shutdown::stop`] is called, then drain. Blocks the
+    /// calling thread.
+    ///
+    /// Returns `TimedOut` where a core still had connections open when
+    /// [`Config::shutdown_grace`] expired. That is an outcome rather than a
+    /// crash — the caller decides whether it is worth complaining about — but
+    /// it is reported rather than swallowed, which is the same contract
+    /// `ramjet_proxy::Server::run` has and the reason `ramjet-ingressd` can
+    /// treat the two engines' shutdowns identically.
     pub fn run(self) -> io::Result<()> {
         let Engine {
             config,
@@ -597,6 +628,13 @@ fn accept_loop(listeners: Vec<(OwnedFd, Vec<OwnedFd>)>, shutdown: Arc<AtomicBool
             Ok(0) => continue,
             Ok(_) => {}
             Err(_) => return,
+        }
+        // Re-read after the wait, not only before it: a stop that arrived while
+        // this thread was parked has already shut the cores' ends of the
+        // channels, so accepting now would be taking a connection nothing in
+        // this process is going to serve.
+        if shutdown.load(Ordering::Relaxed) {
+            return;
         }
         for (index, (listener, channels)) in listeners.iter().enumerate() {
             if poll_fds[index].revents == 0 || channels.is_empty() {

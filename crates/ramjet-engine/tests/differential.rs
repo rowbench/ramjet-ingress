@@ -47,7 +47,7 @@ struct HyperProxy {
     routes: Arc<ramjet_router::SharedRouteTable>,
     handle: Option<ramjet_proxy::ShutdownHandle>,
     runtime: Option<tokio::runtime::Runtime>,
-    task: Option<std::thread::JoinHandle<()>>,
+    task: Option<std::thread::JoinHandle<std::io::Result<()>>>,
 }
 
 impl Drop for HyperProxy {
@@ -64,6 +64,13 @@ impl Drop for HyperProxy {
 
 impl HyperProxy {
     fn start(table: RouteTable) -> HyperProxy {
+        HyperProxy::start_with(table, Duration::from_secs(30))
+    }
+
+    /// The same engine with an explicit drain deadline, for the shutdown
+    /// comparisons — where the deadline is the thing being compared and
+    /// waiting out the default one would make the test thirty seconds long.
+    fn start_with(table: RouteTable, grace: Duration) -> HyperProxy {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -84,6 +91,7 @@ impl HyperProxy {
             // One serving runtime, matching the uring side's one core, so the
             // counter comparison is not comparing two shard counts.
             worker_threads: Some(1),
+            shutdown_grace: grace,
             ..ramjet_proxy::ProxyConfig::default()
         };
 
@@ -103,11 +111,12 @@ impl HyperProxy {
         let admin = server.admin_addr().expect("an admin listener");
         let (handle, shutdown) = ramjet_proxy::Shutdown::channel();
 
+        // The outcome is carried out of the thread rather than dropped: how a
+        // drain *ended* is one of the things the two engines have to agree
+        // about, and it is only readable here.
         let task = {
             let runtime_handle = runtime.handle().clone();
-            std::thread::spawn(move || {
-                let _ = runtime_handle.block_on(server.run(shutdown));
-            })
+            std::thread::spawn(move || runtime_handle.block_on(server.run(shutdown)))
         };
 
         let proxy = HyperProxy {
@@ -136,6 +145,26 @@ impl HyperProxy {
     fn admin(&self, path: &str) -> Response {
         let mut client = Client::connect(self.admin);
         client.send(format!("GET {path} HTTP/1.1\r\nHost: admin\r\n\r\n").as_bytes())
+    }
+
+    /// Ask this engine to drain, without waiting for it.
+    ///
+    /// The same split the uring side's `Proxy` has, and for the same reason: a
+    /// drain is only observable from between the signal and the end of it.
+    fn signal_shutdown(&self) {
+        if let Some(handle) = &self.handle {
+            handle.shutdown();
+        }
+    }
+
+    /// Wait for the drain, and report how it ended.
+    fn wait(&mut self) -> std::io::Result<()> {
+        match self.task.take() {
+            Some(task) => task
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("the server thread panicked"))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -636,4 +665,116 @@ fn a_default_backend_is_attributed_to_no_route_on_either() {
             "{engine}: a default-backend request was attributed to a route"
         );
     }
+}
+
+// ------------------------------------------------------------------ shutdown
+
+/// Both engines over their own slow upstream, with an explicit drain deadline.
+///
+/// Not built through `pair`, which starts echo upstreams: what a drain does is
+/// only visible while something is unfinished, so these tests need an upstream
+/// that is deliberately still thinking when the signal arrives.
+fn drain_pair(behaviour: Behaviour, grace: Duration) -> (HyperProxy, Proxy, Upstream, Upstream) {
+    let hyper_upstream = spawn(behaviour.clone());
+    let uring_upstream = spawn(behaviour);
+    let hyper = HyperProxy::start_with(
+        table_for("app.example.com", &[hyper_upstream.addr]),
+        grace,
+    );
+    let uring = Proxy::with_config(
+        table_for("app.example.com", &[uring_upstream.addr]),
+        |config| {
+            config.workers = Some(1);
+            config.shutdown_grace = grace;
+        },
+    );
+    (hyper, uring, hyper_upstream, uring_upstream)
+}
+
+#[test]
+fn an_in_flight_request_finishes_the_same_way_on_both() {
+    // The promise is that a client cannot tell which engine served it, and the
+    // last request before a rolling update is exactly where an engine that
+    // drains and one that does not stop being interchangeable.
+    let (mut hyper, mut uring, _hyper_upstream, _uring_upstream) = drain_pair(
+        Behaviour::Slow {
+            delay: Duration::from_millis(400),
+            body: b"slow".to_vec(),
+        },
+        Duration::from_secs(30),
+    );
+    let (hyper_addr, uring_addr) = (hyper.addr, uring.addr);
+
+    let hyper_request = std::thread::spawn(move || get(hyper_addr, "/", "app.example.com"));
+    let uring_request = std::thread::spawn(move || get(uring_addr, "/", "app.example.com"));
+    std::thread::sleep(Duration::from_millis(100));
+
+    hyper.signal_shutdown();
+    uring.signal_shutdown();
+
+    let hyper_reply = hyper_request.join().expect("the hyper request thread");
+    let uring_reply = uring_request.join().expect("the uring request thread");
+
+    assert_eq!(
+        (hyper_reply.status, uring_reply.status),
+        (200, 200),
+        "one of the engines dropped a request that was already in flight"
+    );
+    assert_eq!(hyper_reply.text(), uring_reply.text());
+    assert_eq!(
+        hyper_reply.closing, uring_reply.closing,
+        "the two engines disagree about telling a client the connection is \
+         ending: hyper says {}, uring says {}",
+        hyper_reply.closing, uring_reply.closing
+    );
+    assert!(
+        uring_reply.closing,
+        "a drained connection cannot be offered back to the client for reuse"
+    );
+
+    assert!(hyper.wait().is_ok(), "the hyper engine did not drain cleanly");
+    assert!(uring.wait().is_ok(), "the uring engine did not drain cleanly");
+
+    // And both listeners are shut, which is what makes a load balancer look
+    // elsewhere instead of queueing behind a pod that is going away.
+    for (engine, addr) in [("hyper", hyper_addr), ("uring", uring_addr)] {
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "{engine}: the listener is still open after the drain"
+        );
+    }
+}
+
+#[test]
+fn a_drain_that_runs_out_of_time_is_reported_the_same_way_on_both() {
+    // A deadline that is not reported is not a deadline. Both engines have to
+    // give up at the same point and say the same thing about it, because
+    // `ramjet-ingressd` reads exactly one error kind to decide whether a
+    // shutdown that took too long is a crash or a Tuesday.
+    let (mut hyper, mut uring, _hyper_upstream, _uring_upstream) =
+        drain_pair(Behaviour::BlackHole, Duration::from_millis(300));
+
+    // A request each, dispatched to an upstream that will never answer. Raw
+    // sockets rather than the reading client: what these connections are for is
+    // to be unfinished when the deadline arrives.
+    let mut sockets = Vec::new();
+    for addr in [hyper.addr, uring.addr] {
+        let mut socket = std::net::TcpStream::connect(addr).expect("a connection");
+        std::io::Write::write_all(
+            &mut socket,
+            b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n",
+        )
+        .expect("the request was sent");
+        sockets.push(socket);
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    hyper.signal_shutdown();
+    uring.signal_shutdown();
+
+    assert_eq!(
+        hyper.wait().map_err(|error| error.kind()),
+        uring.wait().map_err(|error| error.kind()),
+        "the two engines report an expired grace period differently"
+    );
 }

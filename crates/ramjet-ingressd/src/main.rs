@@ -405,6 +405,10 @@ async fn uring_mode(
         mirror: Some(mirror),
         peer_metrics: Some(Arc::clone(&peer_metrics)),
         dispatch: hyper_lane.as_ref().map(|lane| lane.dispatch.clone()),
+        // The same deadline both lanes drain under. One signal reaches both,
+        // and two different grace periods would mean the process outlives the
+        // number an operator set on whichever lane got the longer one.
+        shutdown_grace: args.shutdown_grace,
         ..ramjet_engine::engine::Config::default()
     };
 

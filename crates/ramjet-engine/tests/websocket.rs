@@ -298,10 +298,13 @@ fn upgrades_work_over_tls_too() {
 
 #[test]
 fn a_tunnel_does_not_hold_shutdown_open() {
-    // The engine stops on a flag every core reads on its next tick, and
-    // `teardown` closes whatever is still open. A tunnel is not excluded from a
-    // drain here because there is no drain to exclude it from — which is the
-    // same end state the hyper engine reaches by excluding it explicitly.
+    // A tunnel is excluded from the drain, explicitly, and closed when it
+    // starts: after a 101 there is no request boundary left to finish at, and
+    // waiting for one would stall every rolling update until the deadline. The
+    // grace period here is the default thirty seconds, so a tunnel that was
+    // counted would show up as this test taking that long — which is what the
+    // clock below is for. `lifecycle.rs` asserts the same thing through an
+    // explicit signal; this one comes through the drop path.
     let upstream = spawn(Behaviour::UpgradeEcho);
     let proxy = Proxy::start(table_for("app.example.com", &[upstream.addr]));
 

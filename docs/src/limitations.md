@@ -77,17 +77,11 @@ the dependency the layering split exists to avoid.
 
 `--default-tls-secret` is the supported way to serve a fallback certificate.
 
-## The `uring` engine does not drain, and does not speak HTTP/2 itself
+## The `uring` engine does not speak HTTP/2 itself
 
 `--engine uring` reached parity with the hyper engine on TLS, WebSocket
-upgrades, the PROXY protocol, mirroring, per-route counters and Kubernetes mode.
-What is left is two things, and they are different in kind.
-
-**It does not drain.** The hyper engine stops accepting on `SIGTERM` and then
-waits up to `--shutdown-grace` for in-flight requests to finish. The uring
-engine stops accepting and closes. On a rolling update that is the difference
-between a request completing and a client retrying, and it is the largest
-remaining gap between the two engines.
+upgrades, the PROXY protocol, mirroring, per-route counters, Kubernetes mode and
+graceful drain. What is left is one thing.
 
 **It speaks HTTP/1.1.** HTTP/2 is served by handing those connections to a hyper
 engine in the same process — the ClientHello is read before a configuration is

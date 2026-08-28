@@ -615,8 +615,8 @@ is io_uring's, so the platform without io_uring measures none of it.
 - Not that io_uring beats epoll in general. This is one proxy workload, one
   kernel, one VM.
 - Not that the uring engine is ready to deploy. **At the time of this
-  measurement** it had no TLS, no HTTP/2, no upgrades and no Kubernetes mode.
-  That list is now down to graceful drain, and HTTP/2 by dispatch.
+  measurement** it had no TLS, no HTTP/2, no upgrades, no Kubernetes mode and no
+  graceful drain. That list is now down to HTTP/2, which is served by dispatch.
 - Not that the hyper engine is badly written. Profiling took it to the syscall
   floor, and this is what is underneath that floor. The difference is the I/O
   model, which is what was being tested.

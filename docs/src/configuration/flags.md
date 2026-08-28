@@ -228,7 +228,10 @@ Mirroring itself is annotation-driven — see
 
 `SIGTERM` stops the accept loop and closes the listeners immediately, so the
 load balancer looks elsewhere, and then gives in-flight requests the grace
-period to finish.
+period to finish. Both engines do this, and with HTTP/2 dispatch on both lanes
+are signalled at once and drain inside the one deadline — see
+[Engines](../operations/engines.md#what-each-one-does) for what counts as
+in-flight and why tunnels do not.
 
 The chart's `terminationGracePeriodSeconds` is `45`, deliberately longer than
 this default, so Kubernetes does not `SIGKILL` a pod mid-drain.

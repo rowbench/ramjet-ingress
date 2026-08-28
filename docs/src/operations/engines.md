@@ -43,15 +43,33 @@ identical traffic and compares the answers.
 | Rollback pins and generation history | yes | yes |
 | `/metrics` exposition | same bytes | same bytes |
 | `/admin/generations`, `/admin/routes` | yes | yes, served by a tokio listener |
-| Graceful drain on `SIGTERM` | up to `--shutdown-grace` | connections end with the process |
+| Graceful drain on `SIGTERM` | up to `--shutdown-grace` | up to `--shutdown-grace` |
 
 Two rows are worth reading twice.
 
-**Graceful drain.** The hyper engine stops accepting, then waits up to
-`--shutdown-grace` for in-flight requests to finish. The uring engine stops
-accepting and closes. On a rolling update that is the difference between a
-request completing and a client retrying, and it is the largest remaining gap
-between the two.
+**Graceful drain.** Both engines stop accepting on `SIGTERM` and then wait up to
+`--shutdown-grace` — 30 seconds by default — for what they are already serving
+to finish. The rules are the same rules on both, because they are the ones a
+client can observe:
+
+- connections that are idle between requests are closed at once, and the
+  response to a request that *is* in flight carries `Connection: close`;
+- a request counts as in flight until its exchange ends, in either direction: a
+  body still arriving and a response still streaming are both unfinished;
+- upgraded tunnels — WebSockets — are **not** drained. Once a connection has
+  been upgraded there is no request boundary left to finish at and no bound on
+  how long it will live, so waiting for one would stall every rolling update
+  until the deadline and then kill it anyway;
+- a drain that reaches the deadline with connections still open closes them,
+  logs `shutdown grace period expired`, and still exits zero. A rolling update
+  is not a crash.
+
+With `--engine uring` and HTTP/2 dispatch on, both lanes are signalled at the
+same instant and drain inside one deadline rather than one after the other.
+
+`crates/ramjet-engine/tests/lifecycle.rs` asserts each of those on the reactor,
+and two cases in the differential test assert that the two engines answer an
+in-flight request — and report an expired deadline — identically.
 
 **HTTP/3.** It stays on the hyper engine's QUIC listener. `--http3` with
 `--engine uring` is refused at startup rather than ignored.
@@ -203,9 +221,9 @@ counter sets driven through the same events, and the two strings asserted
 
 ## Choosing one
 
-Run `hyper` unless you have a reason not to. It is the default, it is what the
-numbers in [Performance](../performance.md) were measured on for every release
-before this one, and it drains gracefully.
+Run `hyper` unless you have a reason not to. It is the default, and it is what
+the numbers in [Performance](../performance.md) were measured on for every
+release before this one.
 
 Run `uring` when the replica is CPU-bound on a Linux host that permits
 `io_uring`, and the traffic is HTTP/1.1 or HTTP/2 over TLS. That is where the

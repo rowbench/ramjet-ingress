@@ -367,6 +367,8 @@ pub async fn run_uring(args: &Args) -> Result<ExitCode, Box<dyn std::error::Erro
             mirror: Some(mirror),
             peer_metrics: Some(Arc::clone(&peer_metrics)),
             dispatch: hyper_lane.as_ref().map(|lane| lane.dispatch.clone()),
+            // The same deadline both lanes drain under; see `uring_mode`.
+            shutdown_grace: args.shutdown_grace,
             ..ramjet_engine::engine::Config::default()
         },
         Arc::clone(&routes),
@@ -469,11 +471,21 @@ pub async fn run_uring(args: &Args) -> Result<ExitCode, Box<dyn std::error::Erro
 
     // The reactor is a blocking loop and is `!Send` per core, so it runs off
     // the async runtime entirely; this task only relays the stop.
+    //
+    // Both lanes are told at the same instant, and that is the whole point of
+    // relaying it here rather than after `engine.run()` returns. Each drains
+    // for up to `--shutdown-grace`; started one after the other they would add
+    // up to twice it, and the second one would be running well past the
+    // `terminationGracePeriodSeconds` the number was chosen to fit inside.
     let stop = engine.shutdown();
+    let hyper_stop = hyper_lane.as_ref().map(|lane| lane.shutdown.clone());
     let mut engine_shutdown = shutdown;
     tokio::spawn(async move {
         engine_shutdown.recv().await;
         stop.stop();
+        if let Some(handle) = hyper_stop {
+            handle.shutdown();
+        }
     });
     let result = tokio::task::spawn_blocking(move || engine.run())
         .await
@@ -488,7 +500,9 @@ pub async fn run_uring(args: &Args) -> Result<ExitCode, Box<dyn std::error::Erro
     if let Some(lane) = hyper_lane {
         // Drained rather than aborted: it may be holding HTTP/2 connections
         // this process accepted, and they get the same grace period every other
-        // connection does.
+        // connection does. The signal above has normally already started that
+        // drain, and this waits for it; the call is repeated for the path where
+        // the reactor stopped for a reason of its own rather than a stop.
         lane.shutdown.shutdown();
         let _ = lane.task.await;
     }

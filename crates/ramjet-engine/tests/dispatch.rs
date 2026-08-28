@@ -39,14 +39,14 @@ struct Dispatched {
     uring: Proxy,
     /// Kept alive: the hyper lane's runtime and the task running its server.
     _runtime: tokio::runtime::Runtime,
-    _hyper: ramjet_proxy::ShutdownHandle,
+    hyper: ramjet_proxy::ShutdownHandle,
     hyper_task: Option<std::thread::JoinHandle<()>>,
     hyper_metrics: Arc<ramjet_proxy::Metrics>,
 }
 
 impl Drop for Dispatched {
     fn drop(&mut self) {
-        self._hyper.shutdown();
+        self.hyper.shutdown();
         if let Some(task) = self.hyper_task.take() {
             let _ = task.join();
         }
@@ -65,6 +65,22 @@ impl Dispatched {
 
     fn metrics(&self) -> String {
         self.uring.admin("/metrics").text()
+    }
+
+    /// Stop both lanes on one signal and wait for both to drain.
+    ///
+    /// The order is `ramjet-ingressd`'s: every lane is told at the same instant
+    /// and waited for afterwards. Telling them one at a time would add their
+    /// grace periods together, and the second one would still be draining long
+    /// after the deadline an operator set.
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        self.uring.signal_shutdown();
+        self.hyper.shutdown();
+        let drained = self.uring.wait();
+        if let Some(task) = self.hyper_task.take() {
+            let _ = task.join();
+        }
+        drained
     }
 }
 
@@ -128,7 +144,7 @@ fn dispatched(table: RouteTable, certs: Arc<ramjet_proxy::CertStore>) -> Dispatc
     Dispatched {
         uring,
         _runtime: runtime,
-        _hyper: handle,
+        hyper: handle,
         hyper_task: Some(hyper_task),
         hyper_metrics,
     }
@@ -371,6 +387,60 @@ fn the_two_engines_share_one_certificate_store() {
         h2.peer_certificates(),
         "the two lanes served different certificates for the same name"
     );
+}
+
+#[test]
+fn one_signal_drains_both_lanes() {
+    // With dispatch on, a request in flight and a connection that was handed
+    // away are being held by two different engines, on two different threading
+    // models, and the process has one signal and one deadline for both. What is
+    // asserted is that the signal reaches both — the HTTP/1.1 request finishes
+    // on the reactor, the handed-over h2 connection is let go by hyper, and the
+    // listeners the uring lane owns for both of them are shut.
+    let upstream = spawn(Behaviour::Slow {
+        delay: Duration::from_millis(400),
+        body: b"slow".to_vec(),
+    });
+    let (table, certs) = tls_table("app.example.com", &[upstream.addr], &["app.example.com"]);
+    let mut proxy = dispatched(table, certs);
+    let http = proxy.http();
+    let tls = proxy.tls();
+
+    // One connection on each lane: an HTTP/1.1 request the reactor is serving,
+    // and an h2 connection hyper took over.
+    let mut h2 = tls_connect(tls, "app.example.com", h2_client_config());
+    h2.handshake();
+    assert_eq!(wait_for_counter(&proxy, "ramjet_dispatch_hyper_total", 1), 1);
+    assert_eq!(
+        proxy.hyper_metrics.active_connections(),
+        1,
+        "the hyper lane should be holding the handed-over connection"
+    );
+
+    let request = std::thread::spawn(move || get(http, "/", "app.example.com"));
+    std::thread::sleep(Duration::from_millis(100));
+
+    let started = Instant::now();
+    proxy.shutdown().expect("both lanes drained cleanly");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the two lanes drained in {:?}, which is one after the other rather \
+         than inside one grace period",
+        started.elapsed()
+    );
+
+    let reply = request.join().expect("the request thread did not panic");
+    assert_eq!(
+        reply.status, 200,
+        "the reactor dropped a request it was serving when the other lane was \
+         told to stop"
+    );
+    assert_eq!(reply.text(), "slow");
+
+    // Both listeners belong to the uring lane, and both are shut — including
+    // the TLS one every handoff arrives through.
+    assert!(TcpStream::connect(http).is_err(), "the plaintext listener is still open");
+    assert!(TcpStream::connect(tls).is_err(), "the TLS listener is still open");
 }
 
 #[test]

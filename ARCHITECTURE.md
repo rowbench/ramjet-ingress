@@ -224,9 +224,12 @@ a Secret that will not parse.
 
 `SIGTERM` stops the accept loop, closes the listeners so the load balancer looks
 elsewhere immediately, and then gives in-flight requests up to 30 seconds to
-finish. Afterwards the controller task is aborted, which stops all five watches
-at once — they live inside that one task precisely so there is a single place to
-cancel.
+finish. That is both engines, and with HTTP/2 dispatch on it is both of them
+inside one deadline rather than one after the other; [Draining, on a
+reactor](#draining-on-a-reactor) has how the uring lane does it without a task
+to await. Afterwards the controller task is aborted, which stops all five
+watches at once — they live inside that one task precisely so there is a single
+place to cancel.
 
 The reverse direction is wired too: if the control plane stops on its own, the
 daemon drains and exits non-zero rather than continuing to serve a table that
@@ -1062,6 +1065,44 @@ Two engines serving one port means one `/metrics` has to describe both, so the
 exposition sums the tokio side's counters into the reactor's. Without that,
 dispatch mode reports the HTTP/1.1 half of its traffic and silently omits the
 rest.
+
+### Draining, on a reactor
+
+Both engines drain on `SIGTERM`: stop accepting, finish what is in flight,
+give up at `--shutdown-grace`. The rules a client can observe are the same on
+both — an idle keep-alive connection is closed at once, the in-flight response
+carries `Connection: close`, a request counts as in flight until its exchange
+ends in *either* direction, and an upgraded tunnel is closed rather than waited
+for. What differs is that the reactor has no task to await and no future to
+cancel, so the drain had to be built out of what a completion loop has.
+
+It is a flag, a count and a deadline. The core reads the stop flag once, at the
+top of its loop, and that turn closes the listeners, closes the idle pooled
+upstreams, and classifies every connection exactly once: closed now, or kept and
+counted. Counted connections then end through the path they always would have —
+`client_keep_alive` is set false, so the response head says `close` and
+`finish_response` puts the connection into `Closing` instead of back to `Head`
+— and the count comes down in `close()`, the single function through which a
+descriptor ever leaves a core. Nothing polls, nothing scans, and there is no
+second state machine beside the one already there.
+
+```
+  Open ── stop flag ──▶ Draining ── count reaches 0 ──▶ teardown, Ok
+                            │
+                            └───── grace expires ─────▶ teardown, TimedOut
+```
+
+The deadline is checked on the helper's tick, because the tick is the only
+thing this reactor has that fires without a peer doing something. `TimedOut`
+comes back with the same error kind and the same message
+`ramjet_proxy::Server::run` uses, which is what lets `ramjet-ingressd` treat
+both engines' shutdowns with one function: report it, exit zero, because a
+rolling update that ran long is not a crash.
+
+With dispatch on, the two lanes are told at the same instant rather than one
+after the other. Started in sequence their grace periods would add up, and the
+second would still be draining well past the `terminationGracePeriodSeconds`
+the number was chosen to fit inside.
 
 ### Falling back
 
