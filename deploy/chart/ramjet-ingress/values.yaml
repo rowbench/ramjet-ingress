@@ -183,6 +183,24 @@ http3:
 # serve on an engine it did not pick.
 engine: hyper
 
+# How the uring engine serves HTTP/2, which it does not speak itself.
+#
+# On, and by dispatch: the uring engine owns the listener, reads the ClientHello
+# — which rustls yields before a configuration is chosen — and hands the socket
+# and the bytes it has read to a hyper engine in the same process when the
+# client offered h2. The client sees one connection that negotiated HTTP/2;
+# there is no reset and no second handshake. On the plaintext port the HTTP/2
+# prior-knowledge preface is handed over the same way.
+#
+# Off means the TLS listener advertises `http/1.1` alone, and an HTTP/2 client
+# negotiates HTTP/1.1 with it — which works, and is what every browser falls
+# back to, but costs multiplexing. It also means the second engine's threads and
+# upstream pools are never started, which is the reason to turn it off.
+#
+# Ignored where engine is `hyper`, which speaks HTTP/2 itself.
+h2Dispatch:
+  enabled: true
+
 ports:
   http: 8080
   # The TLS listener, or 0 to have none at all. Zero is what you want when

@@ -188,6 +188,15 @@ pub struct Args {
     /// Experimental. It adds a UDP socket, one serving thread, and an
     /// `alt-svc` header on TLS responses; with it off none of those exist.
     pub http3: bool,
+    /// Serve HTTP/2 on `--engine uring` by handing those connections to the
+    /// hyper engine, rather than not offering HTTP/2 at all.
+    ///
+    /// On by default where the uring engine runs, and ignored otherwise. Off
+    /// means the TLS listener advertises `http/1.1` alone and an HTTP/2 client
+    /// negotiates HTTP/1.1 with it — which works, and is what every browser
+    /// falls back to, but costs multiplexing. Turning it off also means the
+    /// second engine's threads and upstream pools are never started.
+    pub h2_dispatch: bool,
 }
 
 impl Default for Args {
@@ -229,6 +238,9 @@ impl Default for Args {
             // Experimental, and a UDP port nobody asked for is a UDP port
             // nobody reviewed.
             http3: false,
+            // On, because the alternative is an engine that quietly does not
+            // speak HTTP/2 to clients that asked for it.
+            h2_dispatch: true,
         }
     }
 }
@@ -364,6 +376,9 @@ UPSTREAMS:
 SERVING:
     --engine <NAME>           Data plane: hyper, uring or uring-strict
                                                              [default: hyper]
+    --no-h2-dispatch          On --engine uring, stop offering HTTP/2 rather
+                              than handing those connections to the hyper
+                              engine
     --worker-threads <N>      Serving runtimes, one per thread
                                               [default: one per available core]
     --max-buf-size <BYTES>    Ceiling on one client connection's HTTP/1 read and
@@ -570,6 +585,7 @@ impl Args {
                     args.https_explicit = true;
                 }
                 "--admin" => args.admin = Some(address(&name, &value()?)?),
+                "--no-h2-dispatch" => args.h2_dispatch = false,
                 "--no-http" => args.http = None,
                 "--no-https" => {
                     args.https = None;

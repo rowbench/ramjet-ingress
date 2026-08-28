@@ -146,17 +146,29 @@ fn an_untouched_pair_renders_the_same_zeros() {
 }
 
 #[test]
-fn the_exposition_says_nothing_about_which_engine_produced_it() {
-    // Deliberate. A series naming the engine would be the easiest way to tell
-    // them apart, and it would also be the thing that makes every dashboard
-    // engine-specific — and it would break the equality above, which is worth
-    // more. Which engine is serving is in the startup log, where an operator
-    // reads it once, rather than in a series they would have to alert on.
-    let text = EngineMetrics::new(1).render_prometheus(1, false);
-    for name in ["uring", "hyper", "engine", "reactor"] {
+fn which_engine_rendered_it_is_not_readable_from_the_series_set() {
+    // Two series *name* the engines — `ramjet_dispatch_uring_total` and
+    // `ramjet_dispatch_hyper_total`, which describe the split between them and
+    // could not be named anything else. What must not happen is a series
+    // appearing on one engine and not the other, because that is what makes a
+    // dashboard built against one wrong about the other.
+    let names = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+            .collect()
+    };
+
+    let from_engine = EngineMetrics::new(1).render_prometheus(1, false);
+    let from_hyper = Metrics::new().render_prometheus(1, false);
+    assert_eq!(names(&from_engine), names(&from_hyper));
+
+    // And nothing in the *help* text gives it away either, which is where an
+    // engine-specific explanation would most easily creep in.
+    for text in [&from_engine, &from_hyper] {
         assert!(
-            !text.contains(name),
-            "the exposition names {name:?}, which makes it engine-specific:\n{text}"
+            !text.contains("io_uring") && !text.contains("reactor") && !text.contains("tokio"),
+            "the exposition explains itself in terms of one engine:\n{text}"
         );
     }
 }

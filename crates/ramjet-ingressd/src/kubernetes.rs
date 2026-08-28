@@ -314,25 +314,38 @@ pub async fn run_uring(args: &Args) -> Result<ExitCode, Box<dyn std::error::Erro
     // on the hyper lane: the certificates are arriving over a watch that has
     // not finished its first list, and refusing to bind 443 would mean a
     // restart could never recover a cluster's HTTPS.
+    // The second engine, if there is anything to dispatch to it. Started before
+    // the TLS configuration is chosen, because which ALPN set to advertise
+    // depends on whether an HTTP/2 client has somewhere to go: offering `h2`
+    // with nothing behind it would be a promise this process cannot keep.
+    let hyper_lane = crate::start_hyper_lane(args, &routes, &certs)?;
     let tls = match args.https {
         Some(_) => {
             let resolver = Arc::new(ramjet_proxy::SniResolver::new(
                 Arc::clone(&routes),
                 Arc::clone(&certs),
             ));
-            Some(Arc::new(ramjet_proxy::tls::h1_server_config(resolver)?))
+            Some(Arc::new(match &hyper_lane {
+                Some(_) => ramjet_proxy::tls::server_config(resolver)?,
+                None => ramjet_proxy::tls::h1_server_config(resolver)?,
+            }))
         }
         None => None,
     };
 
-    let mirror_metrics = Arc::new(ramjet_proxy::Metrics::new());
+    // One set of counters for the whole tokio side; the engine sums them into
+    // its own at scrape time. See `Config::peer_metrics`.
+    let peer_metrics = hyper_lane.as_ref().map_or_else(
+        || Arc::new(ramjet_proxy::Metrics::new()),
+        |lane| Arc::clone(&lane.metrics),
+    );
     let mirror = ramjet_engine::mirror::MirrorLane::new(
         ramjet_proxy::Mirror::spawn(
             ramjet_proxy::Upstream::new(&crate::upstream_config(args)),
-            Arc::clone(&mirror_metrics),
+            Arc::clone(&peer_metrics),
         )
         .with_max_body(args.mirror_max_body),
-        mirror_metrics,
+        Arc::clone(&peer_metrics),
     );
 
     let engine = ramjet_engine::engine::Engine::bind(
@@ -352,6 +365,8 @@ pub async fn run_uring(args: &Args) -> Result<ExitCode, Box<dyn std::error::Erro
             max_buf_size: args.max_buf_size,
             mirror_max_body: args.mirror_max_body,
             mirror: Some(mirror),
+            peer_metrics: Some(Arc::clone(&peer_metrics)),
+            dispatch: hyper_lane.as_ref().map(|lane| lane.dispatch.clone()),
             ..ramjet_engine::engine::Config::default()
         },
         Arc::clone(&routes),
@@ -470,6 +485,13 @@ pub async fn run_uring(args: &Args) -> Result<ExitCode, Box<dyn std::error::Erro
     promoter.abort();
     controller.abort();
     mirror_ready.abort();
+    if let Some(lane) = hyper_lane {
+        // Drained rather than aborted: it may be holding HTTP/2 connections
+        // this process accepted, and they get the same grace period every other
+        // connection does.
+        lane.shutdown.shutdown();
+        let _ = lane.task.await;
+    }
     if let Some(admin) = admin {
         admin.abort();
         let _ = admin.await;

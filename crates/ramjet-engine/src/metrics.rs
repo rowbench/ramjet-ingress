@@ -56,6 +56,8 @@ pub struct CoreMetrics {
     route_misses: AtomicU64,
     tls_handshakes: AtomicU64,
     tls_handshake_failures: AtomicU64,
+    dispatched_here: AtomicU64,
+    dispatched_away: AtomicU64,
 }
 
 impl CoreMetrics {
@@ -129,20 +131,34 @@ impl CoreMetrics {
     pub fn tls_handshake_failure(&self) {
         self.tls_handshake_failures.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// A connection this engine kept, having looked at what the client offered.
+    pub fn dispatched_here(&self) {
+        self.dispatched_here.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A connection handed to the other engine.
+    pub fn dispatched_away(&self) {
+        self.dispatched_away.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Every core's counters, and the merge that turns them into an exposition.
 #[derive(Debug)]
 pub struct EngineMetrics {
     cores: Box<[CoreMetrics]>,
-    /// The mirror worker's own counters, when mirroring is wired up.
+    /// The counters belonging to everything on this process's *other* side.
     ///
-    /// Not per-core, and deliberately not: three of the four are written by a
-    /// tokio task that outlives the request that queued the copy, so there is
-    /// no core to attribute them to. They are the hyper engine's `Metrics`,
-    /// shared with the worker, which is also what keeps the numbers on the two
-    /// lanes the same shape.
-    mirror: Option<std::sync::Arc<ramjet_proxy::Metrics>>,
+    /// Two things write to it and both live on tokio: the mirror worker, which
+    /// records what became of a copy long after the request that queued it is
+    /// gone, and — with engine dispatch on — the hyper lane, which serves every
+    /// HTTP/2 connection this engine hands it.
+    ///
+    /// Summed into this engine's own numbers at scrape time, because there is
+    /// one `/metrics` and it has to describe the whole process. Without it,
+    /// dispatch mode reports the HTTP/1.1 half of its traffic and silently
+    /// omits the rest.
+    peer: Option<std::sync::Arc<ramjet_proxy::Metrics>>,
 }
 
 impl EngineMetrics {
@@ -150,25 +166,26 @@ impl EngineMetrics {
     pub fn new(cores: usize) -> Self {
         EngineMetrics {
             cores: (0..cores.max(1)).map(|_| CoreMetrics::default()).collect(),
-            mirror: None,
+            peer: None,
         }
     }
 
-    /// Counters for `cores` serving threads, reporting a mirror worker's
-    /// numbers alongside their own.
-    pub fn with_mirror(cores: usize, mirror: std::sync::Arc<ramjet_proxy::Metrics>) -> Self {
+    /// Counters for `cores` serving threads, summed with everything this
+    /// process serves or records on the tokio side.
+    ///
+    /// See [`EngineMetrics::peer`].
+    pub fn with_peer(cores: usize, peer: std::sync::Arc<ramjet_proxy::Metrics>) -> Self {
         EngineMetrics {
-            mirror: Some(mirror),
+            peer: Some(peer),
             ..EngineMetrics::new(cores)
         }
     }
 
-    /// One of the mirror series, or zero where mirroring is not wired up.
-    ///
-    /// Zero rather than an absent series: a dashboard that loses a line when an
-    /// operator turns a feature off looks like an outage.
-    fn mirror(&self, pick: impl Fn(&ramjet_proxy::Metrics) -> u64) -> u64 {
-        self.mirror.as_deref().map_or(0, pick)
+    /// The other side's numbers, or all zeros where there is no other side.
+    fn peer(&self) -> ramjet_proxy::metrics::Totals {
+        self.peer
+            .as_deref()
+            .map_or_else(Default::default, ramjet_proxy::Metrics::totals)
     }
 
     /// The block belonging to one core.
@@ -222,11 +239,15 @@ impl EngineMetrics {
     pub fn render_prometheus(&self, generation: u64, pinned: bool) -> String {
         use std::fmt::Write as _;
         let mut out = String::with_capacity(2048);
+        // Everything the other side of this process served or recorded, added
+        // to this engine's own numbers. All zeros when there is no other side,
+        // which is the ordinary case.
+        let peer = self.peer();
 
         out.push_str("# HELP ramjet_requests_total Responses served, by status class.\n");
         out.push_str("# TYPE ramjet_requests_total counter\n");
         for (i, class) in CLASSES.iter().enumerate() {
-            let value = self.sum(|c| &c.requests[i]);
+            let value = self.sum(|c| &c.requests[i]) + peer.requests[i];
             let _ = writeln!(out, "ramjet_requests_total{{code=\"{class}\"}} {value}");
         }
 
@@ -239,12 +260,12 @@ impl EngineMetrics {
         // what keeps the hot path a single add.
         let mut cumulative = 0u64;
         for (i, bound) in BUCKETS.iter().enumerate() {
-            cumulative += self.sum(|c| &c.buckets[i]);
+            cumulative += self.sum(|c| &c.buckets[i]) + peer.latency_buckets[i];
             let _ = writeln!(out, "{name}_bucket{{le=\"{bound}\"}} {cumulative}");
         }
-        let count = self.sum(|c| &c.latency_count);
+        let count = self.sum(|c| &c.latency_count) + peer.latency_count;
         let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {count}");
-        let sum = self.sum(|c| &c.sum_nanos) as f64 / 1e9;
+        let sum = (self.sum(|c| &c.sum_nanos) + peer.latency_nanos) as f64 / 1e9;
         let _ = writeln!(out, "{name}_sum {sum:.6}");
         let _ = writeln!(out, "{name}_count {count}");
 
@@ -252,7 +273,7 @@ impl EngineMetrics {
             &mut out,
             "ramjet_active_connections",
             "Downstream connections currently being served.",
-            self.active_connections(),
+            self.active_connections() + peer.active_connections,
         );
         gauge(
             &mut out,
@@ -271,32 +292,42 @@ impl EngineMetrics {
             (
                 "ramjet_tls_handshakes_total",
                 "TLS handshakes completed.",
-                self.sum(|c| &c.tls_handshakes),
+                self.sum(|c| &c.tls_handshakes) + peer.tls_handshakes,
             ),
             (
                 "ramjet_tls_handshake_failures_total",
                 "TLS handshakes that failed.",
-                self.sum(|c| &c.tls_handshake_failures),
+                self.sum(|c| &c.tls_handshake_failures) + peer.tls_handshake_failures,
+            ),
+            (
+                "ramjet_dispatch_uring_total",
+                "Connections the uring engine kept after reading what the client offered.",
+                self.sum(|c| &c.dispatched_here) + peer.dispatch_uring,
+            ),
+            (
+                "ramjet_dispatch_hyper_total",
+                "Connections handed to the hyper engine because the client asked for HTTP/2.",
+                self.sum(|c| &c.dispatched_away) + peer.dispatch_hyper,
             ),
             (
                 "ramjet_upstream_connect_failures_total",
                 "Failures to connect to an upstream endpoint.",
-                self.sum(|c| &c.connect_failures),
+                self.sum(|c| &c.connect_failures) + peer.connect_failures,
             ),
             (
                 "ramjet_upstream_retries_total",
                 "Requests re-dispatched to a different endpoint.",
-                self.sum(|c| &c.retries),
+                self.sum(|c| &c.retries) + peer.retries,
             ),
             (
                 "ramjet_upstream_timeouts_total",
                 "Upstreams that did not send headers before the deadline.",
-                self.sum(|c| &c.timeouts),
+                self.sum(|c| &c.timeouts) + peer.timeouts,
             ),
             (
                 "ramjet_route_misses_total",
                 "Requests that matched no route and no default backend.",
-                self.sum(|c| &c.route_misses),
+                self.sum(|c| &c.route_misses) + peer.route_misses,
             ),
             // Zero for the same reason the TLS handshake counters are: this
             // engine has no QUIC listener, and a dashboard that loses a series
@@ -304,37 +335,37 @@ impl EngineMetrics {
             (
                 "ramjet_h3_connections_total",
                 "HTTP/3 connections established on the QUIC listener.",
-                0,
+                peer.h3_connections,
             ),
             (
                 "ramjet_h3_requests_total",
                 "Requests that arrived over HTTP/3.",
-                0,
+                peer.h3_requests,
             ),
             (
                 "ramjet_h3_handshake_failures_total",
                 "QUIC connections that never became usable HTTP/3 connections.",
-                0,
+                peer.h3_handshake_failures,
             ),
             (
                 "ramjet_mirrored_total",
                 "Requests copied to a mirror backend, which accepted the copy.",
-                self.mirror(ramjet_proxy::Metrics::mirrored),
+                peer.mirrored,
             ),
             (
                 "ramjet_mirror_dropped_total",
                 "Copies discarded because a serving runtime's mirror queue was full.",
-                self.mirror(ramjet_proxy::Metrics::mirror_dropped),
+                peer.mirror_dropped,
             ),
             (
                 "ramjet_mirror_skipped_total",
                 "Copies not attempted because the request body exceeded --mirror-max-body.",
-                self.mirror(ramjet_proxy::Metrics::mirror_skipped),
+                peer.mirror_skipped,
             ),
             (
                 "ramjet_mirror_failures_total",
                 "Copies a mirror backend refused, failed, or did not answer in time.",
-                self.mirror(ramjet_proxy::Metrics::mirror_failures),
+                peer.mirror_failures,
             ),
         ] {
             let _ = writeln!(out, "# HELP {name} {help}");

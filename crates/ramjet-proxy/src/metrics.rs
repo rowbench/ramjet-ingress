@@ -115,6 +115,57 @@ impl Histogram {
     }
 }
 
+/// Every series this engine holds, read out in one pass.
+///
+/// Exists for one caller: engine dispatch, where the two data planes each serve
+/// part of the traffic and `/metrics` has to sum them or every request the
+/// other one answered is missing. A struct of numbers rather than an accessor
+/// per series, because the alternative was twenty accessors that exist for a
+/// single summation.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Totals {
+    /// Responses by status class, in the order [`CLASSES`] names them.
+    pub requests: [u64; CLASSES.len()],
+    /// Non-cumulative latency buckets, in the order [`BUCKETS`] bounds them.
+    pub latency_buckets: [u64; BUCKETS.len()],
+    /// Summed upstream latency, in nanoseconds.
+    pub latency_nanos: u64,
+    /// Latency observations.
+    pub latency_count: u64,
+    /// Connections currently being served.
+    pub active_connections: i64,
+    /// TLS handshakes completed.
+    pub tls_handshakes: u64,
+    /// TLS handshakes that failed.
+    pub tls_handshake_failures: u64,
+    /// Connections kept by the uring engine after reading the ClientHello.
+    pub dispatch_uring: u64,
+    /// Connections handed to the hyper engine.
+    pub dispatch_hyper: u64,
+    /// Failures to connect to an upstream endpoint.
+    pub connect_failures: u64,
+    /// Requests re-dispatched to a different endpoint.
+    pub retries: u64,
+    /// Upstreams that sent no headers before the deadline.
+    pub timeouts: u64,
+    /// Requests that matched no route and no default backend.
+    pub route_misses: u64,
+    /// HTTP/3 connections established.
+    pub h3_connections: u64,
+    /// Requests that arrived over HTTP/3.
+    pub h3_requests: u64,
+    /// QUIC connections that never became usable HTTP/3 connections.
+    pub h3_handshake_failures: u64,
+    /// Copies a mirror backend accepted.
+    pub mirrored: u64,
+    /// Copies dropped because a queue was full.
+    pub mirror_dropped: u64,
+    /// Copies not attempted because a body was too large.
+    pub mirror_skipped: u64,
+    /// Copies a mirror backend refused or did not answer.
+    pub mirror_failures: u64,
+}
+
 /// Every series the data plane exports.
 ///
 /// Cloned around as an `Arc` and shared by every worker; nothing in here is
@@ -126,6 +177,16 @@ pub struct Metrics {
     active_connections: AtomicI64,
     tls_handshakes: AtomicU64,
     tls_handshake_failures: AtomicU64,
+    /// Both structurally zero on this engine, and kept as fields rather than
+    /// written as literals so the rendering loop stays one shape.
+    ///
+    /// Engine dispatch is a decision the *uring* engine makes: it owns the
+    /// listener, reads the ClientHello, and either keeps the connection or
+    /// hands it here. This engine is the destination, never the one choosing,
+    /// so it has nothing to count. The series is emitted anyway — a dashboard
+    /// that loses a line when an operator changes engine looks like an outage.
+    dispatch_uring: AtomicU64,
+    dispatch_hyper: AtomicU64,
     upstream_connect_failures: AtomicU64,
     upstream_retries: AtomicU64,
     upstream_timeouts: AtomicU64,
@@ -143,6 +204,46 @@ impl Metrics {
     /// A fresh, zeroed set of series.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Every series at once, for a caller that has to add two engines together.
+    ///
+    /// Not atomic across series, and it does not need to be: a scrape is a
+    /// sample of counters that are moving anyway, and no reader draws a
+    /// conclusion about one series from another's value.
+    pub fn totals(&self) -> Totals {
+        let mut totals = Totals {
+            latency_nanos: self.upstream_latency.sum_nanos.load(Ordering::Relaxed),
+            latency_count: self.upstream_latency.count.load(Ordering::Relaxed),
+            active_connections: self.active_connections.load(Ordering::Relaxed),
+            tls_handshakes: self.tls_handshakes.load(Ordering::Relaxed),
+            tls_handshake_failures: self.tls_handshake_failures.load(Ordering::Relaxed),
+            dispatch_uring: self.dispatch_uring.load(Ordering::Relaxed),
+            dispatch_hyper: self.dispatch_hyper.load(Ordering::Relaxed),
+            connect_failures: self.upstream_connect_failures.load(Ordering::Relaxed),
+            retries: self.upstream_retries.load(Ordering::Relaxed),
+            timeouts: self.upstream_timeouts.load(Ordering::Relaxed),
+            route_misses: self.route_misses.load(Ordering::Relaxed),
+            h3_connections: self.h3_connections.load(Ordering::Relaxed),
+            h3_requests: self.h3_requests.load(Ordering::Relaxed),
+            h3_handshake_failures: self.h3_handshake_failures.load(Ordering::Relaxed),
+            mirrored: self.mirrored.load(Ordering::Relaxed),
+            mirror_dropped: self.mirror_dropped.load(Ordering::Relaxed),
+            mirror_skipped: self.mirror_skipped.load(Ordering::Relaxed),
+            mirror_failures: self.mirror_failures.load(Ordering::Relaxed),
+            ..Totals::default()
+        };
+        for (slot, counter) in totals.requests.iter_mut().zip(&self.requests) {
+            *slot = counter.load(Ordering::Relaxed);
+        }
+        for (slot, bucket) in totals
+            .latency_buckets
+            .iter_mut()
+            .zip(&self.upstream_latency.buckets)
+        {
+            *slot = bucket.load(Ordering::Relaxed);
+        }
+        totals
     }
 
     /// Records a response by status class.
@@ -391,6 +492,16 @@ impl Metrics {
                 "ramjet_tls_handshake_failures_total",
                 "TLS handshakes that failed.",
                 &self.tls_handshake_failures,
+            ),
+            (
+                "ramjet_dispatch_uring_total",
+                "Connections the uring engine kept after reading what the client offered.",
+                &self.dispatch_uring,
+            ),
+            (
+                "ramjet_dispatch_hyper_total",
+                "Connections handed to the hyper engine because the client asked for HTTP/2.",
+                &self.dispatch_hyper,
             ),
             (
                 "ramjet_upstream_connect_failures_total",

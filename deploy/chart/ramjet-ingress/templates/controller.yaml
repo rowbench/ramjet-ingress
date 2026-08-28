@@ -81,6 +81,9 @@ spec:
             {{- end }}
             - --admin=:{{ .Values.ports.admin }}
             - --engine={{ .Values.engine }}
+            {{- if not .Values.h2Dispatch.enabled }}
+            - --no-h2-dispatch
+            {{- end }}
             {{- if .Values.http3.enabled }}
             - --http3
             {{- end }}

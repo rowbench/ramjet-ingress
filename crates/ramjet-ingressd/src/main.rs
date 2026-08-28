@@ -340,10 +340,18 @@ async fn uring_mode(
     } else {
         None
     };
+    // The second engine, started before the TLS configuration is chosen: which
+    // ALPN set to advertise depends on whether there is anywhere to send an
+    // HTTP/2 client. Offering `h2` with nothing behind it would be a promise
+    // this process cannot keep.
+    let hyper_lane = start_hyper_lane(args, &routes, &certs)?;
     let tls = match https {
         Some(_) => {
             let resolver = Arc::new(SniResolver::new(Arc::clone(&routes), Arc::clone(&certs)));
-            Some(Arc::new(ramjet_proxy::tls::h1_server_config(resolver)?))
+            Some(Arc::new(match &hyper_lane {
+                Some(_) => ramjet_proxy::tls::server_config(resolver)?,
+                None => ramjet_proxy::tls::h1_server_config(resolver)?,
+            }))
         }
         None => None,
     };
@@ -359,14 +367,20 @@ async fn uring_mode(
     // argument does not carry here — the reactor threads are not the ones
     // draining it, and a `try_send` on a full channel is the same
     // constant-time drop from any of them.
-    let mirror_metrics = Arc::new(ramjet_proxy::Metrics::new());
+    // One set of counters for the whole tokio side: the mirror worker and, with
+    // engine dispatch on, the hyper lane serving every HTTP/2 connection. The
+    // engine sums them into its own at scrape time, so `/metrics` describes the
+    // process rather than one half of it.
+    let peer_metrics = hyper_lane
+        .as_ref()
+        .map_or_else(|| Arc::new(ramjet_proxy::Metrics::new()), |lane| Arc::clone(&lane.metrics));
     let mirror = ramjet_engine::mirror::MirrorLane::new(
         ramjet_proxy::Mirror::spawn(
             ramjet_proxy::Upstream::new(&upstream_config(args)),
-            Arc::clone(&mirror_metrics),
+            Arc::clone(&peer_metrics),
         )
         .with_max_body(args.mirror_max_body),
-        mirror_metrics,
+        Arc::clone(&peer_metrics),
     );
 
     let readiness = Arc::new(AtomicBool::new(false));
@@ -389,6 +403,8 @@ async fn uring_mode(
         max_buf_size: args.max_buf_size,
         mirror_max_body: args.mirror_max_body,
         mirror: Some(mirror),
+        peer_metrics: Some(Arc::clone(&peer_metrics)),
+        dispatch: hyper_lane.as_ref().map(|lane| lane.dispatch.clone()),
         ..ramjet_engine::engine::Config::default()
     };
 
@@ -397,6 +413,8 @@ async fn uring_mode(
         Arc::clone(&routes),
         Arc::clone(&readiness),
     )?;
+    // With dispatch on, the two engines each serve part of the traffic, so a
+    // scrape has to sum them or every h2 request is missing from /metrics.
     let metrics = engine.metrics();
 
     // The one generation dev mode has, recorded the way the Kubernetes applier
@@ -492,10 +510,14 @@ async fn uring_mode(
 
     let stop = engine.shutdown();
     let mut signal = Shutdown::on_signal();
+    let hyper_stop = hyper_lane.as_ref().map(|lane| lane.shutdown.clone());
     tokio::spawn(async move {
         signal.recv().await;
         stop.stop();
         admin_handle.shutdown();
+        if let Some(handle) = hyper_stop {
+            handle.shutdown();
+        }
     });
 
     // The reactor is a blocking loop and is `!Send` per core, so it runs off
@@ -503,6 +525,13 @@ async fn uring_mode(
     let outcome = tokio::task::spawn_blocking(move || engine.run())
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::other(e)) })?;
+    if let Some(lane) = hyper_lane {
+        // Drained rather than dropped: it may be holding HTTP/2 connections
+        // this process accepted, and they get the same grace every other
+        // connection does.
+        lane.shutdown.shutdown();
+        let _ = lane.task.await;
+    }
     finish(outcome)
 }
 
@@ -533,6 +562,72 @@ pub(crate) fn watch_pins(
             }
         }
     });
+}
+
+/// The second engine, started only to be handed connections.
+///
+/// It binds nothing. With engine dispatch on, the uring engine owns both
+/// listeners; this one exists because HTTP/2 has to be spoken by something, and
+/// the uring engine speaks HTTP/1.1. A client that offered `h2` gets its socket
+/// handed here, along with every byte read from it, and the handshake finishes
+/// on this side.
+///
+/// Returns `None` where there is nothing to dispatch — dispatch turned off, or
+/// no listener that an HTTP/2 client could arrive on.
+struct HyperLane {
+    dispatch: ramjet_proxy::HandoffSender,
+    metrics: Arc<ramjet_proxy::Metrics>,
+    shutdown: ramjet_proxy::ShutdownHandle,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+fn start_hyper_lane(
+    args: &Args,
+    routes: &Arc<SharedRouteTable>,
+    certs: &Arc<CertStore>,
+) -> Result<Option<HyperLane>, Box<dyn std::error::Error>> {
+    if !args.h2_dispatch {
+        return Ok(None);
+    }
+    let config = ProxyConfig {
+        // Every socket belongs to the other engine.
+        http: None,
+        https: None,
+        admin: None,
+        upstream: upstream_config(args),
+        shutdown_grace: args.shutdown_grace,
+        worker_threads: args.worker_threads,
+        max_buf_size: args.max_buf_size,
+        mirror_max_body: args.mirror_max_body,
+        history_size: args.history_size,
+        // The PROXY header has already been read by the engine that accepted
+        // the connection, and `Handoff::remote` is what it named. Reading it
+        // again here would eat the ClientHello it was in front of.
+        proxy_protocol: None,
+        http3: None,
+        handoff: true,
+    };
+    let server = Server::bind_with(
+        config,
+        Arc::clone(routes),
+        Arc::clone(certs),
+        ReadinessFlag::new(),
+    )?;
+    // This lane answers no probes — the admin listener belongs to the process,
+    // not to it — so its own readiness flag is set once and never read.
+    server.readiness().set_ready(true);
+
+    let dispatch = server.handoffs();
+    let metrics = Arc::clone(server.metrics());
+    let (shutdown, signal) = Shutdown::channel();
+    let task = tokio::spawn(server.run(signal));
+
+    Ok(Some(HyperLane {
+        dispatch,
+        metrics,
+        shutdown,
+        task,
+    }))
 }
 
 /// The upstream settings every lane dials with.
@@ -575,6 +670,9 @@ fn proxy_config(args: &Args, https: Option<SocketAddr>) -> ProxyConfig {
         // HTTP/3 to serve either, and the startup banner says so rather than
         // leaving a UDP port that fails every handshake.
         http3: args.http3.then_some(https).flatten(),
+        // This lane accepts its own connections. Engine dispatch builds a
+        // different configuration; see `start_hyper_lane`.
+        handoff: false,
     }
 }
 

@@ -120,6 +120,23 @@ pub struct Config {
     pub max_buf_size: usize,
     /// Largest request body copied to a mirror backend.
     pub mirror_max_body: usize,
+    /// Where a connection this engine cannot serve is sent, or `None` to serve
+    /// every connection here.
+    ///
+    /// # One port, two engines
+    ///
+    /// With this set, the TLS listener offers `h2` as well as `http/1.1` in its
+    /// ALPN, and a client that takes `h2` is handed to the hyper engine instead
+    /// of being refused. That is possible because a `rustls::server::Acceptor`
+    /// yields the ClientHello *before* a configuration is chosen: the ALPN list
+    /// is readable at a point where nothing has been committed to the
+    /// connection, and the bytes consumed so far can be replayed on the other
+    /// side. From the client there is no reset, no second handshake and no
+    /// retry — it sees one connection that negotiated HTTP/2.
+    ///
+    /// The plaintext listener does the same for the HTTP/2 prior-knowledge
+    /// preface, which is the only way h2 arrives without TLS.
+    pub dispatch: Option<ramjet_proxy::HandoffSender>,
     /// Where sampled copies go, or `None` where mirroring is not wired up.
     ///
     /// The worker draining this queue is a tokio task, so it has to be started
@@ -128,6 +145,20 @@ pub struct Config {
     /// annotation and no lane here simply makes no copies, which is the correct
     /// behaviour for a data plane with nowhere to put them.
     pub mirror: Option<crate::mirror::MirrorLane>,
+    /// Counters for everything this process does on the tokio side, summed into
+    /// this engine's own at scrape time.
+    ///
+    /// Two things write to it, and both of them serve or record traffic this
+    /// engine's per-core blocks never see: the mirror worker, and — with
+    /// [`Config::dispatch`] on — the hyper lane that every HTTP/2 connection is
+    /// handed to. One `/metrics` has to describe the whole process, so leaving
+    /// this unset in dispatch mode would report the HTTP/1.1 half and silently
+    /// omit the rest.
+    ///
+    /// The same `Arc` the mirror lane and the hyper lane were built with;
+    /// passing a different one would produce a second set of numbers nobody
+    /// reads.
+    pub peer_metrics: Option<Arc<ramjet_proxy::Metrics>>,
     /// Listen backlog.
     pub backlog: i32,
     /// How often the helper thread ticks, which sets timeout resolution.
@@ -194,7 +225,9 @@ impl Default for Config {
             pool_idle_timeout: Duration::from_secs(90),
             max_buf_size: 16 * 1024,
             mirror_max_body: ramjet_proxy::DEFAULT_MIRROR_MAX_BODY,
+            dispatch: None,
             mirror: None,
+            peer_metrics: None,
             backlog: 1024,
             tick: Duration::from_millis(100),
         }
@@ -316,10 +349,10 @@ impl Engine {
             None => (None, None),
         };
 
-        // The mirror worker's counters are reported alongside this engine's own,
-        // so a scrape shows one set of mirror numbers whichever lane is serving.
-        let metrics = match config.mirror.as_ref() {
-            Some(lane) => EngineMetrics::with_mirror(cores, Arc::clone(lane.metrics())),
+        // The tokio side's counters are reported alongside this engine's own, so
+        // one scrape describes the whole process however the traffic is split.
+        let metrics = match config.peer_metrics.as_ref() {
+            Some(peer) => EngineMetrics::with_peer(cores, Arc::clone(peer)),
             None => EngineMetrics::new(cores),
         };
 

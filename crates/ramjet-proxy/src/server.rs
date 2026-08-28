@@ -119,6 +119,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use http::header::{self, HeaderValue};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -141,6 +142,68 @@ use crate::mirror::{Mirror, DEFAULT_MIRROR_MAX_BODY};
 use crate::proxy_protocol;
 use crate::tls::{self, CertStore, SniResolver};
 use crate::upstream::{Upstream, UpstreamConfig};
+
+/// How many handed-over connections are held before one is refused.
+///
+/// The queue holds a descriptor and a few hundred bytes per entry and is
+/// drained by a loop that does nothing but forward to a lane, so it is deep
+/// enough that filling it means the process is already failing. Refusing rather
+/// than growing is the same trade the mirror queue makes: an unbounded queue in
+/// front of something that has stopped keeping up is a memory leak with a
+/// friendlier name.
+const HANDOFF_QUEUE_DEPTH: usize = 1024;
+
+/// A connection another engine accepted and decided not to serve.
+///
+/// The uring engine owns the TLS listener when engine dispatch is on. It reads
+/// the ClientHello — which a `rustls::server::Acceptor` yields *before* a
+/// configuration is chosen — and where the client offered `h2`, hands the
+/// socket here rather than negotiating a protocol it cannot speak.
+///
+/// The socket has had nothing written to it and has had exactly `prefix` read
+/// from it, so replaying those bytes ahead of it reconstructs the stream the
+/// client sent. From the client's side the handoff is invisible: no reset, no
+/// second handshake, no retry.
+#[derive(Debug)]
+pub struct Handoff {
+    /// The accepted socket, still open and owned by the receiver.
+    ///
+    /// A `std::net::TcpStream` because it comes from a thread with no tokio
+    /// runtime to register it with; the serving lane does that.
+    pub stream: std::net::TcpStream,
+    /// Every byte already read from the socket, in order.
+    pub prefix: Bytes,
+    /// The client, as the sending engine resolved it — which is the address a
+    /// PROXY header named, where there was one.
+    pub remote: SocketAddr,
+    /// Which listener the connection arrived on.
+    pub scheme: Scheme,
+}
+
+/// Hands connections to a [`Server`] that did not accept them.
+///
+/// Cheap to clone and safe to call from any thread, including a reactor thread
+/// with no runtime: sending is a `try_send` on a bounded channel and never
+/// blocks, allocates, or needs an executor.
+#[derive(Debug, Clone)]
+pub struct HandoffSender {
+    tx: mpsc::Sender<Handoff>,
+}
+
+impl HandoffSender {
+    /// Hand over one connection.
+    ///
+    /// Gives it back when the queue is full or the server has stopped, so the
+    /// caller can decide what to tell the client — which in practice means
+    /// closing the socket, because there is nothing in this process that can
+    /// serve it.
+    pub fn send(&self, handoff: Handoff) -> Result<(), Handoff> {
+        self.tx.try_send(handoff).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(handoff)
+            | mpsc::error::TrySendError::Closed(handoff) => handoff,
+        })
+    }
+}
 
 /// Default plaintext port.
 pub const DEFAULT_HTTP_PORT: u16 = 8080;
@@ -243,6 +306,15 @@ pub struct ProxyConfig {
     /// header is added, and quinn never runs. See [`http3`](crate::http3) for
     /// what is and is not supported when it is on.
     pub http3: Option<SocketAddr>,
+    /// Serve connections another engine accepted and handed over.
+    ///
+    /// This server then terminates TLS on sockets it never accepted, so the
+    /// acceptor is built even where no TLS listener is bound — which is the
+    /// usual shape for it: with engine dispatch on, the uring engine owns both
+    /// listeners and this one binds nothing at all.
+    ///
+    /// See [`Handoff`] and [`Server::handoffs`].
+    pub handoff: bool,
 }
 
 impl Default for ProxyConfig {
@@ -268,6 +340,9 @@ impl Default for ProxyConfig {
             // Experimental, and a UDP port an operator did not ask for is a
             // port a security review did not either.
             http3: None,
+            // Off: this server accepts its own connections unless somebody
+            // wires the other engine's dispatch to it.
+            handoff: false,
         }
     }
 }
@@ -309,6 +384,14 @@ pub struct Server {
     mirror_max_body: usize,
     proxy_protocol: Option<Duration>,
     http3: Option<http3::Listener>,
+    /// Connections another engine accepted and handed over.
+    ///
+    /// Always present, and empty unless somebody holds the matching
+    /// [`HandoffSender`]. Draining it costs one arm of the accept `select!`
+    /// whether or not anything ever arrives, which is cheaper than a branch
+    /// deciding whether to poll it.
+    handoffs: mpsc::Receiver<Handoff>,
+    handoff_tx: mpsc::Sender<Handoff>,
 }
 
 impl Server {
@@ -349,10 +432,14 @@ impl Server {
         // differently, now or after a rotation: it is the same `SniMap` in the
         // same route table and the same `CertStore`, published by the same two
         // stores in the same order.
-        let resolver = (https.is_some() || config.http3.is_some())
+        let resolver = (https.is_some() || config.http3.is_some() || config.handoff)
             .then(|| Arc::new(SniResolver::new(Arc::clone(&routes), Arc::clone(&certs))));
-        let tls = match (&https, &resolver) {
-            (Some(_), Some(resolver)) => {
+        // Built when there is a TLS listener *or* when this server is the
+        // destination of a handoff. In the second case it terminates TLS on
+        // connections it never accepted, and having no acceptor would mean
+        // reading a ClientHello as though it were an HTTP request.
+        let tls = match (https.is_some() || config.handoff, &resolver) {
+            (true, Some(resolver)) => {
                 let config = tls::server_config(Arc::clone(resolver))
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 Some(Arc::new(config))
@@ -383,6 +470,8 @@ impl Server {
             history: Arc::clone(&history),
         });
 
+        let (handoff_tx, handoffs) = mpsc::channel(HANDOFF_QUEUE_DEPTH);
+
         Ok(Server {
             routes,
             upstream: config.upstream,
@@ -400,7 +489,19 @@ impl Server {
             mirror_max_body: config.mirror_max_body,
             proxy_protocol: config.proxy_protocol,
             http3,
+            handoffs,
+            handoff_tx,
         })
+    }
+
+    /// A sender for connections another engine accepted and will not serve.
+    ///
+    /// See [`Handoff`]. Cloning it is cheap and holding one does not keep the
+    /// server running; a send after shutdown gives the connection back.
+    pub fn handoffs(&self) -> HandoffSender {
+        HandoffSender {
+            tx: self.handoff_tx.clone(),
+        }
     }
 
     /// The plaintext address actually bound.
@@ -466,6 +567,7 @@ impl Server {
             mirror_max_body,
             proxy_protocol,
             http3,
+            mut handoffs,
             ..
         } = self;
 
@@ -553,6 +655,19 @@ impl Server {
                     ),
                     Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
                 },
+
+                // A connection the other engine accepted and would not serve.
+                // It costs an arm of this select whether or not engine dispatch
+                // is on, which is cheaper than a branch deciding whether to
+                // poll it — and `recv` on a channel nobody sends to is free.
+                handoff = handoffs.recv() => match handoff {
+                    Some(handoff) => {
+                        workers.dispatch_handoff(handoff, metrics.connection_opened());
+                    }
+                    // Only reachable once every sender has gone, and this
+                    // server holds one itself, so it never is.
+                    None => tokio::time::sleep(ACCEPT_BACKOFF).await,
+                },
             }
         }
 
@@ -617,6 +732,19 @@ fn worker_threads(configured: Option<usize>) -> usize {
 /// not from whenever the serving runtime got round to it.
 struct Job {
     stream: std::net::TcpStream,
+    /// Bytes already read from the socket by whoever accepted it, to be
+    /// replayed before anything else reads from it.
+    ///
+    /// Empty on the ordinary path. Non-empty only for a connection handed over
+    /// by the other engine, which has already consumed a ClientHello deciding
+    /// this connection was not its to serve.
+    prefix: Bytes,
+    /// Whether the PROXY header has already been read off this connection.
+    ///
+    /// True for a handed-over connection: the engine that accepted it read the
+    /// header itself, and `conn.remote` is what the header named. Reading it
+    /// again would consume the first bytes of a ClientHello.
+    preface_done: bool,
     guard: ConnectionGuard,
     conn: ConnInfo,
 }
@@ -694,6 +822,34 @@ impl Workers {
     /// counts even out on their own across anything longer than a burst.
     fn dispatch(&mut self, stream: TcpStream, guard: ConnectionGuard, conn: ConnInfo) {
         let Ok(stream) = stream.into_std() else { return };
+        self.send(Job {
+            stream,
+            prefix: Bytes::new(),
+            preface_done: false,
+            guard,
+            conn,
+        });
+    }
+
+    /// Hands over a connection another engine accepted.
+    ///
+    /// The socket arrives as a `std::net::TcpStream` because it came from a
+    /// thread with no tokio runtime to register it with; the lane's own runtime
+    /// does that when it picks the job up.
+    fn dispatch_handoff(&mut self, handoff: Handoff, guard: ConnectionGuard) {
+        self.send(Job {
+            stream: handoff.stream,
+            prefix: handoff.prefix,
+            preface_done: true,
+            guard,
+            conn: ConnInfo {
+                remote: handoff.remote,
+                scheme: handoff.scheme,
+            },
+        });
+    }
+
+    fn send(&mut self, job: Job) {
         if self.lanes.is_empty() {
             return;
         }
@@ -703,11 +859,7 @@ impl Workers {
             // A closed lane means that runtime is gone; dropping the socket
             // closes it, which is the honest answer to a client whose
             // connection this process can no longer serve.
-            let _ = lane.send(Job {
-                stream,
-                guard,
-                conn,
-            });
+            let _ = lane.send(job);
         }
     }
 
@@ -805,6 +957,8 @@ fn serve_lane(
                 Arc::clone(&lane),
                 graceful.watcher(),
                 stream,
+                job.prefix,
+                job.preface_done,
                 job.guard,
                 job.conn,
             );
@@ -820,10 +974,13 @@ fn serve_lane(
 /// accept loop, and the PROXY header is the newest reason why: waiting up to
 /// `proxy_protocol_timeout` for a stalled sender on the accept path would let
 /// one connection hold up every other accept on the process.
+#[allow(clippy::too_many_arguments)]
 fn spawn_connection(
     lane: Arc<Lane>,
     watcher: Watcher,
     stream: TcpStream,
+    prefix: Bytes,
+    preface_done: bool,
     guard: ConnectionGuard,
     conn: ConnInfo,
 ) {
@@ -831,6 +988,19 @@ fn spawn_connection(
         // The guard lives in the task, not the accept loop, so a connection
         // that ends by panic or abort still decrements the gauge.
         let _guard = guard;
+
+        // Bytes the other engine read before deciding this connection was not
+        // its to serve. Replayed ahead of the socket, so the handshake below
+        // sees a stream that starts at the client's very first byte.
+        let stream = proxy_protocol::Prefixed::new(stream, prefix);
+
+        // A handed-over connection has had its PROXY header read already, and
+        // `conn.remote` is what that header named. Reading it again would eat
+        // the ClientHello sitting in the replay buffer.
+        if preface_done {
+            serve_client(&lane, watcher, stream, conn).await;
+            return;
+        }
 
         let Some(timeout) = lane.proxy_protocol else {
             serve_client(&lane, watcher, stream, conn).await;

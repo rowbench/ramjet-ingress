@@ -240,6 +240,14 @@ struct Conn {
     tls: Option<Box<crate::tls::Session>>,
     /// What `X-Forwarded-Proto` says: `"https"` behind TLS, `"http"` otherwise.
     scheme: &'static str,
+    /// This connection is the other engine's to serve.
+    ///
+    /// Set at the decision point and acted on by [`Worker::advance`], because
+    /// the handover has to happen with the connection back in its slot: it
+    /// takes the descriptor out of this reactor's hands entirely, and doing
+    /// that from inside a borrow of the connection would leave the slot holding
+    /// a descriptor number that no longer belongs to it.
+    hand_off: bool,
     /// Bytes collected while a PROXY protocol header is still being read.
     ///
     /// `Some` only until the header is complete, and only when the listener was
@@ -359,6 +367,7 @@ impl Conn {
             phase: Phase::Head,
             scheme: if tls.is_some() { "https" } else { "http" },
             tls,
+            hand_off: false,
             preface: None,
             inbox: Vec::new(),
             outbox: Vec::new(),
@@ -980,11 +989,14 @@ impl Worker {
 
         match outcome {
             Ok(crate::tls::Step::NeedMore) => {}
-            Ok(crate::tls::Step::Hello(_)) => {
-                // v1 of the TLS lane serves every ClientHello it is offered:
-                // ALPN is `http/1.1` only, so an HTTP/2 client never negotiates
-                // a protocol this engine cannot speak. Dispatch is what turns
-                // this into a decision.
+            // The decision point. Nothing has been committed to the connection
+            // yet — no configuration chosen, no byte written — so it can still
+            // be handed to an engine that speaks what the client asked for.
+            Ok(crate::tls::Step::Hello(offer)) => {
+                if offer == crate::tls::Offer::Http2 && self.config.dispatch.is_some() {
+                    conn.hand_off = true;
+                    return;
+                }
                 let Some(config) = self.config.tls.clone() else {
                     self.metrics.core(self.core).tls_handshake_failure();
                     session.kill();
@@ -999,6 +1011,7 @@ impl Worker {
                     conn.phase = Phase::Closing;
                     return;
                 }
+                self.metrics.core(self.core).dispatched_here();
             }
             Ok(crate::tls::Step::Live) => {}
             Err(_) => {
@@ -1217,9 +1230,21 @@ impl Worker {
             return Ok(false);
         };
 
-        // The HTTP/2 connection preface. Detected before parsing so the refusal
-        // names the real reason instead of "unsupported version".
-        if conn.inbox.starts_with(b"PRI * HTTP/2.0") {
+        // The HTTP/2 connection preface, which is the only way h2 arrives
+        // without TLS. Detected before parsing, so with dispatch on it becomes
+        // a handover and without it the refusal names the real reason rather
+        // than "unsupported version".
+        //
+        // The comparison is against what has arrived so far, because a client
+        // can send the preface in pieces: `PRI` alone is already unambiguous —
+        // no HTTP/1.1 method starts with it.
+        if is_h2_preface(&conn.inbox) {
+            if self.config.dispatch.is_some() {
+                conn.hand_off = true;
+                *self.slot(fd) = Slot::Client(conn);
+                self.hand_off(fd)?;
+                return Ok(false);
+            }
             *self.slot(fd) = Slot::Client(conn);
             self.fail(fd, 502, limits::NO_HTTP2, true);
             return Ok(false);
@@ -2266,6 +2291,11 @@ impl Worker {
             return Ok(());
         };
 
+        if conn.hand_off {
+            *self.slot(fd) = Slot::Client(conn);
+            return self.hand_off(fd);
+        }
+
         // Under TLS the bytes that reach the socket are never the bytes the
         // state machine produced, so the plaintext outbox is encrypted here and
         // the session's ciphertext queue is what gets submitted.
@@ -2343,6 +2373,99 @@ impl Worker {
             }
             self.metrics.core(self.core).connection_closed();
             self.close(fd);
+        }
+        Ok(())
+    }
+
+    // ---- engine dispatch ----------------------------------------------------
+
+    /// Give a connection to the other engine, descriptor and all.
+    ///
+    /// # Why this is safe to do to a live descriptor
+    ///
+    /// Because at this point it is not live. The read that produced the
+    /// ClientHello has completed, and the decision was made before `drive` ran,
+    /// so nothing has been submitted since — no read is parked, no write is in
+    /// flight. The reactor holds one-shot registrations only, released when an
+    /// op completes, so with no op outstanding it holds no state for this
+    /// descriptor at all.
+    ///
+    /// The generation is still bumped and the slot still cleared. Not because
+    /// anything is expected to arrive, but because a completion that did arrive
+    /// after the descriptor left would otherwise be delivered against whatever
+    /// number the kernel handed out next — and that is a bug that would only
+    /// show up under load, in production, as one connection reading another's
+    /// bytes.
+    ///
+    /// # What the client sees
+    ///
+    /// Nothing. The socket has had bytes read from it and none written, so
+    /// replaying what was read reconstructs the stream exactly. There is no
+    /// reset and no second handshake: the client's ClientHello is answered
+    /// once, by the engine that can speak what it asked for.
+    fn hand_off(&mut self, fd: RawFd) -> io::Result<()> {
+        let Slot::Client(mut conn) = std::mem::replace(self.slot(fd), Slot::Taken) else {
+            *self.slot(fd) = Slot::Empty;
+            return Ok(());
+        };
+        let Some(sender) = self.config.dispatch.clone() else {
+            // Nowhere to send it, which can only happen if the configuration
+            // changed under us. Closing is the honest answer.
+            conn.phase = Phase::Closing;
+            *self.slot(fd) = Slot::Client(conn);
+            return self.drive(fd);
+        };
+
+        let prefix = match conn.tls.take() {
+            Some(session) => session.into_replay(),
+            // The plaintext lane's handoff: the preface bytes are already in
+            // the inbox, unparsed.
+            None => std::mem::take(&mut conn.inbox),
+        };
+        let scheme = if conn.scheme == "https" {
+            ramjet_proxy::Scheme::Https
+        } else {
+            ramjet_proxy::Scheme::Http
+        };
+        // The port is not knowable from here — this engine keeps the peer's
+        // address, not its socket address — and nothing downstream reads it:
+        // `X-Forwarded-For` and `X-Real-IP` are both the address alone.
+        let remote = SocketAddr::new(conn.peer, 0);
+
+        // The descriptor leaves this reactor's world here. Cleared and bumped
+        // before the send, so there is no window in which both engines believe
+        // they own it.
+        self.bump_generation(fd);
+        *self.slot(fd) = Slot::Empty;
+        // SAFETY: nothing is in flight on this descriptor — see the note above
+        // — and the slot has just been cleared, so this worker will not touch
+        // the number again until the kernel hands it out afresh.
+        let stream = unsafe {
+            <std::net::TcpStream as std::os::fd::FromRawFd>::from_raw_fd(fd)
+        };
+
+        let handoff = ramjet_proxy::Handoff {
+            stream,
+            prefix: bytes::Bytes::from(prefix),
+            remote,
+            scheme,
+        };
+        match sender.send(handoff) {
+            Ok(()) => {
+                self.metrics.core(self.core).dispatched_away();
+                // No longer this engine's connection. The other one counts it
+                // as its own the moment it takes the job, and in dispatch mode
+                // the exposition sums both — so leaving it counted here would
+                // report every handed-over connection twice.
+                self.metrics.core(self.core).connection_closed();
+            }
+            Err(refused) => {
+                // The queue is full or the other engine has stopped. Dropping
+                // the stream closes the socket, which is the only honest answer
+                // to a client this process can no longer serve.
+                drop(refused);
+                self.metrics.core(self.core).connection_closed();
+            }
         }
         Ok(())
     }
@@ -2612,6 +2735,19 @@ impl Worker {
         }
         self.done = done;
     }
+}
+
+/// Whether these bytes are the start of the HTTP/2 connection preface.
+///
+/// A prefix test in both directions: the preface may arrive in pieces, and
+/// `PRI` on its own is already unambiguous — no HTTP/1.1 method begins with it,
+/// which is exactly why RFC 9113 chose it. Waiting for all 24 bytes before
+/// deciding would leave a connection that sent 3 of them looking like a
+/// malformed request instead of an HTTP/2 client.
+fn is_h2_preface(bytes: &[u8]) -> bool {
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    let seen = bytes.len().min(PREFACE.len());
+    seen > 0 && bytes[..seen] == PREFACE[..seen]
 }
 
 /// Encrypt whatever the state machine has queued for the client.
