@@ -56,7 +56,6 @@ pub struct CoreMetrics {
     route_misses: AtomicU64,
     tls_handshakes: AtomicU64,
     tls_handshake_failures: AtomicU64,
-    proxy_headers_rejected: AtomicU64,
     mirrored: AtomicU64,
     mirror_dropped: AtomicU64,
     mirror_skipped: AtomicU64,
@@ -133,11 +132,6 @@ impl CoreMetrics {
     /// A TLS handshake failed, however it failed.
     pub fn tls_handshake_failure(&self) {
         self.tls_handshake_failures.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// A connection was dropped for not carrying a valid PROXY header.
-    pub fn proxy_header_rejected(&self) {
-        self.proxy_headers_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A copy was queued for a mirror backend and accepted by it.

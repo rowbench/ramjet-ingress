@@ -81,8 +81,14 @@ pub struct Config {
     /// [`SniResolver`](ramjet_proxy::SniResolver) the hyper engine uses, so a
     /// certificate published for one engine is published for both.
     pub tls: Option<Arc<rustls::ServerConfig>>,
-    /// Whether listeners expect a PROXY protocol header before anything else.
-    pub proxy_protocol: bool,
+    /// How long a connection has to produce a PROXY protocol header, or `None`
+    /// where listeners expect no header at all.
+    ///
+    /// The deadline is the whole point of it being a duration rather than a
+    /// flag: without one, a sender that opens a connection and dribbles a byte
+    /// a minute holds a descriptor and a slot in the connection gauge
+    /// indefinitely, which is a cheap way to exhaust a data plane.
+    pub proxy_protocol: Option<Duration>,
     /// Admin listener address, or `None` to disable it.
     ///
     /// Served by core 0's reactor rather than a separate runtime, so
@@ -112,7 +118,7 @@ impl Default for Config {
             http: Some(SocketAddr::from(([0, 0, 0, 0], 8080))),
             https: None,
             tls: None,
-            proxy_protocol: false,
+            proxy_protocol: None,
             admin: Some(SocketAddr::from(([0, 0, 0, 0], 10254))),
             workers: None,
             // The same defaults as the hyper engine's `UpstreamConfig`, because

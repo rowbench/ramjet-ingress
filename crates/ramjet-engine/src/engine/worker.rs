@@ -830,13 +830,17 @@ impl Worker {
         self.bump_generation(fd);
         let session = tls.then(|| Box::new(crate::tls::Session::new()));
         let mut conn = Conn::new(peer, session);
-        if self.config.proxy_protocol {
+        conn.deadline = Some(Instant::now() + CLIENT_IDLE);
+        if let Some(timeout) = self.config.proxy_protocol {
             // Before the TLS record layer and before HTTP: the header is the
             // very first thing on the connection, and everything after it —
             // including the ClientHello — belongs to the protocol above.
             conn.preface = Some(Vec::new());
+            // A much shorter clock than the idle one. A load balancer sends the
+            // header in the same segment as the connection; anything taking
+            // seconds over it is not a load balancer.
+            conn.deadline = Some(Instant::now() + timeout);
         }
-        conn.deadline = Some(Instant::now() + CLIENT_IDLE);
         *self.slot(fd) = Slot::Client(Box::new(conn));
         self.metrics.core(self.core).connection_opened();
         self.drive(fd)
@@ -852,8 +856,15 @@ impl Worker {
         conn.reading = false;
         match c.result {
             Ok(n) if n > 0 => {
-                conn.deadline = Some(Instant::now() + CLIENT_IDLE);
                 self.ingest(&mut conn, &buf[..n as usize]);
+                // The idle clock is only restarted once the connection has got
+                // past its PROXY header. Restarting it first would let a sender
+                // dribbling one byte at a time hold a descriptor for as long as
+                // it liked, which is exactly what the header's own deadline is
+                // there to stop.
+                if conn.preface.is_none() {
+                    conn.deadline = Some(Instant::now() + CLIENT_IDLE);
+                }
             }
             Ok(_) => {
                 conn.client_eof = true;
@@ -991,11 +1002,12 @@ impl Worker {
                 }
                 let surplus = preface.get(consumed..).unwrap_or(&[]).to_vec();
                 conn.preface = None;
+                // Off the header's short clock and onto the ordinary idle one.
+                conn.deadline = Some(Instant::now() + CLIENT_IDLE);
                 Preface::Done(surplus)
             }
             Err(error) => {
                 tracing::debug!(%error, peer = %conn.peer, "refused a connection with no valid PROXY header");
-                self.metrics.core(self.core).proxy_header_rejected();
                 conn.outbox.clear();
                 conn.phase = Phase::Closing;
                 conn.client_eof = true;

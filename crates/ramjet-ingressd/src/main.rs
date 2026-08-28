@@ -317,7 +317,7 @@ async fn uring_mode(
         http: args.http,
         https,
         tls,
-        proxy_protocol: args.proxy_protocol,
+        proxy_protocol: args.proxy_protocol.then_some(args.proxy_protocol_timeout),
         admin: args.admin,
         workers: args.worker_threads,
         connect_timeout: args.connect_timeout,
