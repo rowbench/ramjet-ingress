@@ -11,9 +11,9 @@
 //! exercised in production is one nobody has watched work.
 
 use std::io::Read;
-use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Distinguishes one run's scratch directory from another's.
@@ -41,12 +41,48 @@ fn routes_file(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
-/// A port nothing is using, released before it is handed over.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("a listener");
-    let port = listener.local_addr().expect("an address").port();
-    drop(listener);
-    port
+/// The port the daemon actually bound, read out of its startup banner.
+///
+/// The banner is printed after the listeners are up, so a port here means there
+/// is something to connect to. `https` and `http3` are separate labels on
+/// adjacent lines and must not be mistaken for this one, which is why the label
+/// is compared whole rather than by prefix.
+fn banner_http_port(output: &str) -> Option<u16> {
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("http") {
+            continue;
+        }
+        let (_, port) = fields.next()?.rsplit_once(':')?;
+        if let Ok(port) = port.parse() {
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// Drain one of the child's pipes into `into` until it closes.
+///
+/// A thread per pipe rather than reading both after the child exits: this test
+/// has to read the banner *while* the daemon runs, and a single blocking read
+/// would hang past the deadline on a daemon that neither printed nor exited —
+/// which is a failure worth reporting rather than waiting out.
+///
+/// `from_utf8_lossy` per chunk can only split a multi-byte character, and
+/// everything the daemon writes here is ASCII.
+fn drain(mut pipe: impl Read + Send + 'static, into: Arc<Mutex<String>>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => into
+                    .lock()
+                    .expect("the collected output is not poisoned")
+                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+    })
 }
 
 /// Run the daemon until it says something, then stop it.
@@ -62,14 +98,24 @@ fn run_until_serving(engine: &str, unavailable: bool) -> (bool, String) {
     ));
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     let routes = routes_file(&dir);
-    let http = free_port();
 
+    // Port zero, and the daemon reports back what the kernel gave it.
+    //
+    // Asking for a specific port meant guessing one: bind `:0`, read the
+    // number, close the listener, and hand it to a process that binds it a
+    // moment later. Under a full parallel `cargo test` the workspace is opening
+    // ephemeral sockets constantly, and anything that took the number in that
+    // window made the daemon exit with "address already in use" — which this
+    // test reported as "the daemon should be serving", pointing at the daemon
+    // rather than at the guess. Two `free_port()` calls could also collide with
+    // each other and hand the same number to `--http` and `--admin`. Letting
+    // the kernel assign both closes the window rather than narrowing it.
     let mut command = Command::new(env!("CARGO_BIN_EXE_ramjet-ingressd"));
     command
         .arg(format!("--static-routes={}", routes.display()))
-        .arg(format!("--http=127.0.0.1:{http}"))
+        .arg("--http=127.0.0.1:0")
         .arg("--no-https")
-        .arg(format!("--admin=127.0.0.1:{}", free_port()))
+        .arg("--admin=127.0.0.1:0")
         .arg(format!("--engine={engine}"))
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
@@ -81,41 +127,54 @@ fn run_until_serving(engine: &str, unavailable: bool) -> (bool, String) {
     }
 
     let mut child = command.spawn().expect("the daemon started");
+    let output = Arc::new(Mutex::new(String::new()));
+    let readers = [
+        drain(
+            child.stdout.take().expect("stdout is piped"),
+            Arc::clone(&output),
+        ),
+        drain(
+            child.stderr.take().expect("stderr is piped"),
+            Arc::clone(&output),
+        ),
+    ];
 
     // Waiting for the listener rather than for a timer: "has not exited yet" is
     // a weaker claim than "is accepting connections", and it is the second one
     // that says an engine started.
     let deadline = Instant::now() + Duration::from_secs(10);
-    let serving = loop {
-        if child.try_wait().expect("the child is waitable").is_some() {
-            break false;
+    let mut serving = false;
+    loop {
+        let port = banner_http_port(&output.lock().expect("the readers have not panicked"));
+        if let Some(port) = port {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                serving = true;
+                break;
+            }
         }
-        if std::net::TcpStream::connect(("127.0.0.1", http)).is_ok() {
-            break true;
+        if child.try_wait().expect("the child is waitable").is_some() {
+            break;
         }
         if Instant::now() >= deadline {
-            break false;
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
-    };
-
-    if serving {
-        let _ = child.kill();
     }
+
+    // Unconditional, because a child that has already exited is not harmed by
+    // it and one that is serving has to be stopped before its pipes close.
+    let _ = child.kill();
     let _ = child.wait();
-    let alive = serving;
+    for reader in readers {
+        let _ = reader.join();
+    }
 
-    let mut output = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut output);
-    }
-    if let Some(mut stdout) = child.stdout.take() {
-        let mut banner = String::new();
-        let _ = stdout.read_to_string(&mut banner);
-        output.push_str(&banner);
-    }
+    let collected = output
+        .lock()
+        .expect("the readers have not panicked")
+        .clone();
     let _ = std::fs::remove_dir_all(&dir);
-    (alive, output)
+    (serving, collected)
 }
 
 #[test]
