@@ -148,6 +148,12 @@ resources:
     # latency on every request through it, and the request above is what the
     # scheduler actually uses. Memory is limited because the failure mode of a
     # leak is taking the node down with it.
+    #
+    # What this number buys, measured rather than guessed: an idle keep-alive
+    # connection costs about 20 KiB, so 256Mi is roughly twelve thousand of
+    # them. bench/thesis/RESULTS.md's benchmark 4 held 10,000 and peaked at
+    # 200.7 MiB. Size this by the connections a replica will hold, not by the
+    # traffic through it — the request path streams and does not buffer bodies.
     memory: 256Mi
 
 # Longer than controller.shutdownGrace, so the drain is what ends the process.
