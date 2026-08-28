@@ -240,13 +240,16 @@ set nginx.ingress.kubernetes.io/backend-protocol: GRPC on the Ingress\n"
     /// what makes them the ones worth guarding.
     const PARITY_TABLES: [&str; 2] = ["README.md", "docs/src/introduction.md"];
 
+    /// The workspace this crate lives in: two levels up from `crates/*`.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+    }
+
     /// A file from the workspace this crate lives in.
     fn repo_file(relative: &str) -> String {
-        // Two levels up from `crates/ramjet-engine`.
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(relative);
+        let path = repo_root().join(relative);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
     }
@@ -416,9 +419,7 @@ set nginx.ingress.kubernetes.io/backend-protocol: GRPC on the Ingress\n"
     /// "at the time of this measurement it had no TLS" is a true sentence that
     /// has to stay writable.
     fn markdown_files() -> Vec<std::path::PathBuf> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..");
+        let root = repo_root();
         let mut found = vec![root.join("README.md"), root.join("ARCHITECTURE.md")];
         let mut pending = vec![root.join("docs").join("src"), root.join("deploy")];
         while let Some(dir) = pending.pop() {
