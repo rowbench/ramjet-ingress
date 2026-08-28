@@ -8,6 +8,13 @@
 
 use super::test_support::*;
 use super::*;
+use crate::annotations::{
+    ANNOTATION_AUTO_PROMOTE, ANNOTATION_AUTO_PROMOTE_INTERVAL, ANNOTATION_AUTO_PROMOTE_MAX_5XX,
+    ANNOTATION_AUTO_PROMOTE_MAX_LATENCY, ANNOTATION_AUTO_PROMOTE_MIN_REQUESTS,
+    ANNOTATION_AUTO_PROMOTE_STATUS, ANNOTATION_AUTO_PROMOTE_STEPS, ANNOTATION_CANARY,
+    ANNOTATION_CANARY_WEIGHT, ANNOTATION_MIRROR_HOST, ANNOTATION_MIRROR_PERCENT,
+    DEFAULT_PROMOTE_INTERVAL, DEFAULT_PROMOTE_STEPS,
+};
 use crate::config::CONTROLLER_NAME;
 
 fn opts() -> ControllerOpts {
@@ -1326,4 +1333,462 @@ fn the_managed_list_is_what_the_status_writer_needs() {
     let t = compile(&snapshot);
     let names: Vec<String> = t.managed.iter().map(ToString::to_string).collect();
     assert_eq!(names, ["default/a", "default/b"]);
+}
+
+// ---------------------------------------------------------------------------
+// Traffic mirroring
+// ---------------------------------------------------------------------------
+
+/// A cluster with `prod/api` serving `app.example.com/` and a `prod/shadow`
+/// Service standing by, which is the starting point for every mirror test.
+fn mirrorable() -> ClusterSnapshot {
+    let snapshot = backed(base(), "prod", "api", 80, 8080, &["10.0.0.1"]);
+    backed(snapshot, "prod", "shadow", 80, 8080, &["10.0.9.1"])
+}
+
+fn with_mirror(annotations: &[(&str, &str)]) -> ClusterSnapshot {
+    let mut object = ours(ingress(
+        "prod",
+        "web",
+        &[rule(Some("app.example.com"), &[path("/", "Prefix", "api", 80)])],
+    ));
+    for (key, value) in annotations {
+        object = annotate(object, key, value);
+    }
+    mirrorable().with_ingress(object)
+}
+
+/// The mirror on `app.example.com/`, as the compiled table holds it.
+fn compiled_mirror(table: &RouteTable) -> Option<(String, u32, Option<String>)> {
+    let matched = table.match_request("app.example.com", "/")?;
+    let mirror = matched.mirror()?;
+    Some((
+        table.backend(mirror.backend())?.name().to_owned(),
+        mirror.percent(),
+        mirror.host().map(str::to_owned),
+    ))
+}
+
+#[test]
+fn a_mirror_backend_annotation_attaches_a_mirror() {
+    let snapshot = with_mirror(&[(ANNOTATION_MIRROR_BACKEND, "prod/shadow:80")]);
+    let compiled = compile(&snapshot);
+
+    assert_eq!(
+        compiled_mirror(&compiled.config.table),
+        Some(("prod/shadow:80".to_owned(), 100, None)),
+        "an unset percent mirrors everything"
+    );
+    assert!(compiled.warnings.is_empty(), "{:?}", compiled.warnings);
+}
+
+#[test]
+fn the_percent_and_host_annotations_are_carried_through() {
+    let snapshot = with_mirror(&[
+        (ANNOTATION_MIRROR_BACKEND, "prod/shadow:80"),
+        (ANNOTATION_MIRROR_PERCENT, "10"),
+        (ANNOTATION_MIRROR_HOST, "shadow.internal"),
+    ]);
+    let compiled = compile(&snapshot);
+    assert_eq!(
+        compiled_mirror(&compiled.config.table),
+        Some((
+            "prod/shadow:80".to_owned(),
+            10,
+            Some("shadow.internal".to_owned())
+        ))
+    );
+}
+
+#[test]
+fn a_mirror_backend_may_omit_its_namespace() {
+    // A shadow of a service usually lives beside it, and making people write
+    // their own namespace out is a papercut with no upside.
+    let snapshot = with_mirror(&[(ANNOTATION_MIRROR_BACKEND, "shadow:80")]);
+    let compiled = compile(&snapshot);
+    assert_eq!(
+        compiled_mirror(&compiled.config.table).map(|(backend, _, _)| backend),
+        Some("prod/shadow:80".to_owned())
+    );
+}
+
+#[test]
+fn a_mirror_backend_resolves_its_endpoints_like_any_other() {
+    // The whole point of routing it through the normal backend machinery: the
+    // copy goes to a pod, not to a Service VIP.
+    let snapshot = with_mirror(&[(ANNOTATION_MIRROR_BACKEND, "prod/shadow:80")]);
+    let table = compile(&snapshot).config.table;
+    let mirror = table
+        .match_request("app.example.com", "/")
+        .and_then(|m| m.mirror())
+        .expect("a mirror");
+    let backend = table.backend(mirror.backend()).expect("a backend");
+    assert_eq!(
+        backend
+            .endpoints()
+            .iter()
+            .map(|e| e.addr.to_string())
+            .collect::<Vec<_>>(),
+        vec!["10.0.9.1:8080"]
+    );
+}
+
+#[test]
+fn a_percent_of_zero_compiles_to_a_mirror_that_never_fires() {
+    let snapshot = with_mirror(&[
+        (ANNOTATION_MIRROR_BACKEND, "prod/shadow:80"),
+        (ANNOTATION_MIRROR_PERCENT, "0"),
+    ]);
+    let table = compile(&snapshot).config.table;
+    let mirror = table
+        .match_request("app.example.com", "/")
+        .and_then(|m| m.mirror())
+        .expect("the mirror is still attached");
+    assert_eq!(mirror.percent(), 0);
+    assert!((0..100).all(|roll| !mirror.sample(roll)));
+}
+
+#[test]
+fn an_out_of_range_percent_warns_and_mirrors_everything() {
+    let snapshot = with_mirror(&[
+        (ANNOTATION_MIRROR_BACKEND, "prod/shadow:80"),
+        (ANNOTATION_MIRROR_PERCENT, "150"),
+    ]);
+    let compiled = compile(&snapshot);
+    assert_eq!(
+        compiled_mirror(&compiled.config.table).map(|(_, percent, _)| percent),
+        Some(100)
+    );
+    assert_eq!(warnings(&compiled, WarningKind::InvalidAnnotation).len(), 1);
+}
+
+#[test]
+fn a_malformed_mirror_backend_degrades_the_mirror_and_not_the_route() {
+    // A typo in a shadow backend name must never take production traffic down.
+    // That inversion is the single worst thing this feature could do.
+    let snapshot = with_mirror(&[(ANNOTATION_MIRROR_BACKEND, "not-a-reference")]);
+    let compiled = compile(&snapshot);
+
+    assert_eq!(
+        hit(&compiled.config.table, "app.example.com", "/"),
+        Some("prod/api:80".to_owned()),
+        "the route still serves"
+    );
+    assert!(compiled_mirror(&compiled.config.table).is_none());
+    let rejected = warnings(&compiled, WarningKind::MirrorRejected);
+    assert_eq!(rejected.len(), 1);
+    assert!(rejected[0].detail.contains("not-a-reference"));
+}
+
+#[test]
+fn a_mirror_naming_a_missing_service_serves_the_route_and_mirrors_nowhere() {
+    // The Service does not exist, so the backend resolves empty. That is a
+    // normal state during a rollout and must not degrade the route; the data
+    // plane counts the copies it cannot make.
+    let snapshot = with_mirror(&[(ANNOTATION_MIRROR_BACKEND, "prod/ghost:80")]);
+    let compiled = compile(&snapshot);
+
+    assert_eq!(
+        hit(&compiled.config.table, "app.example.com", "/"),
+        Some("prod/api:80".to_owned())
+    );
+    let table = &compiled.config.table;
+    let mirror = table
+        .match_request("app.example.com", "/")
+        .and_then(|m| m.mirror())
+        .expect("the mirror is attached even with no endpoints");
+    assert!(table
+        .backend(mirror.backend())
+        .is_some_and(|b| b.endpoints().is_empty()));
+    assert_eq!(warnings(&compiled, WarningKind::ServiceUnresolved).len(), 1);
+}
+
+#[test]
+fn a_mirror_annotation_on_a_canary_ingress_is_refused_out_loud() {
+    // Silently ignoring it leaves somebody watching a shadow backend that never
+    // receives anything, with no way to find out why.
+    let production = ours(ingress(
+        "prod",
+        "web",
+        &[rule(Some("app.example.com"), &[path("/", "Prefix", "api", 80)])],
+    ));
+    let canary = annotate(
+        annotate(
+            annotate(
+                ours(ingress(
+                    "prod",
+                    "web-canary",
+                    &[rule(Some("app.example.com"), &[path("/", "Prefix", "api", 80)])],
+                )),
+                ANNOTATION_CANARY,
+                "true",
+            ),
+            ANNOTATION_CANARY_WEIGHT,
+            "10",
+        ),
+        ANNOTATION_MIRROR_BACKEND,
+        "prod/shadow:80",
+    );
+    let snapshot = mirrorable()
+        .with_ingress(created_at(production, 1))
+        .with_ingress(created_at(canary, 2));
+
+    let compiled = compile(&snapshot);
+    assert!(
+        compiled_mirror(&compiled.config.table).is_none(),
+        "the canary's mirror annotation must not take effect"
+    );
+    let complaints = warnings(&compiled, WarningKind::InvalidAnnotation);
+    assert!(
+        complaints
+            .iter()
+            .any(|w| w.detail.contains("production Ingress")),
+        "{complaints:?}"
+    );
+}
+
+#[test]
+fn a_mirror_applies_to_every_rule_of_its_ingress() {
+    // The annotations are on the object, so an Ingress with three paths gets
+    // three mirrors rather than one on whichever rule happened to be first.
+    let object = annotate(
+        ours(ingress(
+            "prod",
+            "web",
+            &[rule(
+                Some("app.example.com"),
+                &[
+                    path("/", "Prefix", "api", 80),
+                    path("/v2", "Prefix", "api", 80),
+                ],
+            )],
+        )),
+        ANNOTATION_MIRROR_BACKEND,
+        "prod/shadow:80",
+    );
+    let table = compile(&mirrorable().with_ingress(object)).config.table;
+
+    for path in ["/", "/v2"] {
+        assert!(
+            table
+                .match_request("app.example.com", path)
+                .and_then(|m| m.mirror())
+                .is_some(),
+            "{path} has no mirror"
+        );
+    }
+}
+
+#[test]
+fn a_mirror_changes_the_digest_so_editing_one_republishes() {
+    let without = compile(&with_mirror(&[])).digest;
+    let with = compile(&with_mirror(&[(ANNOTATION_MIRROR_BACKEND, "prod/shadow:80")])).digest;
+    let resampled = compile(&with_mirror(&[
+        (ANNOTATION_MIRROR_BACKEND, "prod/shadow:80"),
+        (ANNOTATION_MIRROR_PERCENT, "50"),
+    ]))
+    .digest;
+
+    assert_ne!(without, with, "adding a mirror is a configuration change");
+    assert_ne!(with, resampled, "resampling one is too");
+}
+
+// ---------------------------------------------------------------------------
+// Automatic promotion candidates
+// ---------------------------------------------------------------------------
+
+/// A production Ingress plus a canary carrying `annotations`.
+fn canary_cluster(annotations: &[(&str, &str)]) -> ClusterSnapshot {
+    let snapshot = backed(base(), "prod", "api", 80, 8080, &["10.0.0.1"]);
+    let snapshot = backed(snapshot, "prod", "api-next", 80, 8080, &["10.0.1.1"]);
+
+    let production = created_at(
+        ours(ingress(
+            "prod",
+            "web",
+            &[rule(Some("app.example.com"), &[path("/", "Prefix", "api", 80)])],
+        )),
+        1,
+    );
+    let mut canary = ours(ingress(
+        "prod",
+        "web-canary",
+        &[rule(
+            Some("app.example.com"),
+            &[path("/", "Prefix", "api-next", 80)],
+        )],
+    ));
+    canary = annotate(canary, ANNOTATION_CANARY, "true");
+    for (key, value) in annotations {
+        canary = annotate(canary, key, value);
+    }
+    snapshot
+        .with_ingress(production)
+        .with_ingress(created_at(canary, 2))
+}
+
+#[test]
+fn a_canary_without_the_opt_in_is_not_a_promotion_candidate() {
+    let compiled = compile(&canary_cluster(&[(ANNOTATION_CANARY_WEIGHT, "10")]));
+    assert!(
+        compiled.config.promotions.is_empty(),
+        "promotion is opt-in and must stay that way"
+    );
+}
+
+#[test]
+fn an_opted_in_canary_is_compiled_into_a_promotion_target() {
+    let compiled = compile(&canary_cluster(&[
+        (ANNOTATION_CANARY_WEIGHT, "5"),
+        (ANNOTATION_AUTO_PROMOTE, "true"),
+    ]));
+
+    assert_eq!(compiled.config.promotions.len(), 1);
+    let target = &compiled.config.promotions[0];
+    assert_eq!(target.ingress.to_string(), "prod/web-canary");
+    assert_eq!(target.weight, 5);
+    assert_eq!(target.policy.steps, DEFAULT_PROMOTE_STEPS);
+    assert_eq!(target.policy.interval, DEFAULT_PROMOTE_INTERVAL);
+    assert_eq!(
+        target.routes,
+        vec![PromotionRoute {
+            host: "app.example.com".to_owned(),
+            path: "/".to_owned(),
+            path_type: PathType::Prefix,
+        }],
+        "the target names the production route, which is where the counters are"
+    );
+}
+
+#[test]
+fn a_promotion_target_carries_every_configured_threshold() {
+    let compiled = compile(&canary_cluster(&[
+        (ANNOTATION_CANARY_WEIGHT, "25"),
+        (ANNOTATION_AUTO_PROMOTE, "true"),
+        (ANNOTATION_AUTO_PROMOTE_INTERVAL, "30s"),
+        (ANNOTATION_AUTO_PROMOTE_STEPS, "25,50,100"),
+        (ANNOTATION_AUTO_PROMOTE_MAX_5XX, "2.5"),
+        (ANNOTATION_AUTO_PROMOTE_MAX_LATENCY, "3"),
+        (ANNOTATION_AUTO_PROMOTE_MIN_REQUESTS, "200"),
+    ]));
+
+    let target = &compiled.config.promotions[0];
+    assert_eq!(target.weight, 25);
+    assert_eq!(target.policy.interval, std::time::Duration::from_secs(30));
+    assert_eq!(target.policy.steps, vec![25, 50, 100]);
+    assert_eq!(target.policy.max_5xx_percent, 2.5);
+    assert_eq!(target.policy.max_latency_factor, 3.0);
+    assert_eq!(target.policy.min_requests, 200);
+}
+
+#[test]
+fn an_orphaned_canary_is_not_a_promotion_candidate() {
+    // It attached to no production route, so there are no counters to judge it
+    // by. Handing it to the loop would mean looking for a route that is not in
+    // the table every interval, forever.
+    let snapshot = backed(base(), "prod", "api-next", 80, 8080, &["10.0.1.1"]);
+    let canary = annotate(
+        annotate(
+            ours(ingress(
+                "prod",
+                "web-canary",
+                &[rule(
+                    Some("nobody.example.com"),
+                    &[path("/", "Prefix", "api-next", 80)],
+                )],
+            )),
+            ANNOTATION_CANARY,
+            "true",
+        ),
+        ANNOTATION_AUTO_PROMOTE,
+        "true",
+    );
+    let compiled = compile(&snapshot.with_ingress(canary));
+
+    assert!(compiled.config.promotions.is_empty());
+    assert_eq!(warnings(&compiled, WarningKind::CanaryOrphan).len(), 1);
+}
+
+#[test]
+fn a_rolled_back_canary_is_still_reported_so_the_loop_can_refuse_it() {
+    // The flap guard lives in the loop, not here: the target has to reach it
+    // carrying the status, or a controller restart would re-arm a canary that
+    // already failed once.
+    let compiled = compile(&canary_cluster(&[
+        (ANNOTATION_AUTO_PROMOTE, "true"),
+        (
+            ANNOTATION_AUTO_PROMOTE_STATUS,
+            "rolled-back: 5xx 9.1% over 1%",
+        ),
+    ]));
+
+    let target = &compiled.config.promotions[0];
+    assert!(target.policy.rolled_back());
+}
+
+#[test]
+fn promotion_annotations_change_the_digest() {
+    // The loop reads its policy off the published generation, so a change
+    // nobody publishes is a change nobody applies.
+    let armed = compile(&canary_cluster(&[
+        (ANNOTATION_CANARY_WEIGHT, "5"),
+        (ANNOTATION_AUTO_PROMOTE, "true"),
+    ]))
+    .digest;
+    let disarmed = compile(&canary_cluster(&[(ANNOTATION_CANARY_WEIGHT, "5")])).digest;
+    let retuned = compile(&canary_cluster(&[
+        (ANNOTATION_CANARY_WEIGHT, "5"),
+        (ANNOTATION_AUTO_PROMOTE, "true"),
+        (ANNOTATION_AUTO_PROMOTE_MAX_5XX, "5"),
+    ]))
+    .digest;
+
+    assert_ne!(armed, disarmed);
+    assert_ne!(armed, retuned);
+}
+
+#[test]
+fn promotion_targets_come_out_in_a_deterministic_order() {
+    // Two replicas must hand their loops the same list, and the plan they are
+    // gathered from is a hash map.
+    let snapshot = backed(base(), "prod", "api", 80, 8080, &["10.0.0.1"]);
+    let snapshot = backed(snapshot, "prod", "api-next", 80, 8080, &["10.0.1.1"]);
+    let mut snapshot = snapshot;
+
+    for (index, name) in ["z-canary", "a-canary", "m-canary"].iter().enumerate() {
+        let host = format!("{name}.example.com");
+        snapshot = snapshot.with_ingress(created_at(
+            ours(ingress(
+                "prod",
+                &format!("web-{name}"),
+                &[rule(Some(&host), &[path("/", "Prefix", "api", 80)])],
+            )),
+            index as i64 * 2,
+        ));
+        let canary = annotate(
+            annotate(
+                ours(ingress(
+                    "prod",
+                    name,
+                    &[rule(Some(&host), &[path("/", "Prefix", "api-next", 80)])],
+                )),
+                ANNOTATION_CANARY,
+                "true",
+            ),
+            ANNOTATION_AUTO_PROMOTE,
+            "true",
+        );
+        snapshot = snapshot.with_ingress(created_at(canary, index as i64 * 2 + 1));
+    }
+
+    let names: Vec<String> = compile(&snapshot)
+        .config
+        .promotions
+        .iter()
+        .map(|t| t.ingress.to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["prod/a-canary", "prod/m-canary", "prod/z-canary"]
+    );
 }

@@ -65,6 +65,7 @@ pub fn spawn(
     let seed = Arc::new(CompiledConfig {
         table: Arc::new(RouteTableBuilder::new().build()?),
         certs: Vec::new(),
+        promotions: Vec::new(),
         digest: 0,
     });
     let (tx, rx) = watch_channel::channel(seed);

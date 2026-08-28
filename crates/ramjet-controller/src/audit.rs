@@ -75,6 +75,12 @@ pub enum AuditReason {
     ConfigPinned,
     /// A pin was released and the newest generation went live.
     ConfigResumed,
+    /// Automatic promotion advanced a canary to its next weight.
+    CanaryStepped,
+    /// A canary reached its last step and is now taking all of the traffic.
+    CanaryPromoted,
+    /// Automatic promotion pulled a canary's weight to zero and disarmed it.
+    CanaryRolledBack,
 }
 
 impl AuditReason {
@@ -84,6 +90,21 @@ impl AuditReason {
             AuditReason::ConfigApplied => "ConfigApplied",
             AuditReason::ConfigPinned => "ConfigPinned",
             AuditReason::ConfigResumed => "ConfigResumed",
+            AuditReason::CanaryStepped => "CanaryStepped",
+            AuditReason::CanaryPromoted => "CanaryPromoted",
+            AuditReason::CanaryRolledBack => "CanaryRolledBack",
+        }
+    }
+
+    /// Whether `kubectl` should show this in yellow.
+    ///
+    /// A rollback is the only one of these an operator needs to find without
+    /// knowing to look for it, and `kubectl describe` sorts and colours by this
+    /// field. Everything else here is a thing going to plan.
+    fn severity(self) -> &'static str {
+        match self {
+            AuditReason::CanaryRolledBack => "Warning",
+            _ => "Normal",
         }
     }
 
@@ -93,6 +114,9 @@ impl AuditReason {
             AuditReason::ConfigApplied => "Publish",
             AuditReason::ConfigPinned => "Rollback",
             AuditReason::ConfigResumed => "Resume",
+            AuditReason::CanaryStepped => "Step",
+            AuditReason::CanaryPromoted => "Promote",
+            AuditReason::CanaryRolledBack => "RollBack",
         }
     }
 }
@@ -272,6 +296,8 @@ impl AuditSink {
             certs_added = diff.certs_added,
             certs_removed = diff.certs_removed,
             certs_rotated = diff.certs_rotated.len(),
+            mirrors_added = diff.mirrors_added.len(),
+            mirrors_removed = diff.mirrors_removed.len(),
             default_backend_changed = diff.default_backend_changed,
             "{summary}"
         );
@@ -281,6 +307,34 @@ impl AuditSink {
         }
         self.event(AuditReason::ConfigApplied, summary);
         self.post(diff.to_json());
+    }
+
+    /// Records one automatic-promotion decision.
+    ///
+    /// The numbers go in the structured fields rather than only in the prose,
+    /// because the question after a rollback is always "on what evidence" and
+    /// the answer has to be greppable a week later. `detail` carries the same
+    /// thing in a sentence, for the Kubernetes Event, where there are no
+    /// fields.
+    pub fn canary(&self, reason: AuditReason, decision: &CanaryDecision<'_>) {
+        info!(
+            target: "audit",
+            event = "canary",
+            action = reason.as_str(),
+            ingress = decision.ingress,
+            from_weight = decision.from_weight,
+            to_weight = decision.to_weight,
+            canary_requests = decision.canary_requests,
+            canary_5xx_percent = decision.canary_5xx_percent,
+            canary_latency_ms = decision.canary_latency_ms,
+            stable_requests = decision.stable_requests,
+            stable_5xx_percent = decision.stable_5xx_percent,
+            stable_latency_ms = decision.stable_latency_ms,
+            "{}",
+            decision.detail
+        );
+        self.event(reason, format!("{}: {}", decision.ingress, decision.detail));
+        self.post(decision.to_json(reason));
     }
 
     /// Records a rollback taking effect.
@@ -330,7 +384,7 @@ impl AuditSink {
                 regarding: Some((*regarding).clone()),
                 reporting_controller: Some(CONTROLLER_NAME.to_owned()),
                 reporting_instance: Some(instance()),
-                type_: Some("Normal".to_owned()),
+                type_: Some(reason.severity().to_owned()),
                 metadata: ObjectMeta {
                     namespace: Some(EVENT_NAMESPACE.to_owned()),
                     name: Some(format!(
@@ -389,6 +443,66 @@ impl AuditSink {
                 ),
             }
         });
+    }
+}
+
+/// One automatic-promotion decision, with the window it was taken on.
+///
+/// Borrowed rather than owned: the caller is holding all of this already, and a
+/// struct of `String`s per interval per canary would be allocation for the sake
+/// of a log line.
+#[derive(Debug, Clone, Copy)]
+pub struct CanaryDecision<'a> {
+    /// `namespace/name` of the canary Ingress.
+    pub ingress: &'a str,
+    /// The weight before this decision.
+    pub from_weight: u32,
+    /// The weight after it.
+    pub to_weight: u32,
+    /// What happened, in a sentence.
+    pub detail: &'a str,
+    /// Canary requests in the window.
+    pub canary_requests: u64,
+    /// Canary 5xx as a percentage of its requests.
+    pub canary_5xx_percent: f64,
+    /// Canary mean upstream latency in the window, in milliseconds.
+    pub canary_latency_ms: f64,
+    /// Stable requests in the window.
+    pub stable_requests: u64,
+    /// Stable 5xx as a percentage of its requests.
+    pub stable_5xx_percent: f64,
+    /// Stable mean upstream latency in the window, in milliseconds.
+    pub stable_latency_ms: f64,
+}
+
+impl CanaryDecision<'_> {
+    /// The webhook payload.
+    ///
+    /// A different shape from [`ConfigDiff::to_json`], on the same URL, tagged
+    /// with `"event"` so a collector can tell them apart without guessing from
+    /// which keys are present. Adding a second shape rather than forcing this
+    /// into the diff's: a promotion is not a configuration change this
+    /// controller compiled, it is one it *caused*, and describing it as a diff
+    /// would misreport where the change came from.
+    fn to_json(self, reason: AuditReason) -> serde_json::Value {
+        serde_json::json!({
+            "event": "canary",
+            "action": reason.as_str(),
+            "ingress": self.ingress,
+            "summary": self.detail,
+            "from_weight": self.from_weight,
+            "to_weight": self.to_weight,
+            "canary": {
+                "requests": self.canary_requests,
+                "errors_5xx_percent": self.canary_5xx_percent,
+                "upstream_latency_ms": self.canary_latency_ms,
+            },
+            "stable": {
+                "requests": self.stable_requests,
+                "errors_5xx_percent": self.stable_5xx_percent,
+                "upstream_latency_ms": self.stable_latency_ms,
+            },
+        })
     }
 }
 

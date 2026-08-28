@@ -30,12 +30,18 @@ use std::sync::Arc;
 use k8s_openapi::api::networking::v1::{Ingress, IngressBackend};
 use kube::ResourceExt;
 use ramjet_router::{
-    BuildError, CanaryRules, CertifiedKeyHandle, PathType, RouteTable, RouteTableBuilder,
+    BuildError, CanaryRules, CertifiedKeyHandle, MirrorRules, PathType, RouteOptions, RouteTable,
+    RouteTableBuilder,
 };
 
-use crate::annotations::CanaryAnnotations;
+use crate::annotations::{
+    CanaryAnnotations, MirrorAnnotations, PromotionAnnotations, ANNOTATION_MIRROR_BACKEND,
+};
 use crate::class::ClassFilter;
-use crate::config::{BackendPort, CertMaterial, CompiledConfig, ControllerOpts, ServiceRef};
+use crate::config::{
+    BackendPort, CertMaterial, CompiledConfig, ControllerOpts, PromotionRoute, PromotionTarget,
+    ServiceRef,
+};
 use crate::digest::Digest;
 use crate::endpoints::{EndpointIndex, ResolveIssue};
 use crate::snapshot::ClusterSnapshot;
@@ -99,6 +105,8 @@ pub enum WarningKind {
     CanaryConflict,
     /// A canary is configured such that it can never divert a request.
     CanaryInert,
+    /// A mirror could not be used and the route is served without it.
+    MirrorRejected,
     /// A referenced TLS Secret is missing or unusable.
     TlsSecret,
     /// Two Ingresses supplied a certificate for the same host.
@@ -192,6 +200,15 @@ struct RoutePlan {
     backend: ServiceRef,
     owner: ObjectKey,
     canary: Option<CanaryPlan>,
+    mirror: Option<MirrorPlan>,
+}
+
+/// A mirror as planned.
+#[derive(Debug, Clone)]
+struct MirrorPlan {
+    backend: ServiceRef,
+    percent: u32,
+    host: Option<String>,
 }
 
 /// A canary as planned.
@@ -289,11 +306,19 @@ pub fn translate(
         &mut warnings,
     );
 
+    // Compiled last, from the same canary Ingresses already partitioned above,
+    // so the promotion loop never has to read the API server itself. Folded
+    // into the digest because editing an `auto-promote` annotation must
+    // republish: the loop reads its policy off the published generation, and a
+    // change nobody publishes is a change nobody applies.
+    let promotions = collect_promotions(&canaries, &routes, &mut digest, &mut warnings);
+
     let content = digest.finish();
     Ok(Translation {
         config: CompiledConfig {
             table: Arc::new(builder.build()?),
             certs,
+            promotions,
             digest: content,
         },
         digest: content,
@@ -357,6 +382,10 @@ fn plan_ingress(
         return;
     };
 
+    // Parsed once per Ingress rather than per rule: the annotations are on the
+    // object, so every route it declares shares one mirror.
+    let mirror = mirror_plan(ingress.annotations(), &namespace, &owner, warnings);
+
     let mut hosts: Vec<Option<String>> = Vec::new();
 
     for rule in spec.rules.as_deref().unwrap_or_default() {
@@ -398,6 +427,7 @@ fn plan_ingress(
                             backend,
                             owner: owner.clone(),
                             canary: None,
+                            mirror: mirror.clone(),
                         },
                     );
                 }
@@ -437,6 +467,7 @@ fn plan_ingress(
             backend: backend.clone(),
             owner: owner.clone(),
             canary: None,
+            mirror: mirror.clone(),
         });
     }
 }
@@ -463,6 +494,18 @@ fn attach_canary(
             owner.clone(),
             WarningKind::CanaryInert,
             "canary has no weight, header, or cookie, so it can never divert a request",
+        ));
+    }
+    // Silently ignoring it would leave somebody watching a shadow backend that
+    // never receives anything, with no way to find out why.
+    if MirrorAnnotations::parse(ingress.annotations()).enabled() {
+        warnings.push(Warning::new(
+            owner.clone(),
+            WarningKind::InvalidAnnotation,
+            format!(
+                "`{ANNOTATION_MIRROR_BACKEND}` on a canary Ingress does nothing; a mirror \
+                 belongs to the route, so put it on the production Ingress"
+            ),
         ));
     }
 
@@ -530,6 +573,12 @@ fn collect_backends(
         set.insert(plan.backend.clone());
         if let Some(canary) = &plan.canary {
             set.insert(canary.backend.clone());
+        }
+        // A mirror backend is resolved exactly like any other, endpoints and
+        // all. Skipping it here would leave the router with a route naming a
+        // backend that was never registered, which fails the whole table.
+        if let Some(mirror) = &plan.mirror {
+            set.insert(mirror.backend.clone());
         }
     }
     if let Some(target) = default_backend {
@@ -634,50 +683,100 @@ fn register_routes(
         digest.u8(path_type_rank(plan.key.path_type));
         digest.str(&backend);
 
-        let outcome = match &plan.canary {
-            None => {
-                digest.u8(0);
-                builder.route(host, path, plan.key.path_type, &backend)
-            }
-            Some(canary) => {
-                let canary_backend = canary.backend.backend_name();
+        // The canary's backend name has to outlive the borrow inside
+        // `CanaryRules`, so it is bound here rather than inside the branch.
+        let canary_backend = plan
+            .canary
+            .as_ref()
+            .map(|canary| canary.backend.backend_name());
+        let mirror_backend = plan
+            .mirror
+            .as_ref()
+            .map(|mirror| mirror.backend.backend_name());
+
+        match (&plan.canary, &canary_backend) {
+            (Some(canary), Some(name)) => {
                 digest.u8(1);
-                digest.str(&canary_backend);
+                digest.str(name);
                 digest.u64(u64::from(canary.rules.weight));
                 digest.u64(u64::from(canary.rules.weight_total));
                 digest.opt_str(canary.rules.header.as_deref());
                 digest.opt_str(canary.rules.header_value.as_deref());
                 digest.opt_str(canary.rules.header_pattern.as_deref());
                 digest.opt_str(canary.rules.cookie.as_deref());
+            }
+            _ => {
+                digest.u8(0);
+            }
+        }
+        match (&plan.mirror, &mirror_backend) {
+            (Some(mirror), Some(name)) => {
+                digest.u8(1);
+                digest.str(name);
+                digest.u64(u64::from(mirror.percent));
+                digest.opt_str(mirror.host.as_deref());
+            }
+            _ => {
+                digest.u8(0);
+            }
+        }
 
-                let rules = CanaryRules {
-                    backend: &canary_backend,
-                    header: canary.rules.header.as_deref(),
-                    header_value: canary.rules.header_value.as_deref(),
-                    header_pattern: canary.rules.header_pattern.as_deref(),
-                    cookie: canary.rules.cookie.as_deref(),
-                    weight: canary.rules.weight,
-                    weight_total: canary.rules.weight_total,
-                };
+        let canary_rules = plan.canary.as_ref().zip(canary_backend.as_deref()).map(
+            |(canary, backend)| CanaryRules {
+                backend,
+                header: canary.rules.header.as_deref(),
+                header_value: canary.rules.header_value.as_deref(),
+                header_pattern: canary.rules.header_pattern.as_deref(),
+                cookie: canary.rules.cookie.as_deref(),
+                weight: canary.rules.weight,
+                weight_total: canary.rules.weight_total,
+            },
+        );
+        let mirror_rules =
+            plan.mirror
+                .as_ref()
+                .zip(mirror_backend.as_deref())
+                .map(|(mirror, backend)| MirrorRules {
+                    backend,
+                    percent: mirror.percent,
+                    host: mirror.host.as_deref(),
+                });
 
-                let attached =
-                    builder.canary_route(host, path, plan.key.path_type, &backend, &rules);
-                match attached {
-                    Ok(()) => Ok(()),
-                    Err(err) => {
-                        // A broken canary must not take the production route
-                        // down with it: that would turn a bad annotation on a
-                        // side Ingress into an outage on the main one.
-                        warnings.push(Warning::new(
-                            canary.owner.clone(),
-                            WarningKind::InvalidRoute,
-                            format!("canary rejected ({err}); serving {} without it", describe(&plan.key)),
-                        ));
-                        builder.route(host, path, plan.key.path_type, &backend)
-                    }
+        let options = RouteOptions {
+            canary: canary_rules,
+            mirror: mirror_rules,
+        };
+        let mut outcome = builder.route_with(host, path, plan.key.path_type, &backend, &options);
+
+        // A broken canary or mirror must not take the production route down
+        // with it: that would turn a bad annotation on a side object into an
+        // outage on the main one. Drop the optional parts, keep the route, and
+        // say which one went.
+        if let Err(err) = &outcome {
+            if let Some(canary) = &plan.canary {
+                if options.canary.is_some() {
+                    warnings.push(Warning::new(
+                        canary.owner.clone(),
+                        WarningKind::InvalidRoute,
+                        format!(
+                            "canary rejected ({err}); serving {} without it",
+                            describe(&plan.key)
+                        ),
+                    ));
                 }
             }
-        };
+            if plan.mirror.is_some() && options.mirror.is_some() {
+                warnings.push(Warning::new(
+                    plan.owner.clone(),
+                    WarningKind::MirrorRejected,
+                    format!(
+                        "mirror rejected ({err}); serving {} without it",
+                        describe(&plan.key)
+                    ),
+                ));
+            }
+            outcome = builder.route(host, path, plan.key.path_type, &backend);
+        }
 
         if let Err(err) = outcome {
             warnings.push(Warning::new(
@@ -825,6 +924,139 @@ fn normalize_host(host: Option<&str>) -> Option<String> {
         return None;
     }
     Some(host.to_ascii_lowercase())
+}
+
+/// Gathers the canary Ingresses that asked to be promoted automatically.
+///
+/// A canary is a candidate only if it actually attached to a production route:
+/// `routes` is consulted so that an orphaned canary — one whose host and path
+/// nothing serves — is not handed to a loop that would then look for counters
+/// belonging to a route that does not exist.
+///
+/// Every rejection here is silent by design except the flap guard, which says
+/// so once. A canary this controller already rolled back is *supposed* to sit
+/// there untouched until a human looks at it, and warning about that every
+/// rebuild would turn the audit trail into noise at exactly the wrong moment.
+fn collect_promotions(
+    canaries: &[(Arc<Ingress>, CanaryAnnotations)],
+    routes: &HashMap<RouteKey, RoutePlan>,
+    digest: &mut Digest,
+    warnings: &mut Vec<Warning>,
+) -> Vec<PromotionTarget> {
+    let mut targets: Vec<PromotionTarget> = Vec::new();
+
+    for (ingress, canary) in canaries {
+        let policy = PromotionAnnotations::parse(ingress.annotations());
+        if !policy.enabled {
+            continue;
+        }
+        let owner = ObjectKey::of(ingress.as_ref());
+        for key in &policy.invalid {
+            warnings.push(Warning::new(
+                owner.clone(),
+                WarningKind::InvalidAnnotation,
+                format!("`{key}` could not be read; automatic promotion is using its default"),
+            ));
+        }
+
+        // The routes this canary actually landed on, in the spelling the
+        // compiled table uses.
+        let mut covered: Vec<PromotionRoute> = routes
+            .values()
+            .filter(|plan| {
+                plan.canary
+                    .as_ref()
+                    .is_some_and(|attached| attached.owner == owner)
+            })
+            .map(|plan| PromotionRoute {
+                host: plan.key.host.clone().unwrap_or_else(|| "*".to_owned()),
+                path: plan.key.path.clone(),
+                path_type: plan.key.path_type,
+            })
+            .collect();
+        if covered.is_empty() {
+            continue;
+        }
+        // Sorted, because the map above is a `HashMap` and this list reaches
+        // the digest.
+        covered.sort_by(|a, b| {
+            (&a.host, &a.path, path_type_rank(a.path_type))
+                .cmp(&(&b.host, &b.path, path_type_rank(b.path_type)))
+        });
+
+        digest.str(&owner.to_string());
+        digest.u64(u64::from(canary.weight));
+        digest.u64(policy.interval.as_secs());
+        digest.u64(policy.min_requests);
+        digest.str(&format!("{:?}", policy.steps));
+        digest.str(&format!("{:.6}", policy.max_5xx_percent));
+        digest.str(&format!("{:.6}", policy.max_latency_factor));
+        digest.opt_str(policy.status.as_deref());
+        for route in &covered {
+            digest.str(&route.host);
+            digest.str(&route.path);
+            digest.u8(path_type_rank(route.path_type));
+        }
+
+        targets.push(PromotionTarget {
+            ingress: owner,
+            routes: covered,
+            weight: canary.weight,
+            policy,
+        });
+    }
+
+    // Deterministic order, so two replicas hand their loops the same list and
+    // the digest is a function of content rather than of iteration.
+    targets.sort_by(|a, b| a.ingress.cmp(&b.ingress));
+    targets
+}
+
+/// Reads the mirror annotations off one Ingress into a plan.
+///
+/// A mirror that cannot be understood degrades to no mirror, with a warning.
+/// The alternative — refusing the Ingress — would let a typo in a shadow
+/// backend name take production traffic down, which is the exact inversion of
+/// what a mirror is for.
+fn mirror_plan(
+    annotations: &BTreeMap<String, String>,
+    namespace: &str,
+    owner: &ObjectKey,
+    warnings: &mut Vec<Warning>,
+) -> Option<MirrorPlan> {
+    let parsed = MirrorAnnotations::parse(annotations);
+    for key in &parsed.invalid {
+        warnings.push(Warning::new(
+            owner.clone(),
+            WarningKind::InvalidAnnotation,
+            format!("`{key}` is not a percentage in 0-100 and was ignored"),
+        ));
+    }
+
+    let reference = parsed.backend.as_deref()?;
+    // `namespace/service:port`, and a bare `service:port` resolved against the
+    // Ingress's own namespace — because a shadow of a service usually lives
+    // beside it, and making people write their own namespace out is a papercut.
+    let qualified = if reference.contains('/') {
+        reference.to_owned()
+    } else {
+        format!("{namespace}/{reference}")
+    };
+    match qualified.parse::<ServiceRef>() {
+        Ok(backend) => Some(MirrorPlan {
+            backend,
+            percent: parsed.percent,
+            host: parsed.host,
+        }),
+        Err(error) => {
+            warnings.push(Warning::new(
+                owner.clone(),
+                WarningKind::MirrorRejected,
+                format!("`{ANNOTATION_MIRROR_BACKEND}: {reference}` is unusable ({error}); serving without a mirror"),
+            ));
+            None
+        }
+    }
 }
 
 /// Reads a backend into a `ServiceRef`.

@@ -37,6 +37,13 @@ type RouteKey = (String, String, &'static str);
 struct RouteTarget {
     backend: String,
     endpoints: usize,
+    /// The mirror, rendered as it will be reported. `None` for no mirror.
+    ///
+    /// A rendered string rather than a struct because every use of it here is a
+    /// comparison and a line of output: a mirror that changed its target, its
+    /// percentage, or its host override is a different mirror, and one `!=`
+    /// covers all three.
+    mirror: Option<String>,
 }
 
 /// The difference between two compiled generations.
@@ -69,6 +76,16 @@ pub struct ConfigDiff {
     pub hosts_added: Vec<String>,
     /// Hosts the table has stopped serving.
     pub hosts_removed: Vec<String>,
+    /// `host path -> backend (N%)`, for mirrors that were not there before.
+    ///
+    /// A mirror that was retargeted, resampled, or given a different host
+    /// override appears in both lists — the old one removed, the new one
+    /// added — for the same reason a route whose path type changed does: it is
+    /// not the same mirror any more, and reporting it as an edit would hide
+    /// which half moved.
+    pub mirrors_added: Vec<String>,
+    /// `host path -> backend (N%)`, for mirrors that have gone.
+    pub mirrors_removed: Vec<String>,
     /// Whether the backend answering unmatched requests changed.
     pub default_backend_changed: bool,
     /// The backend now answering unmatched requests, if there is one.
@@ -107,10 +124,25 @@ impl ConfigDiff {
                 }
                 Some(_) => {}
             }
+            // Independent of the arms above: a route can keep its backend and
+            // its endpoint count and still gain or lose a shadow, and that is a
+            // change somebody wants to see.
+            let had = before.get(key).and_then(|was| was.mirror.as_deref());
+            if had != target.mirror.as_deref() {
+                if let Some(now) = &target.mirror {
+                    diff.mirrors_added.push(format!("{} {} -> {now}", key.0, key.1));
+                }
+                if let Some(was) = had {
+                    diff.mirrors_removed.push(format!("{} {} -> {was}", key.0, key.1));
+                }
+            }
         }
         for (key, target) in &before {
             if !after.contains_key(key) {
                 diff.routes_removed.push(describe(key, target));
+                if let Some(was) = &target.mirror {
+                    diff.mirrors_removed.push(format!("{} {} -> {was}", key.0, key.1));
+                }
             }
         }
 
@@ -148,6 +180,8 @@ impl ConfigDiff {
         diff.certs_rotated.sort();
         diff.hosts_added.sort();
         diff.hosts_removed.sort();
+        diff.mirrors_added.sort();
+        diff.mirrors_removed.sort();
         diff
     }
 
@@ -163,6 +197,8 @@ impl ConfigDiff {
             && self.certs_rotated.is_empty()
             && self.hosts_added.is_empty()
             && self.hosts_removed.is_empty()
+            && self.mirrors_added.is_empty()
+            && self.mirrors_removed.is_empty()
             && !self.default_backend_changed
     }
 
@@ -184,6 +220,12 @@ impl ConfigDiff {
             ),
             (self.hosts_added.len(), "host added", "hosts added"),
             (self.hosts_removed.len(), "host removed", "hosts removed"),
+            (self.mirrors_added.len(), "mirror added", "mirrors added"),
+            (
+                self.mirrors_removed.len(),
+                "mirror removed",
+                "mirrors removed",
+            ),
         ] {
             if count > 0 {
                 parts.push(format!(
@@ -239,6 +281,13 @@ impl ConfigDiff {
     /// that a terminal UI and whatever an operator points `--audit-webhook` at
     /// both parse, and a derive would let an innocent field rename change the
     /// wire format without anybody deciding to.
+    ///
+    /// **Extending it is additive only.** A consumer that has never heard of
+    /// `mirrors_added` ignores it; one that has, gets it. Renaming or removing
+    /// a key here breaks whatever is on the other end of a webhook nobody in
+    /// this repository can see, so the exact-key test below is deliberately
+    /// annoying to update — it exists to make the decision explicit rather than
+    /// to prevent it.
     pub fn to_json(&self) -> Value {
         json!({
             "summary": self.summary(),
@@ -248,6 +297,8 @@ impl ConfigDiff {
             "certs_rotated": self.certs_rotated,
             "hosts_added": self.hosts_added,
             "hosts_removed": self.hosts_removed,
+            "mirrors_added": self.mirrors_added,
+            "mirrors_removed": self.mirrors_removed,
         })
     }
 }
@@ -273,6 +324,17 @@ fn routes_of(table: Option<&RouteTable>) -> BTreeMap<RouteKey, RouteTarget> {
                 RouteTarget {
                     backend: backend.map_or_else(String::new, |b| b.name().to_owned()),
                     endpoints: backend.map_or(0, |b| b.endpoints().len()),
+                    mirror: rule.mirror().map(|mirror| {
+                        let target = table
+                            .backend(mirror.backend())
+                            .map_or("", ramjet_router::Backend::name);
+                        match mirror.host() {
+                            Some(host) => {
+                                format!("{target} ({}%, host {host})", mirror.percent())
+                            }
+                            None => format!("{target} ({}%)", mirror.percent()),
+                        }
+                    }),
                 },
             )
         })
@@ -552,6 +614,12 @@ mod tests {
                 "certs_rotated",
                 "hosts_added",
                 "hosts_removed",
+                // Added with traffic mirroring, deliberately: the shape is a
+                // published contract, extending it is additive, and a consumer
+                // that has never heard of these two keys ignores them. Removing
+                // or renaming any key in this list is a different decision.
+                "mirrors_added",
+                "mirrors_removed",
                 "routes_added",
                 "routes_removed",
                 "summary",
@@ -560,6 +628,124 @@ mod tests {
         );
         assert_eq!(value["routes_added"][0], "example.com / -> prod/api:80");
         assert!(value["summary"].as_str().is_some_and(|s| s.contains("gen")));
+    }
+
+    /// A one-route table whose route mirrors to `shadow` at `percent`.
+    fn with_mirror(percent: u32, host: Option<&str>) -> RouteTable {
+        let mut builder = RouteTableBuilder::new();
+        builder
+            .backend("prod/api:80", LbPolicy::RoundRobin, endpoints(1))
+            .expect("registers");
+        builder
+            .backend("prod/shadow:80", LbPolicy::RoundRobin, endpoints(1))
+            .expect("registers");
+        builder
+            .route_with(
+                Some("example.com"),
+                "/",
+                PathType::Prefix,
+                "prod/api:80",
+                &ramjet_router::RouteOptions {
+                    mirror: Some(ramjet_router::MirrorRules {
+                        backend: "prod/shadow:80",
+                        percent,
+                        host,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("drafts");
+        builder.build().expect("builds")
+    }
+
+    #[test]
+    fn a_new_mirror_is_an_addition_and_not_a_backend_change() {
+        // The route still sends where it sent. What changed is that a copy now
+        // goes somewhere else, and a diff that reported it as a backend change
+        // would be describing the wrong thing entirely.
+        let before = table("example.com", "/", "prod/api:80", 1);
+        let after = with_mirror(100, None);
+
+        let diff = ConfigDiff::compute(Some(&before), &after);
+        assert_eq!(
+            diff.mirrors_added,
+            vec!["example.com / -> prod/shadow:80 (100%)"]
+        );
+        assert!(diff.mirrors_removed.is_empty());
+        assert!(diff.routes_added.is_empty());
+        assert!(
+            diff.backends_changed.is_empty(),
+            "the primary backend did not move: {:?}",
+            diff.backends_changed
+        );
+        assert_eq!(diff.summary(), "1 mirror added (gen 0\u{2192}0)");
+    }
+
+    #[test]
+    fn a_removed_mirror_is_reported_with_what_it_was() {
+        let before = with_mirror(50, None);
+        let after = table("example.com", "/", "prod/api:80", 1);
+
+        let diff = ConfigDiff::compute(Some(&before), &after);
+        assert_eq!(
+            diff.mirrors_removed,
+            vec!["example.com / -> prod/shadow:80 (50%)"]
+        );
+        assert!(diff.mirrors_added.is_empty());
+        assert_eq!(diff.summary(), "1 mirror removed (gen 0\u{2192}0)");
+    }
+
+    #[test]
+    fn a_resampled_mirror_is_a_removal_and_an_addition() {
+        // Same argument as a route whose path type changed: it is not the same
+        // mirror any more, and one "edited" line would hide which half moved.
+        let before = with_mirror(10, None);
+        let after = with_mirror(50, None);
+
+        let diff = ConfigDiff::compute(Some(&before), &after);
+        assert_eq!(
+            diff.mirrors_added,
+            vec!["example.com / -> prod/shadow:80 (50%)"]
+        );
+        assert_eq!(
+            diff.mirrors_removed,
+            vec!["example.com / -> prod/shadow:80 (10%)"]
+        );
+        assert!(!diff.is_empty());
+    }
+
+    #[test]
+    fn a_changed_host_override_is_visible() {
+        let before = with_mirror(100, None);
+        let after = with_mirror(100, Some("shadow.internal"));
+
+        let diff = ConfigDiff::compute(Some(&before), &after);
+        assert_eq!(
+            diff.mirrors_added,
+            vec!["example.com / -> prod/shadow:80 (100%, host shadow.internal)"]
+        );
+        assert_eq!(diff.mirrors_removed.len(), 1);
+    }
+
+    #[test]
+    fn an_unchanged_mirror_produces_no_diff_at_all() {
+        let before = with_mirror(25, Some("shadow.internal"));
+        let after = with_mirror(25, Some("shadow.internal"));
+        assert!(ConfigDiff::compute(Some(&before), &after).is_empty());
+    }
+
+    #[test]
+    fn deleting_a_mirrored_route_reports_both_losses() {
+        let before = with_mirror(100, None);
+        let after = RouteTableBuilder::new().build().expect("builds");
+
+        let diff = ConfigDiff::compute(Some(&before), &after);
+        assert_eq!(diff.routes_removed.len(), 1);
+        assert_eq!(
+            diff.mirrors_removed,
+            vec!["example.com / -> prod/shadow:80 (100%)"],
+            "a mirror that went away with its route still went away"
+        );
     }
 
     #[test]

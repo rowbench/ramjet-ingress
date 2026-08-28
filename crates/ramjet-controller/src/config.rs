@@ -4,7 +4,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ramjet_router::{LbPolicy, RouteTable};
+use ramjet_router::{LbPolicy, PathType, RouteTable};
+
+use crate::annotations::PromotionAnnotations;
+use crate::translate::ObjectKey;
 
 /// The `spec.controller` value of the `IngressClass` objects we answer to.
 ///
@@ -69,6 +72,15 @@ pub struct CompiledConfig {
     /// Certificate material referenced by `table.tls()`, deduplicated by
     /// [`handle_id`](CertMaterial::handle_id).
     pub certs: Vec<CertMaterial>,
+    /// Canary Ingresses that asked to be promoted automatically.
+    ///
+    /// Compiled here rather than listed from the API server every interval,
+    /// because the controller has already read every Ingress and parsed every
+    /// annotation on it — and because a promotion loop that issued its own
+    /// `list` would cost a cluster-wide read per minute forever, on every
+    /// installation, whether or not anybody uses the feature. Nobody opted in
+    /// means this is empty and the loop does nothing at all.
+    pub promotions: Vec<PromotionTarget>,
     /// Content hash of everything above, excluding the generation number.
     ///
     /// The rebuild loop uses it to suppress a publish that would change
@@ -78,6 +90,40 @@ pub struct CompiledConfig {
     /// numbers they happen to have reached, and that is the only way to tell
     /// them apart from two replicas that have diverged.
     pub digest: u64,
+}
+
+/// One production route a canary shadows, as the data plane will have compiled
+/// it.
+///
+/// Enough to find the route's counters in the serving table and no more: the
+/// promotion loop reads statistics, it does not route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotionRoute {
+    /// Host as the table reports it — `example.com`, `*.example.com`, or `*`.
+    pub host: String,
+    /// The rule's path, as configured.
+    pub path: String,
+    /// How the path is compared.
+    pub path_type: PathType,
+}
+
+/// A canary Ingress that opted into automatic promotion.
+///
+/// The *Ingress* is the unit, not the route, because `canary-weight` is one
+/// annotation on one object: every rule it declares moves together whatever the
+/// loop decides, so they are evaluated together too. Their windows are summed —
+/// they share a backend and a weight, so a per-route verdict could only ever
+/// disagree with itself about which number to write.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromotionTarget {
+    /// The canary Ingress to patch.
+    pub ingress: ObjectKey,
+    /// The production routes it shadows.
+    pub routes: Vec<PromotionRoute>,
+    /// The weight it is currently set to, from `canary-weight`.
+    pub weight: u32,
+    /// Thresholds, steps, and the status this controller last wrote.
+    pub policy: PromotionAnnotations,
 }
 
 /// A `Service` port as an Ingress backend named it: by number or by name.
