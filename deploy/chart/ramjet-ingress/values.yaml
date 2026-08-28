@@ -77,6 +77,33 @@ controller:
   # terminationGracePeriodSeconds so the drain finishes before the kill.
   shutdownGrace: 30
 
+  # Compiled generations kept in memory for /admin/generations and for
+  # POST /admin/rollback, which republishes one of them instantly.
+  #
+  # Each kept generation holds its route table and its parsed certificates
+  # alive — roughly a hundred bytes per route, with certificates shared between
+  # generations that did not rotate them — so ten of a ten-thousand route
+  # cluster is a few megabytes. Raise it where deploys are frequent enough that
+  # ten is less than an afternoon.
+  #
+  # A rollback is an emergency brake and not desired state: it lives in one
+  # replica's memory and does not survive a restart, because after a restart
+  # Kubernetes is the source of truth again.
+  historySize: 10
+
+  # POST the semantic diff of every published generation to this URL.
+  #
+  # Fire-and-forget: one attempt, a 5s timeout, failures logged and never
+  # blocking a publish — the same record is already in the log, in a Kubernetes
+  # Event, and in /admin/generations, so a delivery system with retries and
+  # backoff would be a thing to debug during exactly the incidents this exists
+  # to describe.
+  #
+  # http:// only. An https:// URL is refused at startup rather than downgraded,
+  # because the control plane deliberately carries no TLS client for this;
+  # point it at a collector inside the cluster.
+  auditWebhook: ""
+
   # Anything not covered above. Appended verbatim after the generated flags,
   # and a flag always beats its environment twin.
   extraArgs: []

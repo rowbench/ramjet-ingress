@@ -11,11 +11,18 @@ because a specific piece of the controller cannot run without it:
   secrets              TLS material, filtered server-side to type=kubernetes.io/tls
   endpointslices       the actual pod addresses behind each backend
   ingresses/status     status writeback, as a server-side-apply patch
+  events               the audit trail: one Event on the IngressClass per
+                       published generation, per rollback, and per resume, so
+                       `kubectl describe ingressclass` answers what this
+                       controller has been doing. Cluster-scoped objects get
+                       their Events in `default`, which is why this is not
+                       namespaced. Take it away and the Events are skipped at
+                       debug level; nothing else changes.
 
 Notably absent: pods (endpoints come from EndpointSlice, not from listing
-pods), events (the controller logs rather than emitting events), nodes,
-configmaps, and any write verb on anything except the status subresource. The
-controller creates nothing and deletes nothing.
+pods), nodes, configmaps, and any write verb on anything except the status
+subresource and Events. The controller creates nothing else and deletes
+nothing.
 */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -72,6 +79,16 @@ rules:
       - get
       - list
       - watch
+  # `patch` alongside `create` because the Events API's own aggregation path
+  # updates an existing Event rather than writing a new one, and a rule that
+  # only allowed `create` would work right up until it did not.
+  - apiGroups:
+      - events.k8s.io
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

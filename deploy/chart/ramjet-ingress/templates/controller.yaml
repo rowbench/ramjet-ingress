@@ -105,6 +105,10 @@ spec:
             - --response-timeout={{ .Values.controller.responseTimeout }}
             - --max-connect-attempts={{ .Values.controller.maxConnectAttempts }}
             - --shutdown-grace={{ .Values.controller.shutdownGrace }}
+            - --history-size={{ .Values.controller.historySize }}
+            {{- with .Values.controller.auditWebhook }}
+            - --audit-webhook={{ . }}
+            {{- end }}
             {{- with .Values.controller.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

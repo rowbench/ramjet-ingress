@@ -193,9 +193,15 @@ internet, which is a way to tell an attacker your request rate.
 `/metrics` exposes `ramjet_requests_total`, `ramjet_route_misses_total`,
 `ramjet_active_connections`, `ramjet_upstream_latency_seconds`,
 `ramjet_upstream_{connect_failures,timeouts,retries}_total`,
-`ramjet_tls_handshakes_total`, `ramjet_tls_handshake_failures_total`, and
+`ramjet_tls_handshakes_total`, `ramjet_tls_handshake_failures_total`,
 `ramjet_route_table_generation` — the last of which is how you tell whether a
-replica is actually serving the configuration you think it is.
+replica is actually serving the configuration you think it is — and
+`ramjet_pinned`, which says whether that is the case because somebody pulled the
+emergency brake.
+
+The admin listener also serves a small JSON API: `/admin/generations`,
+`/admin/routes`, and `/admin/rollback`. See
+[Time travel and the audit trail](#time-travel-and-the-audit-trail).
 
 Logs go through `tracing` to stderr, `info` by default, filtered with
 `RUST_LOG`. The lines worth alerting on are the per-generation publish record
@@ -214,6 +220,150 @@ The reverse direction is wired too: if the control plane stops on its own, the
 daemon drains and exits non-zero rather than continuing to serve a table that
 can never change again. A replica that has quietly stopped being an ingress
 controller should show up in `kubectl get pods`, not in a support ticket.
+
+## Time travel and the audit trail
+
+The thesis says a configuration change is one pointer store. Two things follow
+that ingress-nginx cannot offer, and this section is both of them.
+
+### The emergency brake
+
+If publishing a generation is a pointer store, republishing an old one is the
+same pointer store. So the daemon keeps the last N applied generations —
+default 10, `--history-size` — and `POST /admin/rollback {"generation": G}`
+puts G back on the wire.
+
+It costs what a normal configuration change costs, and it works when the API
+server is the thing that is wrong. Every alternative route to the same
+outcome — re-applying the previous Ingress objects, `kubectl rollout undo`,
+waiting for a controller to recompile — goes back through the control plane,
+which is exactly the component an operator reaches for this lever to route
+around.
+
+**A rollback is a pin, not a rewind.** The controller does not stop. It keeps
+watching, keeps compiling, and keeps handing generations over; they are recorded
+with `published: false` so an operator can see what is being held back, and
+nothing reaches the data plane until `DELETE /admin/rollback`, which immediately
+publishes the newest one — not the one that was pinned over. Draining the
+controller's side matters more than it looks: a pin that stopped reading the
+channel would block the rebuild loop, and releasing it would then jump to
+whatever was stuck there rather than to the current state of the cluster.
+
+A pinned generation's **certificates go back with its table**, in the same
+certificates-then-table order as a first publish, because a table whose `SniMap`
+ids are not in the store fails every handshake for the width of the gap.
+
+**The pin dies with the process,** deliberately. Kubernetes is the source of
+truth for what this controller serves; a pin is a local override of that, held
+in memory, by one replica, because something is on fire right now. Persisting it
+would create a second source of truth that survives a restart and answers to
+nobody — a pod that comes back after an eviction still serving a generation from
+last Tuesday, with no object in the cluster saying why. Fix the Ingress objects,
+then release the pin. `ramjet_pinned` is 1 the whole time, so a replica frozen on
+purpose is distinguishable from one whose control plane has died.
+
+The memory cost is the tables themselves: the ring holds each generation's
+`Arc<RouteTable>` and parsed keys alive instead of letting them drop. That is
+roughly a hundred bytes per route per generation, and successive generations
+share every `Arc` that did not change — most importantly the certificates, which
+are content-addressed and therefore shared by id. Ten generations of a
+ten-thousand route cluster is a few megabytes.
+
+The history records generations this replica *applied*, which is not quite every
+generation the controller compiled: the channel between them carries the latest
+value rather than a queue, so publishes closer together than one pass of the
+applier coalesce. A gap in the numbering is generations that were never on the
+wire.
+
+`--static-routes` gets the same endpoints with one generation in the ring.
+Nothing is special-cased for it.
+
+### What changed, in words
+
+A digest tells you *that* configuration changed, which is all the rebuild loop
+needs. It cannot answer the question somebody actually asks, which is *what*
+changed. So every publish is diffed against the previous compiled generation:
+routes added and removed, routes whose backend or endpoint count moved, hosts
+gained and lost, hosts whose certificate material rotated, and a changed default
+backend.
+
+The diff is taken over the two **compiled tables**, not over the API objects,
+and that is what makes it useful. An Ingress edited from `Prefix: /foo` to
+`Prefix: /foo/` compiles to the same route and does not appear; a Deployment
+scaling from three pods to five changes no Ingress at all and does. It is a pure
+function of two `RouteTable`s, so every category has a unit test built from
+tables constructed in memory.
+
+Each publish is written down three ways, for three different readers:
+
+- a **structured `tracing` event on the `audit` target**, so a log pipeline can
+  filter to configuration changes and nothing else;
+- a **Kubernetes Event on the `IngressClass`** — reason `ConfigApplied`,
+  `ConfigPinned`, or `ConfigResumed`, message `"3 routes added, 1 cert rotated
+  (gen 41→42)"` — so `kubectl describe ingressclass` answers "what has this
+  controller been doing" without pod-log access. Events are written directly
+  rather than through kube's `Recorder`, which aggregates same-reason events for
+  six minutes and keeps the *first* note: three deploys in a minute would become
+  "ConfigApplied ×3" showing only what the first one did, which is precisely the
+  information an audit trail exists to keep. RBAC: `events.k8s.io`/`events`,
+  `create` and `patch`; without it the Events are skipped at `debug` and nothing
+  else changes.
+- an optional **`--audit-webhook <url>`**, one fire-and-forget POST of the diff
+  as JSON, five second timeout, failures logged. It does not retry, because it
+  is a copy and not the record — the log line, the Event, and the ring all
+  already have it, and a delivery system with queues and backoff would be a
+  thing to debug during exactly the incidents it exists to describe. `http://`
+  only; an `https://` URL is refused at startup rather than silently downgraded.
+
+### Per-route counters, and where they are *not*
+
+Each route carries request, 5xx, and upstream-latency counters. They survive a
+rebuild the same way load-balancer state does — by identity, not by position —
+so adding one Ingress does not reset every neighbour's numbers. A route's
+identity is its host, path, path type, and backend; change the backend and it is
+a different route for accounting purposes, because its latency is no longer
+comparable to what came before.
+
+The hot path pays four relaxed atomic adds to one cache-line-aligned block,
+reached by an index the matched rule already carries — no map, no label set, and
+no `Arc` clone, because the counters are read through the snapshot the request
+already loaded. Measured on the 10,001-route benchmark table
+(`cargo bench -p ramjet-router -- route_stats`), the whole per-request sequence
+— resolve the block, pick the shard, record a response and an upstream latency —
+is **4.9 ns**, against ~24 us for the forwarded request it describes. Matching
+and then counting is 26.0 ns where matching alone is 25.2 ns.
+
+Each route has `ROUTE_STAT_SHARDS` (4) of those blocks and a serving runtime
+writes only to its own, so a single hot route's counters do not become a
+contended line across cores. Four rather than one-per-core because the memory is
+`routes × shards × 128` bytes and the coherence win flattens quickly: a
+ten-thousand route table costs 5 MB at this number whether the pod has two cores
+or ninety-six.
+
+**Per-route data is served as JSON on `/admin/routes` and is never a labelled
+Prometheus series.** ingress-nginx exports them, and it is the single most
+common reason its metrics endpoint becomes the most expensive request the pod
+serves: ten thousand routes means ten thousand series on every scrape, forever,
+whether or not anybody looks. `/metrics` gained exactly one series here, and it
+is a gauge with no labels.
+
+### The admin API
+
+On the admin listener only (`:10254`), which the chart exposes through a
+ClusterIP Service and never through an Ingress or a LoadBalancer.
+
+| Endpoint | What it answers |
+|---|---|
+| `GET /admin/generations` | every generation applied, newest first, with its diff, digest, counts, and whether it went live |
+| `GET /admin/routes` | every route in the serving table, with its counters and its canary split |
+| `POST /admin/rollback` | pin a generation. `404` if it is not in the ring, `409` if something is already pinned — and the body says what |
+| `DELETE /admin/rollback` | release the pin and publish the newest generation. Idempotent |
+
+There is no authentication and there is not going to be: anything that can reach
+this port can already reach the pod's ServiceAccount token. What *is* enforced is
+the shape — the mutating endpoint answers to `POST` and `DELETE` and nothing
+else, so a link, a browser prefetch, a scraper following URLs, or a health
+checker walking paths cannot roll a cluster back by accident.
 
 ### Dev mode
 

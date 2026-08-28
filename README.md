@@ -77,8 +77,25 @@ cargo run -p ramjet-ingressd -- --static-routes crates/ramjet-ingressd/examples/
 ```
 
 Listeners default to `:8080` plaintext, `:8443` TLS, and `:10254` admin
-(`/metrics`, `/healthz`, `/readyz`). `--help` lists every option; each one has
+(`/metrics`, `/healthz`, `/readyz`, and a small JSON API: `/admin/generations`,
+`/admin/routes`, `/admin/rollback`). `--help` lists every option; each one has
 an environment twin, and a flag always beats the environment.
+
+The admin API is where the anti-reload thesis pays out twice. Because publishing
+a configuration is one pointer store, republishing an old one is the same
+pointer store:
+
+```sh
+curl :10254/admin/generations                                   # what has been applied, and what changed
+curl -XPOST :10254/admin/rollback -d '{"generation": 41}'       # put 41 back on the wire, now
+curl -XDELETE :10254/admin/rollback                             # release, and jump to the newest
+curl :10254/admin/routes                                        # per-route requests, 5xx, upstream latency
+```
+
+A rollback is an emergency brake and not desired state: it lives in one
+replica's memory, the controller keeps compiling behind it, and it does not
+survive a restart — after which Kubernetes is the source of truth again. See
+[ARCHITECTURE.md](ARCHITECTURE.md#time-travel-and-the-audit-trail).
 
 ## Watching it live
 

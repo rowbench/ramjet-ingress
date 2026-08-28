@@ -480,6 +480,19 @@ else
   fail "metrics: requests_total=$REQ_TOTAL generation=${GENERATION:-<absent>}"
 fi
 
+# 7. Per-route counters: the same traffic, attributed to the route that served
+#    it. Read-only, over the admin tunnel that is already open — this asserts
+#    the JSON API is wired to the request path, and deliberately does not
+#    exercise /admin/rollback, which mutates what the pod is serving and would
+#    make every assertion above it depend on the order they run in.
+ROUTES="$(curl -s -m 5 "http://127.0.0.1:$ADMIN_PORT/admin/routes" || true)"
+ROUTE_REQS="$(sed -n 's/.*"host":"'"$HOST"'"[^}]*"requests_total":\([0-9]*\).*/\1/p' <<<"$ROUTES")"
+if [[ -n "$ROUTE_REQS" ]] && (( ROUTE_REQS > 0 )); then
+  pass "per-route stats: /admin/routes counted $ROUTE_REQS requests for $HOST"
+else
+  fail "per-route stats: no counted requests for $HOST in /admin/routes"
+fi
+
 # ----------------------------------------------------------------- summary ---
 
 step "Summary"

@@ -101,6 +101,16 @@ rules:
       - get
       - list
       - watch
+  # `patch` alongside `create` because the Events API's own aggregation path
+  # updates an existing Event rather than writing a new one, and a rule that
+  # only allowed `create` would work right up until it did not.
+  - apiGroups:
+      - events.k8s.io
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
 ---
 # Source: ramjet-ingress/templates/rbac.yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -269,6 +279,7 @@ spec:
             - --response-timeout=60
             - --max-connect-attempts=3
             - --shutdown-grace=30
+            - --history-size=10
           env:
             - name: RUST_LOG
               value: "info,kube=warn"
