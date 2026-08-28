@@ -72,8 +72,10 @@
 #![deny(missing_docs)]
 
 mod annotations;
+mod audit;
 mod class;
 mod config;
+mod diff;
 mod digest;
 mod endpoints;
 mod snapshot;
@@ -88,11 +90,13 @@ pub use annotations::{
     ANNOTATION_CANARY_BY_HEADER_VALUE, ANNOTATION_CANARY_WEIGHT,
     ANNOTATION_CANARY_WEIGHT_TOTAL, ANNOTATION_IS_DEFAULT_CLASS, ANNOTATION_LEGACY_CLASS,
 };
+pub use audit::{AuditReason, AuditSink, WebhookError};
 pub use class::ClassFilter;
 pub use config::{
     BackendPort, CertMaterial, CompiledConfig, ControllerOpts, ServiceRef, ServiceRefError,
     CONTROLLER_NAME, FIELD_MANAGER,
 };
+pub use diff::ConfigDiff;
 pub use snapshot::ClusterSnapshot;
 pub use translate::{translate, ObjectKey, Translation, Warning, WarningKind};
 pub use watch::spawn;

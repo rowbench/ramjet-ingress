@@ -68,7 +68,9 @@ use http::{Request, Response, StatusCode, Version};
 use hyper::body::Incoming;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
-use ramjet_router::{select_endpoint, Backend, RouteTable, SharedRouteTable};
+use ramjet_router::{
+    select_endpoint, Backend, RouteCounters, RouteTable, SharedRouteTable,
+};
 
 use crate::body::ProxyBody;
 use crate::headers;
@@ -117,6 +119,13 @@ pub struct ProxyState {
     pub upstream: Upstream,
     /// Data-plane counters.
     pub metrics: Arc<Metrics>,
+    /// Which per-route counter block this serving runtime writes to.
+    ///
+    /// One per runtime, so two cores never contend on the same cache line for
+    /// the same route; see [`RouteStats`](ramjet_router::RouteStats). The
+    /// remainder against the shard count is taken inside the router, so this
+    /// is just the runtime's index.
+    pub shard: usize,
 }
 
 /// Per-connection facts that every request on it inherits.
@@ -147,11 +156,44 @@ async fn forward(
     // The one and only snapshot load. Everything below borrows from it.
     let snapshot = state.routes.load_full();
 
-    let Some(backend) = select_backend(&snapshot, &request) else {
+    let Some(matched) = select_backend(&snapshot, &request) else {
         state.metrics.record_route_miss();
         return static_response(StatusCode::NOT_FOUND, BODY_NO_ROUTE);
     };
 
+    // Resolved once, here, and passed down as a plain reference into the
+    // snapshot this request is already holding. That is the whole per-route
+    // accounting cost on the request path: one indexed load now, and a handful
+    // of relaxed adds later. There is no map, no label set, and no `Arc` clone
+    // — the counters are reached through the table the request matched
+    // against, and they outlive it, so recording after a rebuild still lands in
+    // the block the new generation serves.
+    //
+    // A request answered by the default backend has no `route` and so is
+    // counted only in the process-wide series: it matched no rule, and
+    // attributing it to one would invent a route that is not in the table.
+    let route = matched
+        .route
+        .and_then(|index| snapshot.route_stats().slot(index))
+        .map(|slot| slot.shard(state.shard));
+
+    let response = dispatch(state, conn, request, &snapshot, matched.backend, route).await;
+    if let Some(counters) = route {
+        counters.record_response(response.status().as_u16());
+    }
+    response
+}
+
+/// Everything after the route is known: header rewriting, endpoint selection,
+/// and the upstream exchange.
+async fn dispatch(
+    state: &ProxyState,
+    conn: ConnInfo,
+    request: Request<Incoming>,
+    snapshot: &RouteTable,
+    backend: &Backend,
+    route: Option<&RouteCounters>,
+) -> Response<ProxyBody> {
     if is_grpc(request.headers()) {
         return static_response(StatusCode::BAD_GATEWAY, BODY_GRPC);
     }
@@ -247,7 +289,11 @@ async fn forward(
         let started = Instant::now();
         match state.upstream.send(request).await {
             Ok(response) => {
-                state.metrics.record_upstream_latency(started.elapsed());
+                let elapsed = started.elapsed();
+                state.metrics.record_upstream_latency(elapsed);
+                if let Some(counters) = route {
+                    counters.record_upstream_latency(elapsed);
+                }
                 return relay(response, downstream_upgrade, upgrade.as_ref());
             }
             Err(error) => {
@@ -278,15 +324,35 @@ async fn forward(
     }
 }
 
+/// What the router said, in the two pieces the request path needs.
+struct Matched<'t> {
+    /// Where to forward, after any canary decision.
+    backend: &'t Backend,
+    /// The matched rule's index into the table's per-route counters, or `None`
+    /// when the default backend answered and there is no rule to attribute the
+    /// request to.
+    route: Option<u32>,
+}
+
 /// Matches the request and applies any canary attached to the matched rule.
 ///
-/// The returned reference borrows the snapshot, not the request, so the caller
+/// The returned references borrow the snapshot, not the request, so the caller
 /// is free to take the request apart afterwards.
-fn select_backend<'t>(table: &'t RouteTable, request: &Request<Incoming>) -> Option<&'t Backend> {
+///
+/// A canary that diverts a request does **not** change which route it is
+/// counted against: the request matched that rule, and splitting one route's
+/// numbers in two the moment somebody starts a canary would break the graph an
+/// operator is watching precisely then. Which share went to the canary is a
+/// property of the rule, and `/admin/routes` reports it as one.
+fn select_backend<'t>(table: &'t RouteTable, request: &Request<Incoming>) -> Option<Matched<'t>> {
     let matched = table.match_request(request_authority(request), request.uri().path())?;
+    let route = matched.rule().map(|rule| rule.stats_index());
 
     let Some(canary) = matched.canary() else {
-        return Some(matched.backend());
+        return Some(Matched {
+            backend: matched.backend(),
+            route,
+        });
     };
 
     // The router refuses to know what a `HeaderMap` is, so the two values it
@@ -300,13 +366,14 @@ fn select_backend<'t>(table: &'t RouteTable, request: &Request<Incoming>) -> Opt
         .and_then(|name| headers::cookie_value(request.headers(), name));
     let roll = rng::below(canary.weight_total());
 
-    if canary.decide(header_value, cookie_value, roll) {
+    let backend = if canary.decide(header_value, cookie_value, roll) {
         // A canary naming a backend the table does not hold is a controller
         // bug, not a reason to fail the request: serve production instead.
-        table.backend(canary.backend()).or(Some(matched.backend()))
+        table.backend(canary.backend()).unwrap_or(matched.backend())
     } else {
-        Some(matched.backend())
-    }
+        matched.backend()
+    };
+    Some(Matched { backend, route })
 }
 
 /// The host the client addressed.

@@ -1821,7 +1821,7 @@ impl Worker {
         match path {
             b"/metrics" => {
                 let generation = self.routes.generation();
-                let body = self.metrics.render_prometheus(generation);
+                let body = self.metrics.render_prometheus(generation, false);
                 write_admin(
                     &mut out,
                     200,

@@ -289,12 +289,14 @@ pub fn translate(
         &mut warnings,
     );
 
+    let content = digest.finish();
     Ok(Translation {
         config: CompiledConfig {
             table: Arc::new(builder.build()?),
             certs,
+            digest: content,
         },
-        digest: digest.finish(),
+        digest: content,
         managed: managed.iter().map(|i| ObjectKey::of(i.as_ref())).collect(),
         warnings,
     })

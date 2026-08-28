@@ -69,6 +69,15 @@ pub struct CompiledConfig {
     /// Certificate material referenced by `table.tls()`, deduplicated by
     /// [`handle_id`](CertMaterial::handle_id).
     pub certs: Vec<CertMaterial>,
+    /// Content hash of everything above, excluding the generation number.
+    ///
+    /// The rebuild loop uses it to suppress a publish that would change
+    /// nothing. It travels with the configuration rather than staying inside
+    /// the loop because the data plane reports it too: two replicas serving the
+    /// same digest are serving the same configuration, whatever generation
+    /// numbers they happen to have reached, and that is the only way to tell
+    /// them apart from two replicas that have diverged.
+    pub digest: u64,
 }
 
 /// A `Service` port as an Ingress backend named it: by number or by name.

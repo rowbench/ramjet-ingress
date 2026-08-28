@@ -131,6 +131,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::admin::{self, AdminState, ReadinessFlag};
 use crate::forward::{self, ConnInfo, ProxyState, Scheme};
+use crate::history::{GenerationHistory, DEFAULT_HISTORY_SIZE};
 use crate::listener::{Listener, ListenerConfig};
 use crate::metrics::{ConnectionGuard, Metrics};
 use crate::proxy_protocol;
@@ -198,6 +199,12 @@ pub struct ProxyConfig {
     ///
     /// Clamped up to [`MIN_MAX_BUF_SIZE`], which is the smallest hyper accepts.
     pub max_buf_size: usize,
+    /// Generations kept for `/admin/generations` and `/admin/rollback`.
+    ///
+    /// Each one holds its route table and its parsed certificates alive, so
+    /// this is the knob that trades memory for how far back an operator can
+    /// roll. Clamped up to one; see [`GenerationHistory`].
+    pub history_size: usize,
     /// Require a PROXY protocol header on the traffic listeners, waiting this
     /// long for it. `None` — the default — disables it.
     ///
@@ -228,6 +235,7 @@ impl Default for ProxyConfig {
             shutdown_grace: Duration::from_secs(30),
             worker_threads: None,
             max_buf_size: DEFAULT_MAX_BUF_SIZE,
+            history_size: DEFAULT_HISTORY_SIZE,
             // Off, and it has to be: a listener that requires the header
             // refuses every connection that does not carry one, so defaulting
             // it on would mean a fresh deployment serves nothing.
@@ -266,6 +274,7 @@ pub struct Server {
     admin: Option<Listener>,
     tls: Option<Arc<rustls::ServerConfig>>,
     metrics: Arc<Metrics>,
+    history: Arc<GenerationHistory>,
     readiness: ReadinessFlag,
     grace: Duration,
     max_buf_size: usize,
@@ -305,7 +314,7 @@ impl Server {
         // listener that does not exist would hide that.
         let tls = match https {
             Some(_) => {
-                let resolver = Arc::new(SniResolver::new(Arc::clone(&routes), certs));
+                let resolver = Arc::new(SniResolver::new(Arc::clone(&routes), Arc::clone(&certs)));
                 let config = tls::server_config(resolver)
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 Some(Arc::new(config))
@@ -314,10 +323,20 @@ impl Server {
         };
 
         let metrics = Arc::new(Metrics::new());
+        // Built here rather than handed in, because it publishes into exactly
+        // the two stores this server was bound over. A history wired to a
+        // different route table than the one being served would roll back to
+        // somewhere nobody is listening.
+        let history = Arc::new(GenerationHistory::new(
+            Arc::clone(&routes),
+            Arc::clone(&certs),
+            config.history_size,
+        ));
         let admin_state = Arc::new(AdminState {
             metrics: Arc::clone(&metrics),
             routes: Arc::clone(&routes),
             readiness: readiness.clone(),
+            history: Arc::clone(&history),
         });
 
         Ok(Server {
@@ -330,6 +349,7 @@ impl Server {
             admin,
             tls,
             metrics,
+            history,
             readiness,
             grace: config.shutdown_grace,
             max_buf_size: config.max_buf_size,
@@ -355,6 +375,16 @@ impl Server {
     /// The data-plane counters, for a caller that wants to read them directly.
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
+    }
+
+    /// The generation ring this server publishes through.
+    ///
+    /// Whoever owns the configuration — the Kubernetes applier, or dev mode's
+    /// one-shot load — records each generation here rather than storing into
+    /// the route table itself, so that a rollback has something to roll back
+    /// to and the publication gate has one place to live.
+    pub fn history(&self) -> &Arc<GenerationHistory> {
+        &self.history
     }
 
     /// The flag gating `/readyz`.
@@ -536,7 +566,7 @@ impl Workers {
             std::thread::Builder::new()
                 .name(format!("ramjet-serve-{index}"))
                 .spawn(move || {
-                    let drained = serve_lane(runtime, config, jobs_rx);
+                    let drained = serve_lane(runtime, index, config, jobs_rx);
                     // A receiver that has gone away means `run` already
                     // returned, which is not this thread's problem.
                     let _ = done_tx.send(drained);
@@ -612,8 +642,11 @@ struct Lane {
 
 /// One serving runtime: accepts handed-off connections until the lane closes,
 /// then drains. Returns whether the drain finished inside `grace`.
+///
+/// `index` is this lane's number, which doubles as its per-route counter shard.
 fn serve_lane(
     runtime: tokio::runtime::Runtime,
+    index: usize,
     config: LaneConfig,
     mut jobs: mpsc::UnboundedReceiver<Job>,
 ) -> bool {
@@ -635,6 +668,7 @@ fn serve_lane(
                 routes,
                 upstream: Upstream::new(&upstream),
                 metrics,
+                shard: index,
             }),
             acceptor,
             proxy_protocol,

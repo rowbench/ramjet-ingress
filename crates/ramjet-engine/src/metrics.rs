@@ -175,7 +175,13 @@ impl EngineMetrics {
     /// same counter values, including the details that are easy to get wrong:
     /// `le="1"` rather than `le="1.0"` (Rust's `f64` Display), `_sum` at
     /// exactly six decimal places, and the series in this order.
-    pub fn render_prometheus(&self, generation: u64) -> String {
+    ///
+    /// `pinned` is always `false` on this engine — it serves a table read once
+    /// at startup, so there is no generation history to roll back to. The
+    /// series is emitted anyway, for the same reason the TLS handshake counters
+    /// are: a dashboard that loses a series when an operator changes engine
+    /// looks like an outage.
+    pub fn render_prometheus(&self, generation: u64, pinned: bool) -> String {
         use std::fmt::Write as _;
         let mut out = String::with_capacity(2048);
 
@@ -215,6 +221,12 @@ impl EngineMetrics {
             "ramjet_route_table_generation",
             "Generation of the currently published route table.",
             generation as i64,
+        );
+        gauge(
+            &mut out,
+            "ramjet_pinned",
+            "1 when a rollback is holding publication at a chosen generation.",
+            i64::from(pinned),
         );
 
         // TLS is not terminated by this engine, so both handshake counters are
@@ -322,7 +334,7 @@ mod tests {
         m.core(0).upstream_latency(Duration::from_micros(500)); // <= 0.001
         m.core(0).upstream_latency(Duration::from_millis(20)); // <= 0.025
         m.core(0).upstream_latency(Duration::from_secs(30)); // past the last
-        let text = m.render_prometheus(0);
+        let text = m.render_prometheus(0, false);
         assert!(text.contains("ramjet_upstream_latency_seconds_bucket{le=\"0.001\"} 1"), "{text}");
         assert!(text.contains("ramjet_upstream_latency_seconds_bucket{le=\"0.025\"} 2"), "{text}");
         assert!(text.contains("ramjet_upstream_latency_seconds_bucket{le=\"10\"} 2"), "{text}");
@@ -334,7 +346,7 @@ mod tests {
     fn the_generation_comes_from_the_argument() {
         let m = EngineMetrics::new(1);
         assert!(m
-            .render_prometheus(42)
+            .render_prometheus(42, false)
             .contains("ramjet_route_table_generation 42"));
     }
 
@@ -397,14 +409,14 @@ mod tests {
         }
 
         assert_eq!(
-            uring.render_prometheus(7),
-            hyper.render_prometheus(7),
+            uring.render_prometheus(7, false),
+            hyper.render_prometheus(7, false),
             "the two engines' /metrics output diverged"
         );
 
         // Guard against the assertion passing because both are empty. 11 is
         // the 200s and the 204s together, which is the point of a class.
-        let text = uring.render_prometheus(7);
+        let text = uring.render_prometheus(7, false);
         assert!(text.contains("ramjet_requests_total{code=\"2xx\"} 11"), "{text}");
         assert!(text.contains("ramjet_upstream_retries_total 2"), "{text}");
         assert!(text.contains("ramjet_active_connections 2"), "{text}");

@@ -182,6 +182,10 @@ async fn dev_mode(
     let has_certificates = !loaded.certs.is_empty();
 
     let routes = Arc::new(SharedRouteTable::new(loaded.table));
+    // Kept alongside the store so the one generation dev mode has can be
+    // recorded in the history: the rollback endpoints then work here exactly as
+    // they do in Kubernetes mode, with nothing to roll back to.
+    let cert_keys = Arc::new(loaded.certs.clone());
     let certs = Arc::new(CertStore::with_certs(loaded.certs));
 
     // Without an explicit --https or --no-https, a TLS listener over an empty
@@ -198,7 +202,7 @@ async fn dev_mode(
     let readiness = ReadinessFlag::new();
     let server = Server::bind_with(
         proxy_config(args, https),
-        routes,
+        Arc::clone(&routes),
         certs,
         readiness.clone(),
     )?;
@@ -229,7 +233,29 @@ async fn dev_mode(
     }
     if let Some(admin) = server.admin_addr() {
         println!("  probes   http://{admin}/healthz  http://{admin}/readyz  http://{admin}/metrics");
+        println!("  admin    http://{admin}/admin/generations  http://{admin}/admin/routes");
     }
+
+    // The one generation dev mode has, recorded the same way the Kubernetes
+    // applier records every generation. Nothing is special-cased for it: the
+    // history holds one entry, `/admin/generations` lists it, and rolling back
+    // to it is a no-op that republishes what is already serving.
+    //
+    // The digest is zero because there is no control plane to have computed
+    // one; the field means "which compiled configuration is this", and in dev
+    // mode the answer is "the file you passed".
+    let audit = ramjet_controller::AuditSink::logging_only();
+    let table = routes.load_full();
+    let diff = ramjet_controller::ConfigDiff::compute(None, &table);
+    let published = server.history().record(
+        table.generation(),
+        0,
+        Arc::new(diff.to_json()),
+        table,
+        cert_keys,
+    );
+    audit.applied(&diff, published);
+    watch_pins(Arc::clone(server.history()), audit);
 
     // Dev mode reads the whole table before binding, so the replica is ready
     // the moment it can accept. The Kubernetes path flips this only once the
@@ -352,6 +378,35 @@ async fn uring_mode(
     finish(outcome)
 }
 
+/// Reports every pin and resume to the audit trail, for as long as the process
+/// runs.
+///
+/// The bridge exists because the two halves cannot see each other by design:
+/// the rollback endpoints live on the admin listener in `ramjet-proxy`, which
+/// knows nothing about Kubernetes, and the Events go through
+/// `ramjet-controller`, which knows nothing about sockets. This binary is the
+/// only place that depends on both, so this is where the wire goes.
+pub(crate) fn watch_pins(
+    history: Arc<ramjet_proxy::GenerationHistory>,
+    audit: ramjet_controller::AuditSink,
+) {
+    use ramjet_proxy::PinChange;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    history.notify(tx);
+    tokio::spawn(async move {
+        while let Some(change) = rx.recv().await {
+            match change {
+                PinChange::Pinned {
+                    generation,
+                    replaced,
+                } => audit.pinned(generation, replaced),
+                PinChange::Resumed { generation } => audit.resumed(generation),
+            }
+        }
+    });
+}
+
 /// The listener and upstream configuration both modes share.
 ///
 /// `https` is passed separately because it is the one setting the two modes
@@ -372,6 +427,7 @@ fn proxy_config(args: &Args, https: Option<SocketAddr>) -> ProxyConfig {
         shutdown_grace: args.shutdown_grace,
         worker_threads: args.worker_threads,
         max_buf_size: args.max_buf_size,
+        history_size: args.history_size,
         proxy_protocol: args
             .proxy_protocol
             .then_some(args.proxy_protocol_timeout),

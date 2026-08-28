@@ -23,6 +23,30 @@
 //! generation instead would let one malformed Secret in one namespace take the
 //! cluster's routing offline.
 //!
+//! # Parsing and publishing are two jobs
+//!
+//! [`Publisher`] does not publish. It turns a generation's `CertMaterial` into
+//! parsed keys, reusing what it already has, and hands them back; whether they
+//! reach the data plane is
+//! [`GenerationHistory`](ramjet_proxy::GenerationHistory)'s decision, because
+//! that is where a rollback pin lives and there should be exactly one place
+//! that knows what "pinned" means. The parse still happens while a pin is held:
+//! the ring records live generations behind the pin so an operator can see what
+//! they are holding back, and a recorded generation that could not be put back
+//! on the wire would be a rollback target that fails when it is used.
+//!
+//! # What the history is a history of
+//!
+//! Generations this replica *applied*, which is not quite every generation the
+//! controller compiled. The channel between them carries the latest value
+//! rather than a queue, so two publishes closer together than one pass of this
+//! loop coalesce and only the second is ever seen. That is the same property
+//! the loop has always had and the reason a burst of churn costs what one
+//! change costs — a pin does not change it, because the applier goes on
+//! draining the channel either way. What it does mean is that
+//! `/admin/generations` can show 41 followed by 44, and the gap is generations
+//! that were never on the wire in the first place.
+//!
 //! # Parsing only what moved
 //!
 //! [`CertMaterial::handle_id`](ramjet_controller::CertMaterial::handle_id) is
@@ -35,9 +59,11 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use ramjet_controller::{CompiledConfig, ControllerOpts};
-use ramjet_proxy::{CertStore, ReadinessFlag, Server, Shutdown, ShutdownHandle};
-use ramjet_router::{RouteTableBuilder, SharedRouteTable};
+use ramjet_controller::{AuditSink, CompiledConfig, ConfigDiff, ControllerOpts};
+use ramjet_proxy::{
+    CertKeys, CertStore, GenerationHistory, ReadinessFlag, Server, Shutdown, ShutdownHandle,
+};
+use ramjet_router::{RouteTable, RouteTableBuilder, SharedRouteTable};
 use rustls::sign::CertifiedKey;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
@@ -45,14 +71,13 @@ use tracing::{error, info, warn};
 use crate::args::Args;
 use crate::certs;
 
-/// Applies compiled configurations to the data plane, in the one order that is
-/// safe, reusing the keys it has already parsed.
+/// Turns a compiled generation's certificate material into parsed keys,
+/// reusing everything that did not rotate.
 pub struct Publisher {
-    routes: Arc<SharedRouteTable>,
-    certs: Arc<CertStore>,
-    /// Every key currently published, by handle id. Content-addressed ids make
-    /// this a cache with no invalidation problem: an entry is either still
-    /// referenced, in which case it is still correct, or it is dropped.
+    /// Every key from the last generation prepared, by handle id.
+    /// Content-addressed ids make this a cache with no invalidation problem: an
+    /// entry is either still referenced, in which case it is still correct, or
+    /// it is dropped.
     parsed: HashMap<u64, Arc<CertifiedKey>>,
 }
 
@@ -77,26 +102,24 @@ impl Applied {
 }
 
 impl Publisher {
-    /// A publisher writing into `routes` and `certs`.
-    pub fn new(routes: Arc<SharedRouteTable>, certs: Arc<CertStore>) -> Self {
+    /// A publisher with an empty key cache.
+    pub fn new() -> Self {
         Publisher {
-            routes,
-            certs,
             parsed: HashMap::new(),
         }
     }
 
-    /// Publishes one generation: certificates, then the table that names them.
+    /// Parses one generation's certificates, reusing every id that survived.
     ///
     /// Total by construction — a certificate that will not parse is dropped
-    /// with a warning and the rest of the generation goes live.
-    pub fn apply(&mut self, config: &CompiledConfig) -> Applied {
+    /// with a warning and the rest of the generation is still usable.
+    pub fn prepare(&mut self, config: &CompiledConfig) -> (Applied, Arc<CertKeys>) {
         let mut applied = Applied {
             generation: config.table.generation(),
             ..Applied::default()
         };
 
-        let mut keys: HashMap<u64, Arc<CertifiedKey>> = HashMap::with_capacity(config.certs.len());
+        let mut keys: CertKeys = HashMap::with_capacity(config.certs.len());
         for material in &config.certs {
             if let Some(key) = self.parsed.get(&material.handle_id) {
                 keys.insert(material.handle_id, Arc::clone(key));
@@ -124,15 +147,25 @@ impl Publisher {
 
         // Cheap: the values are `Arc`s, so this clones pointers, not keys.
         self.parsed = keys.clone();
-        self.certs.publish(keys);
-        self.routes.store_shared(Arc::clone(&config.table));
+        (applied, Arc::new(keys))
+    }
+}
 
-        applied
+impl Default for Publisher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 /// Watches Kubernetes and serves what it compiles, until a signal arrives.
 pub async fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // Checked before the client, so a typo in the URL is a refusal to start
+    // rather than a warning an hour later, from a process that has been failing
+    // to deliver its audit trail to nowhere the whole time.
+    if let Some(url) = &args.audit_webhook {
+        AuditSink::check_webhook(url)?;
+    }
+
     let client = kube::Client::try_default().await?;
     let opts = ControllerOpts {
         namespace: args.watch_namespace.clone(),
@@ -172,6 +205,14 @@ pub async fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         "starting in kubernetes mode"
     );
 
+    let audit = AuditSink::new(
+        Some(client.clone()),
+        &args.ingress_class,
+        args.audit_webhook.as_deref(),
+    )
+    .await?;
+    crate::watch_pins(Arc::clone(server.history()), audit.clone());
+
     let (configs, controller) = ramjet_controller::spawn(client, opts)?;
 
     // The server's own signal handling is replaced by a channel this process
@@ -185,8 +226,14 @@ pub async fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         on_signal.shutdown();
     });
 
-    let publisher = Publisher::new(routes, certs);
-    let applier = tokio::spawn(apply(configs, publisher, readiness, handle));
+    let applier = tokio::spawn(apply(
+        configs,
+        Publisher::new(),
+        Arc::clone(server.history()),
+        audit,
+        readiness,
+        handle,
+    ));
 
     let result = server.run(shutdown).await;
 
@@ -211,33 +258,64 @@ pub async fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     Ok(code)
 }
 
-/// Publishes every generation the controller compiles.
+/// Records every generation the controller compiles, and publishes the ones a
+/// rollback is not holding back.
+///
+/// The receiver is drained whether or not anything is being published, which is
+/// the property a pin depends on: leaving generations queued would block the
+/// controller's rebuild loop, and releasing the pin would then jump to whatever
+/// had been stuck in the channel rather than to the state of the cluster.
 async fn apply(
     mut configs: watch::Receiver<Arc<CompiledConfig>>,
     mut publisher: Publisher,
+    history: Arc<GenerationHistory>,
+    audit: AuditSink,
     readiness: ReadinessFlag,
     shutdown: ShutdownHandle,
 ) {
+    // Diffed against, and deliberately the previous *compiled* generation
+    // rather than the previous published one: while a pin is held, each
+    // generation's diff should describe what the controller did since its own
+    // predecessor, not restate everything that has happened since the pin.
+    let mut previous: Option<Arc<RouteTable>> = None;
+
     // The initial value is the controller's generation-0 seed — an empty table
     // that means "nothing compiled yet" — and a fresh receiver has already seen
     // it, so this waits for the first real publish.
     while configs.changed().await.is_ok() {
         let config = Arc::clone(&*configs.borrow_and_update());
-        let applied = publisher.apply(&config);
+        let (applied, keys) = publisher.prepare(&config);
+        let diff = ConfigDiff::compute(previous.as_deref(), &config.table);
+
+        let published = history.record(
+            applied.generation,
+            config.digest,
+            Arc::new(diff.to_json()),
+            Arc::clone(&config.table),
+            keys,
+        );
+        previous = Some(Arc::clone(&config.table));
+        audit.applied(&diff, published);
 
         info!(
             generation = applied.generation,
+            published,
             certificates = applied.certificates(),
             parsed = applied.parsed,
             reused = applied.reused,
             rejected = applied.rejected,
-            "published to the data plane"
+            "{}",
+            if published {
+                "published to the data plane"
+            } else {
+                "recorded but held back by a rollback pin"
+            }
         );
 
         // Readiness is one-way: a later generation never takes the replica out
         // of rotation, because a table that is one debounce window stale is
         // still far better than 404ing everything while Kubernetes reroutes.
-        if applied.generation > 0 && !readiness.is_ready() {
+        if published && applied.generation > 0 && !readiness.is_ready() {
             readiness.set_ready(true);
             info!(generation = applied.generation, "ready");
         }
@@ -252,16 +330,26 @@ mod tests {
     use super::*;
     use crate::testing::self_signed;
     use ramjet_controller::CertMaterial;
-    use ramjet_router::{CertifiedKeyHandle, Endpoint, LbPolicy, PathType, RouteTable};
+    use ramjet_router::{CertifiedKeyHandle, Endpoint, LbPolicy, PathType};
 
-    /// A compiled configuration serving `host` over the given certificates.
-    fn compiled(host: &str, certs: Vec<CertMaterial>) -> CompiledConfig {
+    /// A compiled configuration at `generation`, serving `host` over the given
+    /// certificates and routing to an endpoint on `port` — so two generations
+    /// can be told apart both by number and by where they send a request.
+    fn compiled(
+        generation: u64,
+        host: &str,
+        port: u16,
+        certs: Vec<CertMaterial>,
+    ) -> CompiledConfig {
         let mut builder = RouteTableBuilder::new();
+        builder.generation(generation);
         builder
             .backend(
                 "app",
                 LbPolicy::RoundRobin,
-                vec![Endpoint::new("10.0.0.1:8080".parse().expect("an address"))],
+                vec![Endpoint::new(
+                    format!("10.0.0.1:{port}").parse().expect("an address"),
+                )],
             )
             .expect("registers");
         builder
@@ -275,6 +363,7 @@ mod tests {
         CompiledConfig {
             table: Arc::new(builder.build().expect("builds")),
             certs,
+            digest: u64::from(port),
         }
     }
 
@@ -287,29 +376,67 @@ mod tests {
         }
     }
 
-    fn publisher() -> (Publisher, Arc<SharedRouteTable>, Arc<CertStore>) {
-        let routes = Arc::new(SharedRouteTable::new(
-            RouteTableBuilder::new().build().expect("an empty table"),
-        ));
-        let certs = Arc::new(CertStore::new());
-        (
-            Publisher::new(Arc::clone(&routes), Arc::clone(&certs)),
-            routes,
-            certs,
-        )
+    /// The pipeline one generation goes through: parse, then record, then
+    /// publish if nothing is holding the gate.
+    struct Pipeline {
+        publisher: Publisher,
+        history: Arc<GenerationHistory>,
+        routes: Arc<SharedRouteTable>,
+        certs: Arc<CertStore>,
+        previous: Option<Arc<RouteTable>>,
+    }
+
+    impl Pipeline {
+        fn new() -> Self {
+            let routes = Arc::new(SharedRouteTable::new(
+                RouteTableBuilder::new().build().expect("an empty table"),
+            ));
+            let certs = Arc::new(CertStore::new());
+            Pipeline {
+                publisher: Publisher::new(),
+                history: Arc::new(GenerationHistory::new(
+                    Arc::clone(&routes),
+                    Arc::clone(&certs),
+                    10,
+                )),
+                routes,
+                certs,
+                previous: None,
+            }
+        }
+
+        fn apply(&mut self, config: &CompiledConfig) -> (Applied, bool) {
+            let (applied, keys) = self.publisher.prepare(config);
+            let diff = ConfigDiff::compute(self.previous.as_deref(), &config.table);
+            let published = self.history.record(
+                applied.generation,
+                config.digest,
+                Arc::new(diff.to_json()),
+                Arc::clone(&config.table),
+                keys,
+            );
+            self.previous = Some(Arc::clone(&config.table));
+            (applied, published)
+        }
     }
 
     #[test]
     fn a_generation_publishes_its_table_and_its_certificates() {
-        let (mut publisher, routes, certs) = publisher();
-        let applied = publisher.apply(&compiled("app.example.com", vec![material(7, "app.example.com")]));
+        let mut pipeline = Pipeline::new();
+        let (applied, published) = pipeline.apply(&compiled(
+            1,
+            "app.example.com",
+            8080,
+            vec![material(7, "app.example.com")],
+        ));
 
+        assert!(published);
         assert_eq!(applied.parsed, 1);
         assert_eq!(applied.rejected, 0);
-        assert_eq!(certs.len(), 1);
-        assert!(certs.get(7).is_some(), "the handle id is the store's key");
+        assert_eq!(pipeline.certs.len(), 1);
+        assert!(pipeline.certs.get(7).is_some(), "the handle id is the store's key");
 
-        let table = routes.load_full();
+        let table = pipeline.routes.load_full();
         assert!(table.match_request("app.example.com", "/anything").is_some());
         assert_eq!(
             table.tls().resolve("app.example.com").map(|h| h.id()),
@@ -323,24 +450,34 @@ mod tests {
     /// is the only moment the two snapshots are meant to agree.
     #[test]
     fn every_handle_the_table_names_is_in_the_store() {
-        let (mut publisher, routes, certs) = publisher();
-        publisher.apply(&compiled("app.example.com", vec![material(11, "app.example.com")]));
+        let mut pipeline = Pipeline::new();
+        pipeline.apply(&compiled(
+            1,
+            "app.example.com",
+            8080,
+            vec![material(11, "app.example.com")],
+        ));
 
-        let table = routes.load_full();
+        let table = pipeline.routes.load_full();
         let handle = table
             .tls()
             .resolve("app.example.com")
             .expect("the name resolves");
         assert!(
-            certs.get(handle.id()).is_some(),
+            pipeline.certs.get(handle.id()).is_some(),
             "a table published over a store missing its ids fails every handshake"
         );
     }
 
     #[test]
     fn an_unchanged_certificate_is_not_parsed_twice() {
-        let (mut publisher, _routes, certs) = publisher();
-        let first = publisher.apply(&compiled("app.example.com", vec![material(7, "app.example.com")]));
+        let mut pipeline = Pipeline::new();
+        let (first, _) = pipeline.apply(&compiled(
+            1,
+            "app.example.com",
+            8080,
+            vec![material(7, "app.example.com")],
+        ));
         assert_eq!((first.parsed, first.reused), (1, 0));
 
         // A different generation carrying the same content-addressed id: the
@@ -350,52 +487,167 @@ mod tests {
             cert_chain_pem: b"garbage that would never parse".to_vec(),
             key_pem: b"nor would this".to_vec(),
         };
-        let second = publisher.apply(&compiled("app.example.com", vec![same]));
+        let (second, _) = pipeline.apply(&compiled(2, "app.example.com", 8080, vec![same]));
         assert_eq!(
             (second.parsed, second.reused),
             (0, 1),
             "a surviving handle id must reuse the key already parsed"
         );
-        assert!(certs.get(7).is_some());
+        assert!(pipeline.certs.get(7).is_some());
     }
 
     #[test]
     fn a_rotated_certificate_replaces_the_old_one() {
-        let (mut publisher, _routes, certs) = publisher();
-        publisher.apply(&compiled("app.example.com", vec![material(7, "app.example.com")]));
-        assert!(certs.get(7).is_some());
+        let mut pipeline = Pipeline::new();
+        pipeline.apply(&compiled(
+            1,
+            "app.example.com",
+            8080,
+            vec![material(7, "app.example.com")],
+        ));
+        assert!(pipeline.certs.get(7).is_some());
 
         // Rotation means new content, and content-addressed ids mean a new id.
-        let rotated = publisher.apply(&compiled("app.example.com", vec![material(8, "app.example.com")]));
+        let (rotated, _) = pipeline.apply(&compiled(
+            2,
+            "app.example.com",
+            8080,
+            vec![material(8, "app.example.com")],
+        ));
         assert_eq!((rotated.parsed, rotated.reused), (1, 0));
-        assert_eq!(certs.len(), 1, "the retired id is dropped, not accumulated");
-        assert!(certs.get(7).is_none());
-        assert!(certs.get(8).is_some());
+        assert_eq!(pipeline.certs.len(), 1, "the retired id is dropped, not accumulated");
+        assert!(pipeline.certs.get(7).is_none());
+        assert!(pipeline.certs.get(8).is_some());
     }
 
     #[test]
     fn an_unparseable_certificate_is_skipped_and_the_rest_goes_live() {
-        let (mut publisher, routes, certs) = publisher();
+        let mut pipeline = Pipeline::new();
         let broken = CertMaterial {
             handle_id: 1,
             cert_chain_pem: b"-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n".to_vec(),
             key_pem: b"neither is this a key".to_vec(),
         };
-        let applied = publisher.apply(&compiled(
+        let (applied, _) = pipeline.apply(&compiled(
+            1,
             "app.example.com",
+            8080,
             vec![broken, material(2, "app.example.com")],
         ));
 
         assert_eq!(applied.rejected, 1);
         assert_eq!(applied.parsed, 1);
-        assert!(certs.get(1).is_none(), "a broken certificate is not published");
-        assert!(certs.get(2).is_some());
         assert!(
-            routes
+            pipeline.certs.get(1).is_none(),
+            "a broken certificate is not published"
+        );
+        assert!(pipeline.certs.get(2).is_some());
+        assert!(
+            pipeline
+                .routes
                 .load_full()
                 .match_request("app.example.com", "/")
                 .is_some(),
             "routing must survive a Secret that does not parse"
+        );
+    }
+
+    /// The rollback, all the way through the pipeline the daemon actually runs:
+    /// a pinned generation's certificates go back with its table, later
+    /// generations are recorded without reaching the wire, and the pinned
+    /// generation's key is still in the store while the pin holds.
+    #[test]
+    fn a_pin_republishes_a_generations_certificates_with_its_table() {
+        let mut pipeline = Pipeline::new();
+        pipeline.apply(&compiled(
+            1,
+            "app.example.com",
+            8080,
+            vec![material(7, "app.example.com")],
+        ));
+        pipeline.apply(&compiled(
+            2,
+            "app.example.com",
+            8081,
+            vec![material(8, "app.example.com")],
+        ));
+        assert!(pipeline.certs.get(8).is_some());
+        assert!(pipeline.certs.get(7).is_none(), "generation 2 retired it");
+
+        pipeline.history.pin(1).expect("generation 1 is in the ring");
+        assert!(
+            pipeline.certs.get(7).is_some(),
+            "the pinned generation's certificate must come back with its table, \
+             or every handshake for its names fails"
+        );
+        assert!(pipeline.certs.get(8).is_none());
+        assert_eq!(pipeline.routes.generation(), 1);
+
+        // The controller has not stopped. Its work is recorded and held.
+        let (_, published) = pipeline.apply(&compiled(
+            3,
+            "app.example.com",
+            8082,
+            vec![material(9, "app.example.com")],
+        ));
+        assert!(!published);
+        assert_eq!(pipeline.routes.generation(), 1);
+        assert!(
+            pipeline.certs.get(7).is_some(),
+            "a held-back generation must not touch the certificate store either"
+        );
+
+        assert_eq!(pipeline.history.unpin(), Some(3));
+        assert_eq!(pipeline.routes.generation(), 3);
+        assert!(pipeline.certs.get(9).is_some());
+    }
+
+    /// Per-route counters are the reason `/admin/routes` is worth reading, and
+    /// they are only worth reading if a deploy does not reset them.
+    #[test]
+    fn route_counters_survive_a_rebuild_through_the_publisher() {
+        let mut pipeline = Pipeline::new();
+        pipeline.apply(&compiled(1, "app.example.com", 8080, Vec::new()));
+
+        let table = pipeline.routes.load_full();
+        let (_, rule) = table.routes().next().expect("one route");
+        table
+            .route_stats()
+            .slot(rule.stats_index())
+            .expect("a counter block")
+            .shard(0)
+            .record_response(200);
+
+        // A second generation of the same route, built the way the controller
+        // builds one: from the previous table.
+        let mut builder = RouteTableBuilder::from_previous(&table);
+        builder
+            .backend(
+                "app",
+                LbPolicy::RoundRobin,
+                vec![Endpoint::new("10.0.0.1:8080".parse().expect("an address"))],
+            )
+            .expect("registers");
+        builder
+            .route(Some("app.example.com"), "/", PathType::Prefix, "app")
+            .expect("drafts");
+        pipeline.apply(&CompiledConfig {
+            table: Arc::new(builder.build().expect("builds")),
+            certs: Vec::new(),
+            digest: 2,
+        });
+
+        let table = pipeline.routes.load_full();
+        let (_, rule) = table.routes().next().expect("one route");
+        assert_eq!(
+            table
+                .route_stats()
+                .slot(rule.stats_index())
+                .expect("a counter block")
+                .totals()
+                .requests,
+            1,
+            "a route that survived the rebuild must keep its counters"
         );
     }
 
@@ -406,6 +658,7 @@ mod tests {
         Arc::new(CompiledConfig {
             table: Arc::new(builder.build().expect("builds")),
             certs: Vec::new(),
+            digest: generation,
         })
     }
 
@@ -421,16 +674,35 @@ mod tests {
         assert!(waited.is_ok(), "{what} never happened");
     }
 
+    fn history() -> (Arc<GenerationHistory>, Arc<SharedRouteTable>) {
+        let routes = Arc::new(SharedRouteTable::new(
+            RouteTableBuilder::new().build().expect("an empty table"),
+        ));
+        let history = Arc::new(GenerationHistory::new(
+            Arc::clone(&routes),
+            Arc::new(CertStore::new()),
+            10,
+        ));
+        (history, routes)
+    }
+
     #[tokio::test]
     async fn readiness_waits_for_a_compiled_generation() {
-        let (publisher, routes, _certs) = publisher();
         let readiness = ReadinessFlag::new();
         let (shutdown_handle, mut shutdown) = Shutdown::channel();
+        let (history, routes) = history();
 
         // The channel starts on the controller's seed, which a fresh receiver
         // has already seen.
         let (tx, rx) = watch::channel(at_generation(0));
-        let applier = tokio::spawn(apply(rx, publisher, readiness.clone(), shutdown_handle));
+        let applier = tokio::spawn(apply(
+            rx,
+            Publisher::new(),
+            Arc::clone(&history),
+            AuditSink::logging_only(),
+            readiness.clone(),
+            shutdown_handle,
+        ));
         assert!(!readiness.is_ready(), "nothing has been compiled yet");
 
         // Generation 0 means "no configuration has been compiled". Publishing
@@ -453,20 +725,67 @@ mod tests {
         applier.await.expect("the applier ends when the channel closes");
     }
 
+    /// The pin's other half: the applier must keep *draining* the channel while
+    /// publication is held, or the controller's rebuild loop stalls behind it
+    /// and resuming lands on a stale generation rather than the current one.
+    #[tokio::test]
+    async fn a_pinned_applier_keeps_recording_what_it_is_holding_back() {
+        let (shutdown_handle, _shutdown) = Shutdown::channel();
+        let (history, routes) = history();
+
+        let (tx, rx) = watch::channel(at_generation(0));
+        tokio::spawn(apply(
+            rx,
+            Publisher::new(),
+            Arc::clone(&history),
+            AuditSink::logging_only(),
+            ReadinessFlag::new(),
+            shutdown_handle,
+        ));
+
+        tx.send(at_generation(1)).expect("listening");
+        eventually("generation 1 landed", || routes.generation() == 1).await;
+        history.pin(1).expect("pins");
+
+        // Each one is waited for before the next is sent. The channel carries
+        // the latest value rather than a queue — see the module docs — so
+        // firing three at once would legitimately coalesce into one, and this
+        // test is about what the pin does, not about the channel.
+        for generation in 2..=4 {
+            tx.send(at_generation(generation)).expect("listening");
+            eventually("the generation was recorded", || {
+                history.with_records(|_, ring| {
+                    ring.iter().any(|record| record.generation == generation)
+                })
+            })
+            .await;
+        }
+        assert_eq!(routes.generation(), 1, "nothing reached the wire");
+
+        let held: Vec<(u64, bool)> = history
+            .with_records(|_, ring| ring.iter().map(|r| (r.generation, r.published)).collect());
+        assert_eq!(held, vec![(1, true), (2, false), (3, false), (4, false)]);
+
+        assert_eq!(history.unpin(), Some(4));
+        assert_eq!(routes.generation(), 4, "resuming publishes the newest");
+    }
+
     #[test]
     fn the_generation_reported_is_the_one_published() {
-        let (mut publisher, routes, _certs) = publisher();
+        let mut pipeline = Pipeline::new();
         let first: RouteTable = RouteTableBuilder::new().build().expect("builds");
         let second = RouteTableBuilder::from_previous(&first)
             .build()
             .expect("builds");
         let generation = second.generation();
 
-        let applied = publisher.apply(&CompiledConfig {
+        let (applied, published) = pipeline.apply(&CompiledConfig {
             table: Arc::new(second),
             certs: Vec::new(),
+            digest: 0,
         });
+        assert!(published);
         assert_eq!(applied.generation, generation);
-        assert_eq!(routes.generation(), generation);
+        assert_eq!(pipeline.routes.generation(), generation);
     }
 }

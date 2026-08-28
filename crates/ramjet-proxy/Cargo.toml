@@ -26,6 +26,13 @@ hyper-util = { version = "0.1", features = [
     "http2",
 ] }
 pin-project-lite = "0.2"
+# The admin listener's JSON, and nothing else. `/admin/generations` and
+# `/admin/routes` serve structures a human and a TUI both read, and hand-rolling
+# the escaping for host names and backend names out of a cluster is a way to
+# emit invalid JSON on the one input nobody tested. It is off the request path
+# entirely: no `serde_json` call happens between accepting a client connection
+# and writing its response.
+serde_json = "1.0"
 socket2 = { version = "0.6", features = ["all"] }
 # One event, on the connection-drop path when a PROXY header is rejected. The
 # binary already links this through `ramjet-controller`, and a filtered-out

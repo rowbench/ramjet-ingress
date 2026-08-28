@@ -22,8 +22,8 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use ramjet_proxy::{
-    CertStore, ListenerConfig, Metrics, ProxyConfig, ReadinessFlag, Server, Shutdown,
-    ShutdownHandle, UpstreamConfig,
+    CertStore, GenerationHistory, ListenerConfig, Metrics, ProxyConfig, ReadinessFlag, Server,
+    Shutdown, ShutdownHandle, UpstreamConfig,
 };
 use ramjet_router::{
     Endpoint, LbPolicy, PathType, RouteTable, RouteTableBuilder, SharedRouteTable,
@@ -210,6 +210,8 @@ pub struct ProxyOptions {
     pub workers: Option<usize>,
     /// Require a PROXY protocol header on the traffic listeners.
     pub proxy_protocol: Option<Duration>,
+    /// Generations the rollback ring keeps.
+    pub history_size: usize,
 }
 
 impl Default for ProxyOptions {
@@ -221,6 +223,7 @@ impl Default for ProxyOptions {
             grace: Duration::from_secs(10),
             workers: Some(1),
             proxy_protocol: None,
+            history_size: ramjet_proxy::DEFAULT_HISTORY_SIZE,
         }
     }
 }
@@ -234,6 +237,7 @@ pub struct TestProxy {
     pub certs: Arc<CertStore>,
     pub metrics: Arc<Metrics>,
     pub readiness: ReadinessFlag,
+    pub history: Arc<GenerationHistory>,
     handle: ShutdownHandle,
     task: Option<JoinHandle<std::io::Result<()>>>,
 }
@@ -253,6 +257,7 @@ impl TestProxy {
             shutdown_grace: options.grace,
             worker_threads: options.workers,
             proxy_protocol: options.proxy_protocol,
+            history_size: options.history_size,
             ..ProxyConfig::default()
         };
 
@@ -269,6 +274,7 @@ impl TestProxy {
         let https = server.https_addr();
         let admin = server.admin_addr().expect("an admin port");
         let metrics = Arc::clone(server.metrics());
+        let history = Arc::clone(server.history());
 
         let (handle, shutdown) = Shutdown::channel();
         let task = tokio::spawn(server.run(shutdown));
@@ -281,6 +287,7 @@ impl TestProxy {
             certs: options.certs,
             metrics,
             readiness,
+            history,
             handle,
             task: Some(task),
         }

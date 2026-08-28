@@ -16,8 +16,13 @@
 //! Per-route and per-backend series are deliberately absent. ingress-nginx
 //! emits them and they are the single most common reason its metrics endpoint
 //! becomes the most expensive request the pod serves; a cluster with 5k
-//! Ingresses produces enough series to knock over the scraper. If they come
-//! back, they come back behind a flag and with a cardinality cap.
+//! Ingresses produces enough series to knock over the scraper.
+//!
+//! The per-route *numbers* do exist — the router counts them, and
+//! `/admin/routes` serves them as JSON. What is refused is turning them into
+//! labelled series that every scrape pays for whether or not anybody is
+//! looking. Cardinality here stays bounded by the type system rather than by
+//! the size of somebody's cluster.
 //!
 //! # Ordering
 //!
@@ -208,11 +213,19 @@ impl Metrics {
 
     /// Renders the Prometheus text exposition format.
     ///
-    /// `generation` is read from the route table at scrape time rather than
-    /// mirrored into an atomic on every publish; a scrape happens once every
-    /// fifteen seconds and a publish is rarer still, so there is no reason for
-    /// either to maintain state for the other.
-    pub fn render_prometheus(&self, generation: u64) -> String {
+    /// `generation` and `pinned` are read from the route table and the
+    /// generation history at scrape time rather than mirrored into atomics on
+    /// every publish; a scrape happens once every fifteen seconds and a publish
+    /// is rarer still, so there is no reason for either to maintain state for
+    /// the other.
+    ///
+    /// The two answer different questions and both are needed:
+    /// `ramjet_route_table_generation` says what is *serving*, and
+    /// `ramjet_pinned` says whether that is the case because somebody pulled
+    /// the emergency brake. Without the second, a replica frozen on an old
+    /// generation is indistinguishable from a replica whose control plane has
+    /// stopped — and those want very different pages.
+    pub fn render_prometheus(&self, generation: u64, pinned: bool) -> String {
         let mut out = String::with_capacity(2048);
 
         out.push_str("# HELP ramjet_requests_total Responses served, by status class.\n");
@@ -240,6 +253,12 @@ impl Metrics {
             "ramjet_route_table_generation",
             "Generation of the currently published route table.",
             generation as i64,
+        );
+        gauge(
+            &mut out,
+            "ramjet_pinned",
+            "1 when a rollback is holding publication at a chosen generation.",
+            i64::from(pinned),
         );
 
         for (name, help, value) in [
@@ -334,7 +353,7 @@ mod tests {
         m.record_upstream_latency(Duration::from_millis(20)); // <= 0.025
         m.record_upstream_latency(Duration::from_secs(30)); // over the last bound
 
-        let text = m.render_prometheus(0);
+        let text = m.render_prometheus(0, false);
         assert!(text.contains("ramjet_upstream_latency_seconds_bucket{le=\"0.001\"} 1"));
         assert!(text.contains("ramjet_upstream_latency_seconds_bucket{le=\"0.025\"} 2"));
         assert!(text.contains("ramjet_upstream_latency_seconds_bucket{le=\"10\"} 2"));
@@ -359,13 +378,20 @@ mod tests {
     fn generation_is_reported_from_the_argument() {
         let m = Metrics::new();
         assert!(m
-            .render_prometheus(42)
+            .render_prometheus(42, false)
             .contains("ramjet_route_table_generation 42"));
     }
 
     #[test]
+    fn the_pin_gauge_says_whether_publication_is_held() {
+        let m = Metrics::new();
+        assert!(m.render_prometheus(42, false).contains("ramjet_pinned 0"));
+        assert!(m.render_prometheus(42, true).contains("ramjet_pinned 1"));
+    }
+
+    #[test]
     fn exposition_has_help_and_type_for_every_series() {
-        let text = Metrics::new().render_prometheus(1);
+        let text = Metrics::new().render_prometheus(1, false);
         let series: Vec<&str> = text
             .lines()
             .filter(|l| l.starts_with("# TYPE "))

@@ -109,6 +109,10 @@ pub struct Args {
     pub default_tls_secret: Option<String>,
     /// Whether to write Ingress status at all.
     pub update_status: bool,
+    /// Compiled generations kept for `/admin/generations` and rollback.
+    pub history_size: usize,
+    /// URL the semantic configuration diff is POSTed to on every publish.
+    pub audit_webhook: Option<String>,
     /// Plaintext listener, or `None` if disabled.
     pub http: Option<SocketAddr>,
     /// TLS listener, or `None` if disabled.
@@ -161,6 +165,8 @@ impl Default for Args {
             default_backend: None,
             default_tls_secret: None,
             update_status: true,
+            history_size: ramjet_proxy::DEFAULT_HISTORY_SIZE,
+            audit_webhook: None,
             http: Some(all(DEFAULT_HTTP_PORT)),
             https: Some(all(DEFAULT_HTTPS_PORT)),
             admin: Some(all(DEFAULT_ADMIN_PORT)),
@@ -211,6 +217,31 @@ KUBERNETES:
     The client is configured the way every Kubernetes tool configures one: the
     in-cluster ServiceAccount if there is one, otherwise the current context of
     $KUBECONFIG or ~/.kube/config.
+
+TIME TRAVEL AND THE AUDIT TRAIL:
+    --history-size <N>        Compiled generations kept for /admin/generations
+                              and rollback                      [default: 10]
+    --audit-webhook <URL>     POST the semantic diff of every published
+                              generation to URL
+
+    Each kept generation holds its route table and its parsed certificates
+    alive, which is roughly a hundred bytes per route per generation; the
+    certificates are content-addressed and shared between generations that did
+    not rotate them. Ten generations of a ten-thousand route cluster is a few
+    megabytes.
+
+    Every publish is written down three ways: a structured `tracing` event on
+    the `audit` target, a Kubernetes Event on the IngressClass (reason
+    ConfigApplied, ConfigPinned, or ConfigResumed), and — with --audit-webhook —
+    one POST of the diff as JSON. The webhook is fire-and-forget: one attempt, a
+    5s timeout, failures logged and never blocking a publish. It speaks http://
+    only and refuses an https:// URL at startup rather than downgrading, because
+    the control plane does not carry a TLS client for this; point it at a
+    collector inside the cluster.
+
+    Events need RBAC: `events.k8s.io` / `events` / create. The chart's
+    ClusterRole has it. Without it the Events are skipped at debug level and
+    everything else still works.
 
 DEV MODE:
     --static-routes <FILE>    Serve the hosts, paths, backends, and certificates
@@ -304,6 +335,7 @@ OTHER:
 Every option has an environment twin (RAMJET_STATIC_ROUTES, RAMJET_INGRESS_CLASS,
 RAMJET_WATCH_NAMESPACE, RAMJET_DEFAULT_BACKEND, RAMJET_DEFAULT_TLS_SECRET,
 RAMJET_PUBLISH_ADDRESS, RAMJET_PUBLISH_SERVICE, RAMJET_UPDATE_STATUS,
+RAMJET_HISTORY_SIZE, RAMJET_AUDIT_WEBHOOK,
 RAMJET_HTTP, RAMJET_HTTPS, RAMJET_ADMIN, RAMJET_CONNECT_TIMEOUT,
 RAMJET_RESPONSE_TIMEOUT, RAMJET_MAX_CONNECT_ATTEMPTS, RAMJET_UPSTREAM_POOL_IDLE,
 RAMJET_MAX_BUF_SIZE, RAMJET_WORKER_THREADS, RAMJET_SHUTDOWN_GRACE,
@@ -311,11 +343,39 @@ RAMJET_ENGINE, RAMJET_PROXY_PROTOCOL, RAMJET_PROXY_PROTOCOL_TIMEOUT).
 A flag always beats the environment. RUST_LOG sets the log filter.
 
 ADMIN ENDPOINTS:
-    /metrics    Prometheus text exposition
-    /healthz    Liveness: 200 whenever the process is answering
-    /readyz     Readiness: 200 once a route table has been published. In
-                Kubernetes mode that means a compiled generation, not the
-                controller's empty seed.
+    GET    /metrics             Prometheus text exposition
+    GET    /healthz             Liveness: 200 whenever the process is answering
+    GET    /readyz              Readiness: 200 once a route table has been
+                                published. In Kubernetes mode that means a
+                                compiled generation, not the controller's empty
+                                seed.
+    GET    /admin/generations   The generations this replica has applied, newest
+                                first, each with what changed and whether it
+                                went live
+    GET    /admin/routes        Every route in the serving table, with its
+                                request, error, and upstream-latency counters
+    POST   /admin/rollback      {\"generation\": N} — republish N and hold
+                                publication there. 404 if N is not in the
+                                history, 409 if something is already pinned.
+    DELETE /admin/rollback      Release the pin and publish the newest
+                                generation. Idempotent.
+
+    A rollback is an emergency brake, not desired state. The controller keeps
+    watching and compiling while a pin is held — the generations it builds are
+    recorded and marked as not published — and releasing the pin jumps straight
+    to the newest one. The pin lives in memory and dies with the process:
+    Kubernetes is the source of truth after a restart, so fix the objects and
+    then release it.
+
+    Per-route counters are served here and deliberately not exported as
+    Prometheus series: ten thousand routes would mean ten thousand series on
+    every scrape. /metrics gains only ramjet_pinned, which is 1 while a rollback
+    is holding publication.
+
+    The listener has no authentication and is not meant to be reachable from
+    outside the cluster; the chart puts it behind a ClusterIP Service. Only POST
+    and DELETE can change what is served, so nothing that follows links can roll
+    a cluster back by accident.
 ";
 
 impl Args {
@@ -370,6 +430,8 @@ impl Args {
                 }
                 "--default-tls-secret" => args.default_tls_secret = Some(value()?),
                 "--no-status-update" => args.update_status = false,
+                "--history-size" => args.history_size = number(&name, &value()?)?.max(1),
+                "--audit-webhook" => args.audit_webhook = Some(value()?),
                 "--http" => args.http = Some(address(&name, &value()?)?),
                 "--https" => {
                     args.https = Some(address(&name, &value()?)?);
@@ -440,6 +502,12 @@ impl Args {
         }
         if let Some(value) = env("RAMJET_UPDATE_STATUS") {
             args.update_status = boolean("RAMJET_UPDATE_STATUS", &value)?;
+        }
+        if let Some(value) = env("RAMJET_HISTORY_SIZE") {
+            args.history_size = number("RAMJET_HISTORY_SIZE", &value)?.max(1);
+        }
+        if let Some(value) = env("RAMJET_AUDIT_WEBHOOK") {
+            args.audit_webhook = Some(value);
         }
         if let Some(value) = env("RAMJET_HTTP") {
             args.http = Some(address("RAMJET_HTTP", &value)?);
@@ -895,9 +963,63 @@ mod tests {
             "--engine",
             "--proxy-protocol",
             "--proxy-protocol-timeout",
+            "--history-size",
+            "--audit-webhook",
         ] {
             assert!(USAGE.contains(option), "{option} is undocumented");
         }
+    }
+
+    #[test]
+    fn the_usage_text_documents_every_admin_endpoint() {
+        for endpoint in [
+            "/metrics",
+            "/healthz",
+            "/readyz",
+            "/admin/generations",
+            "/admin/routes",
+            "/admin/rollback",
+        ] {
+            assert!(USAGE.contains(endpoint), "{endpoint} is undocumented");
+        }
+    }
+
+    #[test]
+    fn history_and_audit_take_a_flag_and_an_environment_twin() {
+        let args = parse(&[
+            "--history-size",
+            "25",
+            "--audit-webhook",
+            "http://audit.svc:8080/hook",
+        ])
+        .expect("valid");
+        assert_eq!(args.history_size, 25);
+        assert_eq!(args.audit_webhook.as_deref(), Some("http://audit.svc:8080/hook"));
+
+        let env = |name: &str| match name {
+            "RAMJET_HISTORY_SIZE" => Some("3".to_owned()),
+            "RAMJET_AUDIT_WEBHOOK" => Some("http://elsewhere:9000/".to_owned()),
+            _ => None,
+        };
+        let args = Args::parse(Vec::<String>::new(), env).expect("valid");
+        assert_eq!(args.history_size, 3);
+        assert_eq!(args.audit_webhook.as_deref(), Some("http://elsewhere:9000/"));
+    }
+
+    #[test]
+    fn a_history_of_zero_is_read_as_one() {
+        // A ring that keeps nothing could never answer a rollback, and zero is
+        // a typo rather than an intent.
+        assert_eq!(parse(&["--history-size", "0"]).expect("valid").history_size, 1);
+    }
+
+    #[test]
+    fn the_history_default_is_the_one_the_proxy_documents() {
+        assert_eq!(
+            parse(&[]).expect("valid").history_size,
+            ramjet_proxy::DEFAULT_HISTORY_SIZE
+        );
+        assert_eq!(parse(&[]).expect("valid").audit_webhook, None);
     }
 
     #[test]
