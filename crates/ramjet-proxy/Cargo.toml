@@ -33,6 +33,12 @@ pin-project-lite = "0.2"
 # entirely: no `serde_json` call happens between accepting a client connection
 # and writing its response.
 serde_json = "1.0"
+# One call, `geteuid`, in the message a refused bind below port 1024 prints.
+# This crate forbids unsafe code, so the raw syscall is not an option, and the
+# uid is the line that tells the reader why a capability the values file grants
+# was not in force. `ramjet-top` already links rustix through crossterm, so the
+# workspace pays no new build for it.
+rustix = { version = "1.1", features = ["process"] }
 socket2 = { version = "0.6", features = ["all"] }
 # Comparing the admin bearer token, and nothing else. Six lines of `|= a ^ b`
 # would look the same and be a promise this crate cannot keep: nothing stops

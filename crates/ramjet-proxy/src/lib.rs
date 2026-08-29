@@ -103,7 +103,7 @@ pub use forward::{ConnInfo, ProxyState, Scheme};
 pub use history::{
     CertKeys, GenerationHistory, GenerationRecord, PinChange, PinError, DEFAULT_HISTORY_SIZE,
 };
-pub use listener::{Listener, ListenerConfig};
+pub use listener::{explain_bind_failure, Listener, ListenerConfig};
 pub use metrics::{Exposition, Metrics};
 pub use mirror::{Mirror, DEFAULT_MIRROR_MAX_BODY, MIRROR_QUEUE_DEPTH};
 pub use server::{

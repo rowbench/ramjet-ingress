@@ -149,7 +149,8 @@ impl Listener {
         // first one owns, and QUIC has no way to recover from that: the packets
         // are simply delivered to an endpoint that cannot decrypt them. A bind
         // that fails loudly with `EADDRINUSE` is the outcome to want here.
-        let socket = UdpSocket::bind(addr)?;
+        let socket = UdpSocket::bind(addr)
+            .map_err(|error| crate::listener::explain_bind_failure(addr, error))?;
         // quinn drives this through its own reactor registration, which needs a
         // non-blocking socket; a blocking one stalls the whole runtime.
         socket.set_nonblocking(true)?;

@@ -565,11 +565,16 @@ fn bind_intake(addr: SocketAddr, cores: usize, backlog: i32) -> io::Result<(Vec<
     let mut sockets = Vec::with_capacity(wanted);
     let mut bound = addr;
     for i in 0..wanted {
-        let listener = ramjet::net::Listener::builder(if i == 0 { addr } else { bound })
+        let wanted_addr = if i == 0 { addr } else { bound };
+        let listener = ramjet::net::Listener::builder(wanted_addr)
             .reuseaddr(true)
             .reuseport(per_core)
             .backlog(backlog)
-            .build()?;
+            .build()
+            // Same explanation the hyper engine gives, from the same function:
+            // which engine happened to own the listener is not something the
+            // operator chose, and the remedy does not depend on it.
+            .map_err(|error| ramjet_proxy::explain_bind_failure(wanted_addr, error))?;
         if i == 0 {
             bound = listener.local_addr();
         }

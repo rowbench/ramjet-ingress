@@ -2274,6 +2274,7 @@ dependencies = [
  "quinn",
  "ramjet-router",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",

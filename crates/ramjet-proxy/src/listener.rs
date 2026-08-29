@@ -28,6 +28,71 @@ use std::net::SocketAddr;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 
+/// The first port a process with no capability of its own may bind on Linux,
+/// unless the node's `net.ipv4.ip_unprivileged_port_start` says otherwise.
+const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
+
+/// Replace a bare `EACCES` from `bind(2)` with an error an operator can act on.
+///
+/// This is the one bind failure whose kernel message says nothing useful.
+/// `Permission denied (os error 13)` names neither the port that was refused
+/// nor the reason, and the reason is genuinely surprising: a Kubernetes
+/// `securityContext` that adds `NET_BIND_SERVICE` puts the capability in the
+/// container's permitted and bounding sets, and a **non-root** process still
+/// drops it on `execve` — the kernel raises a capability into a non-root
+/// process's effective set only from a file capability on the binary. So the
+/// values file reads as though the capability was granted, the pod crash-loops,
+/// and the log says "Permission denied".
+///
+/// Everything else is passed through unchanged. `EACCES` on any other port is a
+/// different problem (SELinux, an LSM, a seccomp filter) and guessing at it
+/// would bury the real error under a paragraph about ports. Port 0 counts as
+/// "any other": the kernel picks from the ephemeral range, which is never
+/// privileged.
+pub fn explain_bind_failure(addr: SocketAddr, error: io::Error) -> io::Error {
+    let privileged = (1..FIRST_UNPRIVILEGED_PORT).contains(&addr.port());
+    if error.kind() != io::ErrorKind::PermissionDenied || !privileged {
+        return error;
+    }
+
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "cannot bind {addr}: permission denied. \
+             Binding a port below {FIRST_UNPRIVILEGED_PORT} as uid {uid} needs CAP_NET_BIND_SERVICE \
+             in this process's *effective* set, and a non-root process gets one there only from a \
+             file capability on the binary — Kubernetes' securityContext.capabilities.add grants \
+             it to the container, and execve then drops it again. Two ways out. (1) Run an image \
+             whose binary carries the capability, which the published one does \
+             (`setcap cap_net_bind_service=+ep /usr/local/bin/ramjet-ingressd`), and keep \
+             NET_BIND_SERVICE in securityContext.capabilities.add so it stays in the container's \
+             bounding set. (2) `sysctl -w net.ipv4.ip_unprivileged_port_start={port}` on the \
+             node, which makes this port unprivileged for everything on it — and has to be set \
+             on the node, because a host-network pod shares the node's network namespace and the \
+             kubelet refuses to set net.* sysctls for such a pod",
+            uid = effective_uid(),
+            port = addr.port(),
+        ),
+    )
+}
+
+/// The uid the kernel checked the capability against, for the message above.
+///
+/// `rustix` rather than a `libc::geteuid` call because this crate forbids
+/// unsafe code, and rather than nothing at all because "as uid 65532" is the
+/// line that tells a reader the process is not root — which is the whole
+/// mechanism, and the thing a values file does not make obvious.
+fn effective_uid() -> String {
+    #[cfg(unix)]
+    {
+        rustix::process::geteuid().as_raw().to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        "this process's user".to_owned()
+    }
+}
+
 /// How a listening socket is configured.
 #[derive(Debug, Clone, Copy)]
 pub struct ListenerConfig {
@@ -94,7 +159,9 @@ impl Listener {
         // tokio requires a non-blocking socket; converting a blocking one
         // produces a listener that stalls the whole worker on accept.
         socket.set_nonblocking(true)?;
-        socket.bind(&config.addr.into())?;
+        socket
+            .bind(&config.addr.into())
+            .map_err(|error| explain_bind_failure(config.addr, error))?;
         socket.listen(config.backlog)?;
 
         Ok(Listener {
@@ -150,6 +217,48 @@ mod tests {
             second.is_ok(),
             "SO_REUSEPORT should permit a second listener on {addr}"
         );
+    }
+
+    #[test]
+    fn a_refused_privileged_bind_says_what_to_do_about_it() {
+        let addr: SocketAddr = "0.0.0.0:80".parse().expect("literal");
+        let error = explain_bind_failure(addr, io::Error::from(io::ErrorKind::PermissionDenied));
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let message = error.to_string();
+        // The port, the uid, and both remedies — each of which somebody has to
+        // be able to find in a `kubectl logs` of a crash-looping pod.
+        assert!(message.contains("0.0.0.0:80"), "{message}");
+        assert!(
+            message.contains(&format!("uid {}", effective_uid())),
+            "{message}"
+        );
+        assert!(message.contains("setcap cap_net_bind_service=+ep"), "{message}");
+        assert!(message.contains("capabilities.add"), "{message}");
+        assert!(
+            message.contains("net.ipv4.ip_unprivileged_port_start"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn every_other_bind_failure_is_passed_through_untouched() {
+        // A port already in use is the common bind failure and the kernel's
+        // own message is the right one; so is EACCES on a high port, which is
+        // an LSM or a seccomp filter and has nothing to do with capabilities.
+        let addr: SocketAddr = "0.0.0.0:80".parse().expect("literal");
+        let in_use = explain_bind_failure(addr, io::Error::from(io::ErrorKind::AddrInUse));
+        assert!(!in_use.to_string().contains("setcap"), "{in_use}");
+
+        let high: SocketAddr = "0.0.0.0:8080".parse().expect("literal");
+        let denied = explain_bind_failure(high, io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(!denied.to_string().contains("setcap"), "{denied}");
+
+        // Port 0 is the kernel picking from the ephemeral range, which is never
+        // privileged — so an EACCES there is somebody else's problem too.
+        let any: SocketAddr = "0.0.0.0:0".parse().expect("literal");
+        let ephemeral = explain_bind_failure(any, io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(!ephemeral.to_string().contains("setcap"), "{ephemeral}");
     }
 
     #[tokio::test]
