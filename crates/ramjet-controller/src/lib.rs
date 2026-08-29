@@ -76,6 +76,7 @@ mod annotations;
 mod audit;
 mod class;
 mod config;
+mod diagnostics;
 mod diff;
 mod digest;
 mod endpoints;

@@ -3,6 +3,10 @@
 Every annotation this controller reads, and nothing else. Anything not on this
 page is ignored — see [what is not here](#what-is-not-here).
 
+A value that *is* read and cannot be used is
+[reported on the object itself](#a-refused-value-says-so-on-the-object), so
+finding out does not need pod-log access.
+
 ## Two prefixes, and the rule for choosing
 
 Anything ingress-nginx already spells gets the `nginx.ingress.kubernetes.io`
@@ -230,6 +234,56 @@ metadata:
 
 See [Canary auto-promotion](../operations/canary.md) for the state machine and
 the interlocks.
+
+## A refused value says so on the object
+
+Every annotation above falls back rather than failing the Ingress — a
+fat-fingered weight must not take a route out of service. The cost of that is
+that a refused value goes on sitting there looking applied, so each one also
+becomes a **Warning Event on the Ingress that carries it**:
+
+```sh
+kubectl describe ingress web-canary
+```
+
+```text
+Events:
+  Type     Reason             Age   From            Message
+  ----     ------             ----  ----            -------
+  Warning  InvalidAnnotation  2m    ramjet-ingress  `nginx.ingress.kubernetes.io/canary-weight` is not a number; using 0
+  Warning  MirrorRejected     2m    ramjet-ingress  a canary Ingress cannot also mirror; the mirror is ignored
+```
+
+The `Reason` is the refusal's kind, so it is filterable:
+
+```sh
+kubectl get events -A --field-selector reason=CanaryInert
+```
+
+| Reason | Means |
+|---|---|
+| `InvalidAnnotation` | A value could not be parsed and its default was used |
+| `CanaryInert` | A canary is configured such that no request can ever reach it |
+| `CanaryOrphan` | A canary attached to no production route |
+| `CanaryConflict` | Two canaries claimed the same production route |
+| `MirrorRejected` | A mirror could not be used and the route is served without it |
+| `BackendProtocolConflict` | Two Ingresses asked for different `backend-protocol` on one Service port |
+
+**Only these, and only when they change.** Events are written when an object's
+set of refusals differs from the last set written for it, not on every rebuild —
+a rebuild happens on every watch event in the cluster, and re-stating an
+unchanged complaint would be one Event per Ingress per deploy forever. Fixing
+one annotation and breaking another in the same edit is a change, so it is
+reported immediately; a cooldown would have swallowed it.
+
+Warnings that are *not* about an annotation value stay in the log, where the
+person who can act on them already is: a Service with no endpoints, a TLS Secret
+that has not been created, a route another Ingress already claimed. So does
+`EndpointsSkipped`, which fires on every healthy rolling update and would train
+people to ignore the stream.
+
+RBAC: `events.k8s.io`/`events`/`create`, which the chart's ClusterRole has.
+Without it these are skipped at `debug` and the log lines are unaffected.
 
 ## What is not here
 

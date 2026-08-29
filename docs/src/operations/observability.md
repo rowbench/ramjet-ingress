@@ -314,3 +314,19 @@ Through `tracing` to stderr, `info` by default, filtered with `RUST_LOG`. The
 lines worth alerting on are the per-generation publish record on the `audit`
 target and the warnings from translation: a rejected Ingress, an unresolvable
 Service, a Secret that will not parse.
+
+## Events
+
+Not everything worth knowing needs pod-log access, and the things an Ingress's
+author can act on should not.
+
+| Where | What lands there |
+|---|---|
+| `kubectl describe ingressclass ramjet` | `ConfigApplied`, `ConfigPinned`, `ConfigResumed` — one per published generation, rollback, and resume |
+| `kubectl describe ingress <canary>` | `CanaryStepped`, `CanaryPromoted`, `CanaryRolledBack` — [automatic promotion](canary.md#where-the-decisions-show-up) |
+| `kubectl describe ingress <any>` | A `Warning` per [refused annotation value](../configuration/annotations.md#a-refused-value-says-so-on-the-object) |
+
+The split is by what the Event is about: a compiled generation belongs to no
+single Ingress, and a promotion decision or a refused value belongs to exactly
+one. Per-object Events are written only when what they say changes, so a steady
+broken state costs one Event rather than one per rebuild.

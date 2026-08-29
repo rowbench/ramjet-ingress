@@ -121,6 +121,70 @@ pub enum WarningKind {
     BackendProtocolConflict,
 }
 
+impl WarningKind {
+    /// The `Reason` string for a Kubernetes Event, which is a `PascalCase`
+    /// identifier by convention.
+    ///
+    /// Written out rather than derived from `Debug`, because it is a name
+    /// operators will filter on — `kubectl get events --field-selector
+    /// reason=CanaryInert` — and a rename of a Rust variant should not silently
+    /// break somebody's alert.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WarningKind::UnknownClass => "UnknownClass",
+            WarningKind::RouteConflict => "RouteConflict",
+            WarningKind::UnsupportedBackend => "UnsupportedBackend",
+            WarningKind::ServiceUnresolved => "ServiceUnresolved",
+            WarningKind::ExternalNameService => "ExternalNameService",
+            WarningKind::EndpointsSkipped => "EndpointsSkipped",
+            WarningKind::InvalidRoute => "InvalidRoute",
+            WarningKind::InvalidAnnotation => "InvalidAnnotation",
+            WarningKind::CanaryOrphan => "CanaryOrphan",
+            WarningKind::CanaryConflict => "CanaryConflict",
+            WarningKind::CanaryInert => "CanaryInert",
+            WarningKind::MirrorRejected => "MirrorRejected",
+            WarningKind::TlsSecret => "TlsSecret",
+            WarningKind::TlsConflict => "TlsConflict",
+            WarningKind::TlsHostless => "TlsHostless",
+            WarningKind::DefaultBackendConflict => "DefaultBackendConflict",
+            WarningKind::BackendProtocolConflict => "BackendProtocolConflict",
+        }
+    }
+
+    /// Whether this names a value the operator wrote in an annotation on the
+    /// subject, and so is worth a Warning Event on it.
+    ///
+    /// The line is drawn at *annotations*, not at "everything on an Ingress",
+    /// for two reasons that point the same way.
+    ///
+    /// An annotation is where this controller's own vocabulary lives, so a
+    /// refused one is nearly always a typo or a value that means something
+    /// different from what the author expected — and the object is the only
+    /// place that can say so, because the annotation itself still sits there
+    /// looking applied. Everything else here is either visible in the `spec`
+    /// (`UnsupportedBackend`, `InvalidRoute`), a fact about the cluster rather
+    /// than the object (`ServiceUnresolved`, `TlsSecret`), or a conflict whose
+    /// interesting half is on some *other* object (`RouteConflict`).
+    ///
+    /// Two exclusions are worth naming. `EndpointsSkipped` fires on every
+    /// healthy rolling update and is logged at `debug` for exactly that reason;
+    /// an Event stream that cried wolf on every deploy would train people to
+    /// ignore the ones that matter. `UnknownClass` is about an Ingress this
+    /// replica is *not* managing, and writing Events onto other controllers'
+    /// objects is not this controller's business.
+    pub fn is_annotation_refusal(self) -> bool {
+        matches!(
+            self,
+            WarningKind::InvalidAnnotation
+                | WarningKind::CanaryOrphan
+                | WarningKind::CanaryConflict
+                | WarningKind::CanaryInert
+                | WarningKind::MirrorRejected
+                | WarningKind::BackendProtocolConflict
+        )
+    }
+}
+
 /// One thing the translator refused, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Warning {

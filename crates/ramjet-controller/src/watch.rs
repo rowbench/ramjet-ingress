@@ -36,6 +36,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use crate::config::{CompiledConfig, ControllerOpts};
+use crate::diagnostics::WarningEvents;
 use crate::snapshot::ClusterSnapshot;
 use crate::status::StatusWriter;
 use crate::tls::TLS_SECRET_TYPE;
@@ -269,6 +270,7 @@ async fn rebuild_loop(
     }
     info!("initial list complete");
 
+    let mut warnings = WarningEvents::new(client.clone());
     let mut status = StatusWriter::new(client, &opts);
     // Seeded with the empty table the channel already holds, so the first real
     // publish lands at generation 1 and "generation 0" keeps its meaning:
@@ -279,10 +281,12 @@ async fn rebuild_loop(
     loop {
         if resynced.swap(false, Ordering::Relaxed) {
             // The watch restarted, so what we believe we wrote to each
-            // Ingress's status may predate the gap. Re-assert it.
+            // Ingress's status — and what we believe we have already complained
+            // about — may predate the gap. Re-assert both.
             if let Some(status) = &mut status {
                 status.invalidate();
             }
+            warnings.invalidate();
         }
 
         rebuild(
@@ -290,6 +294,7 @@ async fn rebuild_loop(
             &tx,
             &stores,
             &mut status,
+            &mut warnings,
             &mut current,
             &mut published_digest,
         )
@@ -315,6 +320,7 @@ async fn rebuild(
     tx: &watch_channel::Sender<Arc<CompiledConfig>>,
     stores: &Stores,
     status: &mut Option<StatusWriter>,
+    warning_events: &mut WarningEvents,
     current: &mut Option<Arc<CompiledConfig>>,
     published_digest: &mut Option<u64>,
 ) {
@@ -347,6 +353,11 @@ async fn rebuild(
             );
         }
     }
+
+    // And the ones that name a value somebody wrote in an annotation also go on
+    // the object, where its author can see them without pod-log access. Only
+    // when the set changed; see `diagnostics`.
+    warning_events.sync(&translation.warnings, &snapshot);
 
     if *published_digest == Some(translation.digest) {
         debug!(
