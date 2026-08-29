@@ -1,0 +1,64 @@
+[1;34m==>[0m steady-state, c64
+[1;34m==>[0m Benchmark 1: steady-state forwarding, c64, 30s x 3, interleaved
+    contenders rotate every round so ordering bias cancels rather than accumulates
+    engines verified: hyper=engine="hyper" uring=engine="uring"
+[1;34m==>[0m round 1/3: baseline hyper nginx uring
+    c64-baseline-r1           21,724 rps  p50   2.11  p99   13.78 ms  2xx  651,892  other    0  err    0  cpu/req    0.0 us  | us=42 sy=45 id=6 wa=3 steal=1.03
+    c64-hyper-r1              10,858 rps  p50   4.97  p99   21.11 ms  2xx  325,841  other    0  err    0  cpu/req  100.5 us  | us=43 sy=46 id=6 wa=2 steal=0.41
+    c64-nginx-r1               7,865 rps  p50   7.32  p99   24.90 ms  2xx  236,020  other    0  err    0  cpu/req  188.5 us  | us=48 sy=44 id=4 wa=1 steal=0.09
+    c64-uring-r1              12,299 rps  p50   3.85  p99   21.96 ms  2xx  369,067  other    0  err    0  cpu/req   70.5 us  | us=38 sy=49 id=6 wa=3 steal=0.41
+[1;34m==>[0m round 2/3: hyper nginx uring baseline
+    c64-hyper-r2              10,689 rps  p50   4.90  p99   22.70 ms  2xx  320,755  other    0  err    0  cpu/req  101.2 us  | us=43 sy=45 id=6 wa=3 steal=0.44
+    c64-nginx-r2               8,078 rps  p50   7.06  p99   23.96 ms  2xx  242,418  other    0  err    0  cpu/req  184.1 us  | us=48 sy=44 id=3 wa=2 steal=0.03
+    c64-uring-r2              12,446 rps  p50   3.75  p99   22.05 ms  2xx  373,512  other    0  err    0  cpu/req   69.0 us  | us=38 sy=49 id=6 wa=3 steal=0.34
+    c64-baseline-r2           22,386 rps  p50   2.04  p99   13.64 ms  2xx  671,697  other    0  err    0  cpu/req    0.0 us  | us=43 sy=45 id=5 wa=4 steal=0.19
+[1;34m==>[0m round 3/3: nginx uring baseline hyper
+    c64-nginx-r3               7,971 rps  p50   6.96  p99   25.02 ms  2xx  239,205  other    0  err    0  cpu/req  186.8 us  | us=48 sy=44 id=4 wa=1 steal=0.12
+    c64-uring-r3              12,355 rps  p50   3.81  p99   22.07 ms  2xx  370,748  other    0  err    0  cpu/req   69.2 us  | us=38 sy=49 id=6 wa=3 steal=0.31
+    c64-baseline-r3           22,234 rps  p50   2.11  p99   13.36 ms  2xx  667,169  other    0  err    0  cpu/req    0.0 us  | us=43 sy=45 id=5 wa=3 steal=0.72
+    c64-hyper-r3              10,880 rps  p50   4.95  p99   20.89 ms  2xx  326,484  other    0  err    0  cpu/req   99.4 us  | us=43 sy=46 id=5 wa=3 steal=0.12
+[1;34m==>[0m Benchmark 1 complete — raw output in /home/ubuntu/ec2bench/results/s1
+[1;34m==>[0m steady-state, c256
+[1;34m==>[0m Benchmark 1: steady-state forwarding, c256, 30s x 1, interleaved
+    contenders rotate every round so ordering bias cancels rather than accumulates
+    engines verified: hyper=engine="hyper" uring=engine="uring"
+[1;34m==>[0m round 1/1: baseline hyper nginx uring
+    c256-baseline-r1          22,722 rps  p50   9.51  p99   42.32 ms  2xx  682,040  other    0  err    0  cpu/req    0.0 us  | us=44 sy=46 id=5 wa=2 steal=0.09
+    c256-hyper-r1             11,705 rps  p50  18.56  p99   78.61 ms  2xx  351,480  other    0  err    0  cpu/req  100.4 us  | us=45 sy=47 id=3 wa=2 steal=0.06
+    c256-nginx-r1              8,027 rps  p50  29.81  p99   78.47 ms  2xx  241,056  other    0  err    0  cpu/req  188.4 us  | us=49 sy=45 id=3 wa=1 steal=0.00
+    c256-uring-r1             13,490 rps  p50  14.62  p99   77.83 ms  2xx  405,128  other    0  err    0  cpu/req   69.1 us  | us=39 sy=50 id=5 wa=2 steal=0.53
+[1;34m==>[0m Benchmark 1 complete — raw output in /home/ubuntu/ec2bench/results/s1
+[1;34m==>[0m config churn
+[1;34m==>[0m Benchmark 2: config churn under load
+    window 120s, settle 10s, oha c64 for 100s, churn every 2s
+    50 idle keep-alive connections held throughout, probed every 10s
+[1;34m==>[0m round 1/2 (contenders: hyper nginx; arms: baseline spec endpoint)
+    hyper-baseline-r1          10,454 rps  p99  21.95 ms  err    0  idle 50/50  cfg   0  cpu/req  110.6 us  | us=43 sy=46 id=4 wa=3 steal=0.44
+    nginx-baseline-r1           7,963 rps  p99  24.93 ms  err    0  idle 50/50  cfg   0  cpu/req  197.2 us  | us=49 sy=44 id=2 wa=1 steal=0.04
+    hyper-spec-r1              10,055 rps  p99  23.24 ms  err    0  idle 50/50  cfg  44  cpu/req  109.7 us  | us=45 sy=45 id=4 wa=3 steal=0.23
+    nginx-spec-r1               7,149 rps  p99  29.46 ms  err  876  idle 0/50  cfg  33  cpu/req  218.5 us  | us=49 sy=44 id=2 wa=1 steal=0.06
+    hyper-endpoint-r1           9,916 rps  p99  23.82 ms  err    0  idle 50/50  cfg  46  cpu/req  110.1 us  | us=45 sy=45 id=4 wa=3 steal=0.43
+    nginx-endpoint-r1           7,531 rps  p99  29.43 ms  err    0  idle 50/50  cfg   0  cpu/req  194.9 us  | us=49 sy=43 id=2 wa=1 steal=0.05
+[1;34m==>[0m round 2/2 (contenders: nginx hyper; arms: endpoint spec baseline)
+    nginx-endpoint-r2           7,626 rps  p99  30.50 ms  err    0  idle 50/50  cfg   0  cpu/req  193.3 us  | us=49 sy=44 id=2 wa=1 steal=0.01
+    hyper-endpoint-r2          10,270 rps  p99  23.10 ms  err    0  idle 50/50  cfg  46  cpu/req  107.6 us  | us=45 sy=46 id=3 wa=2 steal=0.01
+    nginx-spec-r2               7,303 rps  p99  28.28 ms  err  953  idle 0/50  cfg  33  cpu/req  215.1 us  | us=50 sy=44 id=2 wa=1 steal=0.02
+    hyper-spec-r2              10,410 rps  p99  22.22 ms  err    0  idle 50/50  cfg  45  cpu/req  107.6 us  | us=46 sy=46 id=3 wa=2 steal=0.02
+    nginx-baseline-r2           8,215 rps  p99  26.07 ms  err    0  idle 50/50  cfg   0  cpu/req  188.6 us  | us=49 sy=44 id=3 wa=1 steal=0.05
+    hyper-baseline-r2          11,144 rps  p99  20.22 ms  err    0  idle 50/50  cfg   0  cpu/req  104.4 us  | us=44 sy=47 id=3 wa=2 steal=0.04
+[1;34m==>[0m Benchmark 2 complete — raw output in /home/ubuntu/ec2bench/results/s2
+[1;34m==>[0m propagation
+[1;34m==>[0m Benchmark 3: propagation latency (apply -> first 200)
+    10 trials per contender, contenders rotated every trial
+    trial 1    hyper=371.8/187.7ms  nginx=398.4/189.6ms  uring=371.3/166.8ms
+    trial 2    nginx=2813.0/170.9ms  uring=371.2/186.0ms  hyper=374.0/189.5ms
+    trial 3    uring=371.3/166.6ms  hyper=372.7/188.0ms  nginx=996.2/169.1ms
+    trial 4    hyper=393.4/208.5ms  nginx=2787.2/192.2ms  uring=392.3/187.4ms
+    trial 5    nginx=2803.2/171.1ms  uring=370.8/186.0ms  hyper=371.6/186.9ms
+    trial 6    uring=372.8/186.3ms  hyper=392.5/187.5ms  nginx=917.6/192.8ms
+    trial 7    hyper=426.5/221.8ms  nginx=2750.9/190.9ms  uring=393.9/188.5ms
+    trial 8    nginx=2782.7/192.5ms  uring=390.8/186.6ms  hyper=375.6/190.8ms
+    trial 9    uring=370.4/185.7ms  hyper=395.1/189.1ms  nginx=917.5/190.8ms
+    trial 10   hyper=392.6/186.8ms  nginx=2772.2/192.4ms  uring=371.7/186.9ms
+[1;34m==>[0m Benchmark 3 complete — raw output in /home/ubuntu/ec2bench/results/s3
+[1;34m==>[0m ALL DONE

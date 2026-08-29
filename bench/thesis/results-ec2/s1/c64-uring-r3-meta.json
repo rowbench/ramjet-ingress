@@ -1,0 +1,1 @@
+{"controller_cpu_seconds": 25.666, "controller_mem_bytes_end": 15900672, "cpu_us_per_request": 69.23, "vmstat": "us=38 sy=49 id=6 wa=3 steal=0.31", "rps": 12354.994287050315, "p50_ms": 3.814624, "p99_ms": 22.07044, "ok": 370748, "non_2xx": 0, "errors": 0}

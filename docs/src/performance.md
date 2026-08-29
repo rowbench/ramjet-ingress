@@ -8,15 +8,21 @@ re-derived without re-running anything.
 | Document | The question it answers |
 |---|---|
 | [`bench/thesis/RESULTS.md`](https://github.com/rowbench/ramjet-ingress/blob/main/bench/thesis/RESULTS.md) | What does a configuration change cost, against ingress-nginx? **This is the project's actual thesis.** |
+| [`bench/thesis/RESULTS-EC2.md`](https://github.com/rowbench/ramjet-ingress/blob/main/bench/thesis/RESULTS-EC2.md) | Does that thesis survive on real Linux? Same opponent, EC2 and k0s, no VM |
 | [`bench/RESULTS.md`](https://github.com/rowbench/ramjet-ingress/blob/main/bench/RESULTS.md) | Raw HTTP/1.1 forwarding throughput, against nginx |
 | [`bench/engine/RESULTS.md`](https://github.com/rowbench/ramjet-ingress/blob/main/bench/engine/RESULTS.md) | Does the io_uring engine get under the syscall floor? |
 | [`bench/PROFILE.md`](https://github.com/rowbench/ramjet-ingress/blob/main/bench/PROFILE.md) | Where does a request actually go? |
 
 ## Read this first
 
-**These are macOS Docker Desktop VM numbers**, on Apple Silicon under a linuxkit
-guest. They are valid *relative to each other* under identical conditions; they
-are not Linux bare-metal absolutes and should not be quoted as such.
+**Most of these are macOS Docker Desktop VM numbers**, on Apple Silicon under a
+linuxkit guest. They are valid *relative to each other* under identical
+conditions; they are not Linux bare-metal absolutes and should not be quoted as
+such. Two sections are the exception and say so where they appear: the thesis
+[re-run on EC2 and k0s](#on-real-linux-same-opponent), and the uring engine's
+[real-Linux check](#on-real-linux). Both carry their own caveat — a shared,
+burstable four-vCPU box with the load generator on it — which compresses ratios
+rather than inflating them.
 
 **The competitor is not understated on purpose.** ingress-nginx does **not**
 reload for every change — endpoint updates go through its Lua balancer without
@@ -99,8 +105,13 @@ kept all 50 idle connections and served zero errors. Its Lua balancer does what
 it claims, and any characterisation of ingress-nginx as "reloads on every
 change" is wrong.
 
-**But its non-reloading path is the more expensive one for CPU**: +25% against
-its own baseline, where the reloading path cost +10%.
+> **The +25% below has since been retracted.** This run reported that
+> ingress-nginx's non-reloading path was the more expensive one for CPU — +25%
+> against its own baseline, where the reloading path cost +10%. It was measured
+> under the arm-ordering confound described in the next section, and when
+> [the EC2 run](#on-real-linux-same-opponent) reversed the arm order the figure
+> came back as **+1%**. The Lua balancer is close to free; treat the +25% as an
+> artifact and not as a finding.
 
 ### What benchmark 1 does not establish
 
@@ -123,6 +134,48 @@ their own warning label: they report ramjet-ingress losing 62% of its throughput
 to spec churn, from a contender whose CPU per request did not move at all under
 the same churn on a quiet machine. **That number is the other agent's benchmark,
 not this one's.**
+
+### On real Linux, same opponent
+
+Everything above is VM numbers, so the thesis was re-run against the same
+`kubernetes/ingress-nginx` 4.15.1 on an EC2 `t3.xlarge` running k0s v1.36.3 —
+real Linux, no VM in the path, three controllers standing in one cluster. Full
+report: [`bench/thesis/RESULTS-EC2.md`](https://github.com/rowbench/ramjet-ingress/blob/main/bench/thesis/RESULTS-EC2.md).
+
+**The thesis transfers, at the same magnitudes.**
+
+| Under Ingress-spec churn | ramjet | ingress-nginx |
+|---|---:|---:|
+| Idle keep-alive connections surviving | **100 / 100** | **0 / 100** |
+| HTTP errors | **0** | 1,829 |
+| CPU per request vs own baseline | **+1%** | +12% |
+
+Steady-state forwarding on the same box, median of three interleaved 30-second
+runs at c64, with the backend Service's own NodePort as a no-proxy baseline:
+
+| Contender | RPS | % of baseline | CPU per request | Memory |
+|---|---:|---:|---:|---:|
+| **ramjet (uring)** | **12,355** | 55.6% | **69 µs** | 15.2 MiB |
+| ramjet (hyper) | 10,858 | 48.8% | 100 µs | **10.5 MiB** |
+| ingress-nginx | 7,971 | 35.9% | 187 µs | 67.6 MiB |
+
+Propagation of a new Ingress is 372–384 ms at the median against 2,762 ms, and
+the spread matters more than the median: twenty ramjet trials spanned 370–426 ms
+with no slow mode, while ingress-nginx's ten spanned 398–2,813 ms in three
+clusters set by its `--sync-rate-limit` default of 0.3.
+
+**Two claims move, and both move ingress-nginx's way.** Reversing the arm order
+resolved the confound flagged above: endpoint-only churn costs it **+1%** CPU
+per request, not +25%, and −6.3% throughput rather than −26.8% — the same
+contention tax ramjet-ingress paid in the same arm. And the `kubectl apply`
+write path is now a **draw**, 191 ms against 189, with ingress-nginx still doing
+`nginx -t` validation through an admission webhook in that time.
+
+> **Same caveat as the uring section below, and it is load-bearing.** The load
+> generator, the proxies and the upstreams all share four burstable vCPUs, so
+> the proxy is never the sole bottleneck and **every ratio on this page is
+> compressed toward 1.** Steal stayed under 1.1%. The connection-survival result
+> is the one that does not care: 100 against 0, in both environments.
 
 ## Propagation latency
 
@@ -799,8 +852,9 @@ fold, canary resolution, and SNI lookup.
 | | Result |
 |---|---|
 | **Idle-connection memory** | **Won, heavily.** 4.4 KiB/connection against 27.1, and it returns all of it on close while ramjet-ingress retained and grew. Still won after the fix, by less: 4.4 against 20.3, and both now return what they took |
-| **`kubectl apply` write path (single Ingress)** | **Won.** 138 ms median against 159, *including* `nginx -t` validation through an admission webhook that ramjet-ingress does not have |
-| **Endpoint-only churn: connection safety** | **Tied.** 50/50 idle connections survived, zero errors, zero reloads. Its Lua balancer does exactly what it claims and the reload argument does not apply to endpoint changes |
+| **`kubectl apply` write path (single Ingress)** | **Won in the VM, drew on real Linux.** 138 ms median against 159 there; 191 against 189 on EC2. Either way it is doing strictly more work in the time — `nginx -t` validation through an admission webhook that ramjet-ingress does not have |
+| **Endpoint-only churn: connection safety** | **Tied.** 50/50 idle connections survived, zero errors, zero reloads, in both environments. Its Lua balancer does exactly what it claims and the reload argument does not apply to endpoint changes |
+| **Endpoint-only churn: CPU** | **Won a retraction.** The VM run's +25% CPU-per-request penalty on that path did not survive the EC2 rerun with the arm order reversed: **+1%**. The non-reloading path is close to free and the earlier figure was an ordering artifact |
 | **Deleting 500 Ingresses** | **Tied.** ~105 s each; the API server is the bottleneck, not either controller |
 | **Reaching 500 routes at all** | **Tied.** Both converged; neither fell over |
 | **Stall severity** | **Tied-ish.** Neither contender produced a stall over one second attributable to churn. ingress-nginx's reload is visible in the tail, but it is tens of milliseconds, not seconds |
@@ -820,6 +874,11 @@ bench/thesis/run-all.sh                          # the whole cluster suite
 python3 bench/thesis/report.py
 bench/thesis/teardown.sh                         # remove everything, and verify it
 
+bench/thesis/ec2/setup.sh                        # the same thesis on a real k0s node
+bench/thesis/ec2/run-all.sh                      # ~50 minutes
+python3 bench/thesis/ec2/report.py
+bench/thesis/ec2/teardown.sh
+
 ./bench/engine/run.sh                            # ~25 minutes
 python3 bench/engine/report.py
 
@@ -828,8 +887,8 @@ cargo bench -p ramjet-router                     # the matcher microbenchmark
 
 Raw data lives beside each harness: `bench/results/` (current),
 `bench/results/4f58bd7/` and `bench/results/before/` (kept verbatim),
-`bench/thesis/results/` including `b4/` and `b4-after/`, and
-`bench/engine/results/`. Each archived run keeps its own `versions.txt`,
+`bench/thesis/results/` including `b4/` and `b4-after/`,
+`bench/thesis/results-ec2/`, and `bench/engine/results/`. Each archived run keeps its own `versions.txt`,
 `diagnostics.txt` and `table.md`.
 
 Two harness rules worth knowing before you re-run anything:

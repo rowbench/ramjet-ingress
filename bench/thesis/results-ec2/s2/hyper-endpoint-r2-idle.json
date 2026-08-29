@@ -1,0 +1,1 @@
+{"target": "127.0.0.1:31080", "host": "stable.ec2.test", "held": 50, "survived": 50, "lost": 0, "probe_rounds": 12, "probe_every_s": 10.0, "duration_s": 120.0, "events": []}
