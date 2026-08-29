@@ -458,7 +458,7 @@ pub fn normalize_url(input: &str) -> Result<String, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{GenerationEntry, RouteEntry};
+    use crate::contract::{GenerationEntry, RouteEntry, KNOWN_VERSION};
 
     #[test]
     fn a_bare_host_and_port_gains_a_scheme() {
@@ -525,6 +525,7 @@ mod tests {
         Snapshot {
             url: DEFAULT_ADMIN_URL.to_string(),
             generations: GenerationsResponse {
+                version: KNOWN_VERSION,
                 pinned,
                 serving,
                 generations: vec![GenerationEntry {
@@ -533,6 +534,7 @@ mod tests {
                 }],
             },
             routes: RoutesResponse {
+                version: KNOWN_VERSION,
                 generation: serving,
                 routes: vec![RouteEntry::default()],
             },

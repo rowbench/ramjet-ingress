@@ -226,6 +226,7 @@ pub fn generations_json(generation: u64, pinned: Option<u64>, _requests: u64) ->
     let serving = generation;
     format!(
         r#"{{
+  "version": 1,
   "pinned": {pinned},
   "serving": {serving},
   "generations": [
@@ -281,6 +282,7 @@ pub fn routes_json(generation: u64, requests: u64, errors: u64) -> String {
     let canary_latency_sum = canary_requests as f64 * 9.0;
     format!(
         r#"{{
+  "version": 1,
   "generation": {generation},
   "routes": [
     {{

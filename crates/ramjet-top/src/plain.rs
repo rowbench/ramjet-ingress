@@ -269,6 +269,7 @@ fn display_width(text: &str) -> usize {
 mod tests {
     use super::*;
     use crate::contract::{
+        KNOWN_VERSION,
         Canary, GenerationDiff, GenerationEntry, GenerationsResponse, PathType, RouteEntry,
         RoutesResponse,
     };
@@ -288,6 +289,7 @@ mod tests {
         Snapshot {
             url: "http://127.0.0.1:10254".to_string(),
             generations: GenerationsResponse {
+                version: KNOWN_VERSION,
                 pinned: None,
                 serving: 42,
                 generations: vec![
@@ -321,6 +323,7 @@ mod tests {
                 ],
             },
             routes: RoutesResponse {
+                version: KNOWN_VERSION,
                 generation: 42,
                 routes: vec![
                     RouteEntry {

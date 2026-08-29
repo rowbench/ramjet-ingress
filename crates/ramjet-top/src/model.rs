@@ -506,6 +506,7 @@ pub fn compute_global(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::KNOWN_VERSION;
 
     fn route(host: &str, path: &str, backend: &str, requests: u64, errors: u64) -> RouteEntry {
         RouteEntry {
@@ -525,6 +526,7 @@ mod tests {
 
     fn response(routes: Vec<RouteEntry>) -> RoutesResponse {
         RoutesResponse {
+            version: KNOWN_VERSION,
             generation: 1,
             routes,
         }

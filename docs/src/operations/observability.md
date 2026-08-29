@@ -16,7 +16,16 @@ two probes, and a small JSON API.
 | `DELETE` | `/admin/rollback` | Release the pin and publish the newest generation. Idempotent |
 
 The two rollback verbs are covered in
-[Rollback and the audit trail](./rollback.md).
+[Rollback and the audit trail](./rollback.md), including the
+[bearer token](./index.md#the-admin-listener) they need when one is configured.
+
+Both JSON endpoints carry a top-level `"version"`, currently `1`. It exists for
+the day a field's *meaning* has to change rather than a field being added —
+a discriminator introduced at the same time as the break would be one release
+too late to help anyone. Until then, a reader that ignores it is correct, and one
+that reads it must treat **absent as version 0**: every build before this one
+serves the same shape without the field, and an upgrade is exactly when somebody
+is watching. `ramjet-top` parses it and does not branch on it.
 
 ## The probes answer different questions
 
@@ -92,6 +101,7 @@ Every route in the serving table with its counters, exactly as served:
 
 ```json
 {
+  "version": 1,
   "generation": 0,
   "routes": [
     {
@@ -160,6 +170,7 @@ purposes, because its latency is no longer comparable to what came before.
 
 ```json
 {
+  "version": 1,
   "serving": 0,
   "pinned": null,
   "generations": [

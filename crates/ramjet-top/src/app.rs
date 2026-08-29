@@ -649,6 +649,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::contract::{
+        KNOWN_VERSION,
         GenerationEntry, GenerationsResponse, PathType, RouteEntry, RoutesResponse,
     };
     use crate::prom::MetricsSnapshot;
@@ -682,6 +683,7 @@ mod tests {
         Snapshot {
             url: "http://127.0.0.1:10254".to_string(),
             generations: GenerationsResponse {
+                version: KNOWN_VERSION,
                 pinned,
                 serving: 7,
                 generations: vec![
@@ -700,6 +702,7 @@ mod tests {
                 ],
             },
             routes: RoutesResponse {
+                version: KNOWN_VERSION,
                 generation: 7,
                 routes,
             },

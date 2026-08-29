@@ -10,8 +10,29 @@
 //! The rule is not symmetric. Fields this client *displays as numbers* —
 //! counters, generations — are typed, because a counter that silently defaults
 //! to zero is a rate that is silently wrong.
+//!
+//! # The version field
+//!
+//! Both responses carry a top-level `version`, and it is 1. Absent means 0: a
+//! daemon built before the field existed serves the same shape without it, and
+//! a client that refused those would be a monitoring tool that stops working
+//! against the thing it monitors — which is the failure this whole module is
+//! written to avoid.
+//!
+//! Nothing here branches on it yet, and nothing should until there is a version
+//! 2. It is parsed and carried so that the day a shape has to change
+//! incompatibly, this client can tell which one it is looking at *before* it
+//! parses — a discriminator added at the same time as the break is one release
+//! too late to be useful.
 
 use serde::{Deserialize, Serialize};
+
+/// The schema version this client was written against.
+///
+/// Not enforced: a newer server is not a reason to refuse a poll, and an older
+/// one — which sends no `version` at all — is the ordinary case during an
+/// upgrade.
+pub const KNOWN_VERSION: u64 = 1;
 
 /// `GET /admin/generations`.
 ///
@@ -19,6 +40,10 @@ use serde::{Deserialize, Serialize};
 /// therefore the order this client relies on rather than re-sorting.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct GenerationsResponse {
+    /// Schema version of this response. `0` when the server sent none, which
+    /// means a build from before the field existed.
+    #[serde(default)]
+    pub version: u64,
     /// The generation traffic is pinned to, if the emergency brake is on.
     #[serde(default)]
     pub pinned: Option<u64>,
@@ -160,6 +185,10 @@ impl From<&str> for DiffItem {
 /// `GET /admin/routes`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RoutesResponse {
+    /// Schema version of this response. `0` when the server sent none, which
+    /// means a build from before the field existed.
+    #[serde(default)]
+    pub version: u64,
     /// The generation these rows were read from.
     #[serde(default)]
     pub generation: u64,
@@ -315,7 +344,13 @@ mod tests {
     use super::*;
 
     /// The exact shape the contract specifies, with every field populated.
+    ///
+    /// `version` was added deliberately: the contract grows additively, and the
+    /// fixture has to move with it or these tests stop describing what the
+    /// server sends. The tests below cover the other direction too — a response
+    /// with no `version`, which is every build before it was added.
     const GENERATIONS_JSON: &str = r#"{
+      "version": 1,
       "pinned": 41,
       "serving": 41,
       "generations": [
@@ -359,6 +394,7 @@ mod tests {
     }"#;
 
     const ROUTES_JSON: &str = r#"{
+      "version": 1,
       "generation": 42,
       "routes": [
         {
@@ -399,6 +435,7 @@ mod tests {
     fn the_generations_contract_parses() {
         let parsed: GenerationsResponse =
             serde_json::from_str(GENERATIONS_JSON).expect("contract shape");
+        assert_eq!(parsed.version, KNOWN_VERSION);
         assert_eq!(parsed.pinned, Some(41));
         assert_eq!(parsed.serving, 41);
         assert_eq!(parsed.generations.len(), 2);
@@ -427,8 +464,38 @@ mod tests {
     }
 
     #[test]
+    fn a_response_with_no_version_is_read_as_the_version_before_it_existed() {
+        // Every daemon built before the field was added serves exactly this,
+        // and an upgrade is precisely when somebody is watching. Refusing these
+        // would mean the monitoring tool stops working against the thing it
+        // monitors, on the release that made it version-aware.
+        let generations = r#"{"pinned": null, "serving": 3, "generations": []}"#;
+        let parsed: GenerationsResponse = serde_json::from_str(generations).expect("legacy shape");
+        assert_eq!(parsed.version, 0);
+        assert_eq!(parsed.serving, 3);
+
+        let routes = r#"{"generation": 3, "routes": []}"#;
+        let parsed: RoutesResponse = serde_json::from_str(routes).expect("legacy shape");
+        assert_eq!(parsed.version, 0);
+        assert_eq!(parsed.generation, 3);
+    }
+
+    #[test]
+    fn a_version_from_the_future_is_parsed_rather_than_refused() {
+        // A newer daemon is not a reason to stop polling. If a version 2 ever
+        // changes a field's meaning, *that* is when this client learns to
+        // branch; until then, refusing on the number alone would break every
+        // pairing where the daemon was upgraded first.
+        let json = r#"{"version": 99, "generation": 7, "routes": []}"#;
+        let parsed: RoutesResponse = serde_json::from_str(json).expect("still readable");
+        assert_eq!(parsed.version, 99);
+        assert_eq!(parsed.generation, 7);
+    }
+
+    #[test]
     fn the_routes_contract_parses() {
         let parsed: RoutesResponse = serde_json::from_str(ROUTES_JSON).expect("contract shape");
+        assert_eq!(parsed.version, KNOWN_VERSION);
         assert_eq!(parsed.generation, 42);
         assert_eq!(parsed.routes.len(), 2);
 

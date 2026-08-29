@@ -435,6 +435,25 @@ async fn without_a_token_the_mutating_endpoints_are_unchanged() {
     proxy.shutdown().await.expect("drains");
 }
 
+/// Both JSON endpoints carry the schema version, over the wire.
+#[tokio::test]
+async fn the_json_endpoints_name_their_schema_version() {
+    let upstream = spawn_echo("api").await;
+    let proxy = proxy().await;
+    record(&proxy, table(1, upstream), 0);
+
+    for path in ["/admin/generations", "/admin/routes"] {
+        let (status, body) = admin_json(proxy.admin, path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["version"], ramjet_proxy::API_VERSION,
+            "{path} must say which shape it is serving"
+        );
+    }
+
+    proxy.shutdown().await.expect("drains");
+}
+
 #[tokio::test]
 async fn metrics_reports_whether_publication_is_held() {
     let upstream = spawn_echo("api").await;

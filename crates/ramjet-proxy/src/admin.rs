@@ -81,6 +81,18 @@
 //! after the fact and are `null` on a route that has neither, which is a case
 //! every existing reader already handles because `canary` has always been
 //! nullable.
+//!
+//! Both JSON endpoints carry a top-level `"version"`, which is
+//! [`API_VERSION`] and is 1. It exists for the day the additive rule has to be
+//! broken — a field whose meaning changes rather than a field that appears —
+//! because on that day a reader needs to be able to tell the two shapes apart
+//! before parsing, and adding the discriminator at the same time as the break
+//! is one release too late. Until then it is a constant, and a reader that
+//! ignores it is correct.
+//!
+//! A reader must treat *absent* as version 0: every build before this one
+//! served the same shape without the field, and refusing to parse those would
+//! make a monitoring tool stop working against the thing it monitors.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,6 +112,14 @@ use crate::metrics::Exposition;
 
 /// The exposition format version Prometheus expects to negotiate.
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// Schema version of the JSON `/admin/generations` and `/admin/routes` serve.
+///
+/// Bumped only for a change a reader written against the previous version could
+/// not survive — a field whose meaning changed, or one that went away. Adding a
+/// field does not bump it, because a reader that ignores unknown fields is
+/// unaffected and one that does not was already broken.
+pub const API_VERSION: u64 = 1;
 
 /// Largest request body the rollback endpoint will read.
 ///
@@ -380,6 +400,7 @@ fn generations(state: &AdminState) -> Value {
             })
             .collect();
         json!({
+            "version": API_VERSION,
             "pinned": pinned,
             "serving": state.routes.generation(),
             "generations": generations,
@@ -463,6 +484,7 @@ fn routes(state: &AdminState) -> Value {
     routes.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
 
     json!({
+        "version": API_VERSION,
         "generation": table.generation(),
         "routes": routes.into_iter().map(|(_, _, value)| value).collect::<Vec<_>>(),
     })
@@ -762,6 +784,7 @@ mod tests {
         );
 
         let body = generations(&state);
+        assert_eq!(body["version"], API_VERSION);
         assert_eq!(body["pinned"], Value::Null);
         assert_eq!(body["serving"], 8);
 
@@ -802,6 +825,7 @@ mod tests {
     fn routes_reports_every_field_of_the_contract() {
         let state = state(table(7));
         let body = routes(&state);
+        assert_eq!(body["version"], API_VERSION);
         assert_eq!(body["generation"], 7);
 
         let listed = body["routes"].as_array().expect("an array");

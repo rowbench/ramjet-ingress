@@ -839,6 +839,7 @@ mod tests {
     use crate::app::App;
     use crate::client::Snapshot;
     use crate::contract::{
+        KNOWN_VERSION,
         Canary, GenerationDiff, GenerationsResponse, PathType, RouteEntry, RoutesResponse,
     };
     use crate::prom::MetricsSnapshot;
@@ -1042,6 +1043,7 @@ mod tests {
         Snapshot {
             url: "http://127.0.0.1:10254".to_string(),
             generations: GenerationsResponse {
+                version: KNOWN_VERSION,
                 pinned,
                 serving: 42,
                 generations: vec![crate::contract::GenerationEntry {
@@ -1060,6 +1062,7 @@ mod tests {
                 }],
             },
             routes: RoutesResponse {
+                version: KNOWN_VERSION,
                 generation: 42,
                 routes: vec![
                     RouteEntry {

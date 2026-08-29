@@ -97,7 +97,7 @@ pub mod server;
 pub mod tls;
 pub mod upstream;
 
-pub use admin::{AdminAuth, AdminState, ReadinessFlag, TokenError};
+pub use admin::{AdminAuth, AdminState, ReadinessFlag, TokenError, API_VERSION};
 pub use body::{BodyError, ProxyBody};
 pub use forward::{ConnInfo, ProxyState, Scheme};
 pub use history::{

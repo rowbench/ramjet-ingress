@@ -374,6 +374,14 @@ ClusterIP Service and never through an Ingress or a LoadBalancer.
 | `POST /admin/rollback` | pin a generation. `404` if it is not in the ring, `409` if something is already pinned — and the body says what |
 | `DELETE /admin/rollback` | release the pin and publish the newest generation. Idempotent |
 
+The two JSON responses are a contract `ramjet-top` parses, and it grows
+additively: `canary_stats` and `mirror` were added after the fact and are `null`
+where they do not apply, which every existing reader already handled because
+`canary` had always been nullable. A top-level `"version"` — currently `1` —
+exists for the day that rule has to be broken, since a discriminator added at the
+same time as the break is one release too late to be useful. Absent means version
+0, because every build before it served the same shape without it.
+
 Three defences, different in kind. The **shape** is unconditional: the mutating
 endpoint answers to `POST` and `DELETE` and nothing else, so a link, a browser
 prefetch, a scraper following URLs, or a health checker walking paths cannot roll
