@@ -166,6 +166,16 @@ pub(crate) fn created_at(mut ingress: Ingress, epoch_seconds: i64) -> Ingress {
     ingress
 }
 
+/// Gives an Ingress the `metadata.uid` a real one would have.
+///
+/// Fixtures normally leave it off, because nothing in the compiled table
+/// depends on it. The Events this controller writes about an Ingress do: a
+/// `regarding` with the wrong uid is not one `kubectl describe` will find.
+pub(crate) fn with_uid(mut ingress: Ingress, uid: &str) -> Ingress {
+    ingress.metadata.uid = Some(uid.to_owned());
+    ingress
+}
+
 /// Adds an annotation.
 pub(crate) fn annotate(mut ingress: Ingress, key: &str, value: &str) -> Ingress {
     ingress

@@ -81,7 +81,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ramjet_controller::{
-    patch_ingress_annotations, AuditReason, AuditSink, CanaryDecision, CompiledConfig, ObjectKey,
+    patch_ingress_annotations, AuditReason, AuditSink, CanaryDecision, CompiledConfig, EventSubject,
+    ObjectKey,
     PromotionAnnotations, PromotionRoute, PromotionTarget, ANNOTATION_AUTO_PROMOTE,
     ANNOTATION_AUTO_PROMOTE_STATUS, ANNOTATION_CANARY_WEIGHT, STATUS_PROMOTED,
     STATUS_ROLLED_BACK,
@@ -562,6 +563,15 @@ impl<P: IngressPatcher> Promoter<P> {
             reason,
             &CanaryDecision {
                 ingress: &ingress,
+                // The Event goes on this Ingress, which needs its uid — see
+                // `AuditSink`. A target compiled from an object that carried
+                // none gets the log line and the webhook and no Event, rather
+                // than an Event nothing will ever display.
+                subject: target.uid.as_deref().map(|uid| EventSubject {
+                    namespace: &target.ingress.namespace,
+                    name: &target.ingress.name,
+                    uid,
+                }),
                 from_weight: target.weight,
                 to_weight,
                 detail: &detail,
@@ -968,6 +978,7 @@ mod tests {
                 namespace: "prod".to_owned(),
                 name: "web-canary".to_owned(),
             },
+            uid: Some("3f2b1c0d-0000-4000-8000-000000000001".to_owned()),
             routes: vec![PromotionRoute {
                 host: "app.example.com".to_owned(),
                 path: "/".to_owned(),

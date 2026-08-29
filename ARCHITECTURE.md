@@ -758,8 +758,13 @@ threshold, so the canary is compared to what it is replacing.
   at the final weight.
 
 Every decision is logged on the `audit` target with its numbers, written as a
-Kubernetes Event on the IngressClass (`CanaryStepped`, `CanaryPromoted`,
+Kubernetes Event **on the canary Ingress** (`CanaryStepped`, `CanaryPromoted`,
 `CanaryRolledBack` — the last as a `Warning`), and POSTed to `--audit-webhook`.
+On the Ingress rather than on the class, because an Event exists to point at the
+object to go and look at, and after an automatic rollback that is the canary. It
+needs the object's `uid` — `kubectl describe` searches by a field selector that
+includes `involvedObject.uid` — so the uid rides along on the compiled
+`PromotionTarget` rather than costing a `GET` per decision.
 Holds are `debug` only: on a quiet route they are the normal state, and an Event
 per interval per canary would bury the three that matter.
 

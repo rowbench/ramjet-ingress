@@ -157,8 +157,15 @@ aggregates same-reason events for six minutes and keeps the *first* note: three
 deploys in a minute would become "ConfigApplied ×3" showing only what the first
 one did, which is precisely the information an audit trail exists to keep.
 
-RBAC: `events.k8s.io` / `events`, `create` and `patch`. The chart's ClusterRole
-has it. Without it the Events are skipped at `debug` and nothing else changes.
+Canary lifecycle events go on the **canary Ingress** instead — see
+[canary deployments](canary.md#where-the-decisions-show-up). The split is by
+what the Event is about: a compiled generation belongs to no single Ingress, and
+a promotion decision belongs to exactly one.
+
+RBAC: `events.k8s.io` / `events`, `create` and `patch`, as a ClusterRole rather
+than a Role — Events are namespaced and an Ingress can be in any namespace. The
+chart has it. Without it the Events are skipped at `debug` and nothing else
+changes.
 
 ### An optional webhook
 

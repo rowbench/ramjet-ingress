@@ -5,10 +5,32 @@
 //! - a **`tracing` event on the `audit` target**, structured rather than
 //!   prose, so a log pipeline can filter on `target=audit` and get every
 //!   configuration change this replica made and nothing else;
-//! - a **Kubernetes Event** on the `IngressClass`, so `kubectl describe
-//!   ingressclass ramjet` answers "what has this controller been doing" without
-//!   anybody needing access to pod logs;
+//! - a **Kubernetes Event**, so `kubectl describe` answers "what has this
+//!   controller been doing" without anybody needing access to pod logs;
 //! - an optional **webhook**, for a cluster that collects this somewhere else.
+//!
+//! # Which object an Event hangs on
+//!
+//! Configuration-level events — `ConfigApplied`, `ConfigPinned`,
+//! `ConfigResumed` — go on the `IngressClass`. They describe a whole compiled
+//! generation, which belongs to no single Ingress, and the class is the one
+//! object that stands for "this controller".
+//!
+//! Canary events — `CanaryStepped`, `CanaryPromoted`, `CanaryRolledBack` — go on
+//! **the canary Ingress**, and only there. An Event exists to point at the
+//! object to go and look at, and after an automatic rollback that object is the
+//! canary, not the class: `kubectl describe ingress web-canary` is the command
+//! somebody actually types. Writing a second copy onto the class as well would
+//! double the Event rate and make `kubectl get events` show every promotion
+//! twice, for a class-level view that the `audit` log target and the webhook
+//! already carry in full.
+//!
+//! A namespaced Event needs its object's `uid` or `kubectl describe` will not
+//! find it — the search is a field selector that includes `involvedObject.uid`
+//! whenever the object has one. The uid rides along on
+//! [`PromotionTarget`](crate::PromotionTarget) from the translation pass that
+//! already had the Ingress in its hand, rather than costing a `GET` per
+//! decision.
 //!
 //! # Why the Events are written directly
 //!
@@ -26,9 +48,11 @@
 //! ingress-nginx emits a Sync event per Ingress per change, which is strictly
 //! more.
 //!
-//! `IngressClass` is cluster-scoped and Events are not, so they land in
+//! `IngressClass` is cluster-scoped and Events are not, so the class's land in
 //! `default` — which is where the Kubernetes convention puts events for
-//! cluster-scoped objects, and where `kubectl describe` looks for them.
+//! cluster-scoped objects, and where `kubectl describe` looks for them. An
+//! Ingress's land in the Ingress's own namespace, which is where `kubectl
+//! describe ingress` looks.
 //!
 //! # Why the webhook does not retry
 //!
@@ -333,7 +357,18 @@ impl AuditSink {
             "{}",
             decision.detail
         );
-        self.event(reason, format!("{}: {}", decision.ingress, decision.detail));
+
+        // On the canary Ingress, and not on the class. The note drops the
+        // `namespace/name` prefix the log line carries, because an Event
+        // attached to an object does not need to name it.
+        if let (Some(client), Some(subject)) = (self.client.clone(), decision.subject) {
+            write_event(
+                client,
+                subject.reference(),
+                reason,
+                decision.detail.to_owned(),
+            );
+        }
         self.post(decision.to_json(reason));
     }
 
@@ -358,53 +393,12 @@ impl AuditSink {
         self.event(AuditReason::ConfigResumed, summary);
     }
 
-    /// Writes one Kubernetes Event, without waiting for it.
-    ///
-    /// Spawned rather than awaited: a slow API server must not delay the next
-    /// generation reaching the data plane. Serving traffic correctly outranks
-    /// recording that we are.
+    /// Writes one Kubernetes Event on the `IngressClass`, without waiting.
     fn event(&self, reason: AuditReason, note: String) {
         let (Some(client), Some(regarding)) = (self.client.clone(), self.regarding.clone()) else {
             return;
         };
-
-        tokio::spawn(async move {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default();
-            let event = Event {
-                action: Some(reason.action().to_owned()),
-                reason: Some(reason.as_str().to_owned()),
-                // The Event API caps this at a kilobyte; the summary is one
-                // line by construction, but truncating here is cheaper than
-                // having the API server reject the whole write.
-                note: Some(note.chars().take(1024).collect()),
-                event_time: Some(MicroTime(k8s_openapi::jiff::Timestamp::now())),
-                regarding: Some((*regarding).clone()),
-                reporting_controller: Some(CONTROLLER_NAME.to_owned()),
-                reporting_instance: Some(instance()),
-                type_: Some(reason.severity().to_owned()),
-                metadata: ObjectMeta {
-                    namespace: Some(EVENT_NAMESPACE.to_owned()),
-                    name: Some(format!(
-                        "{}.{now:x}",
-                        regarding.name.as_deref().unwrap_or("ramjet")
-                    )),
-                    ..ObjectMeta::default()
-                },
-                ..Event::default()
-            };
-
-            let api: Api<Event> = Api::namespaced(client, EVENT_NAMESPACE);
-            if let Err(error) = api.create(&PostParams::default(), &event).await {
-                // Losing an Event is survivable and must not be loud: the same
-                // record is in the log line that has already been written, and
-                // a missing `events` RBAC rule would otherwise produce one
-                // warning per configuration change forever.
-                debug!(%error, reason = reason.as_str(), "could not write a configuration Event");
-            }
-        });
+        write_event(client, (*regarding).clone(), reason, note);
     }
 
     /// Posts the diff, without waiting for it.
@@ -446,6 +440,124 @@ impl AuditSink {
     }
 }
 
+/// Writes one Kubernetes Event, without waiting for it.
+///
+/// Spawned rather than awaited: a slow API server must not delay the next
+/// generation reaching the data plane, or the next promotion decision. Serving
+/// traffic correctly outranks recording that we are.
+///
+/// The Event lands in `regarding.namespace`, falling back to
+/// [`EVENT_NAMESPACE`] for a cluster-scoped object — which is where the
+/// Kubernetes convention puts those and where `kubectl describe` looks.
+pub(crate) fn write_event(
+    client: KubeClient,
+    regarding: ObjectReference,
+    reason: AuditReason,
+    note: String,
+) {
+    write_raw_event(
+        client,
+        regarding,
+        reason.as_str().to_owned(),
+        reason.action().to_owned(),
+        reason.severity().to_owned(),
+        note,
+    );
+}
+
+/// The same, for a reason that is not an [`AuditReason`].
+///
+/// Exists for the translator's per-object warnings, whose reasons come from
+/// [`WarningKind`](crate::WarningKind) and whose severity is always `Warning`.
+/// Taking strings rather than growing `AuditReason` a variant per warning kind
+/// keeps the two vocabularies apart: one names things this controller *did*, the
+/// other names things it *refused*.
+pub(crate) fn write_raw_event(
+    client: KubeClient,
+    regarding: ObjectReference,
+    reason: String,
+    action: String,
+    severity: String,
+    note: String,
+) {
+    let namespace = regarding
+        .namespace
+        .clone()
+        .unwrap_or_else(|| EVENT_NAMESPACE.to_owned());
+
+    tokio::spawn(async move {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let event = Event {
+            action: Some(action),
+            reason: Some(reason.clone()),
+            // The Event API caps this at a kilobyte; the summary is one line by
+            // construction, but truncating here is cheaper than having the API
+            // server reject the whole write.
+            note: Some(note.chars().take(1024).collect()),
+            event_time: Some(MicroTime(k8s_openapi::jiff::Timestamp::now())),
+            reporting_controller: Some(CONTROLLER_NAME.to_owned()),
+            reporting_instance: Some(instance()),
+            type_: Some(severity),
+            metadata: ObjectMeta {
+                namespace: Some(namespace.clone()),
+                name: Some(format!(
+                    "{}.{now:x}",
+                    regarding.name.as_deref().unwrap_or("ramjet")
+                )),
+                ..ObjectMeta::default()
+            },
+            regarding: Some(regarding),
+            ..Event::default()
+        };
+
+        let api: Api<Event> = Api::namespaced(client, &namespace);
+        if let Err(error) = api.create(&PostParams::default(), &event).await {
+            // Losing an Event is survivable and must not be loud: the same
+            // record is in the log line that has already been written, and a
+            // missing `events` RBAC rule would otherwise produce one warning per
+            // configuration change forever.
+            debug!(%error, %reason, "could not write an Event");
+        }
+    });
+}
+
+/// A namespaced object an Event can be attached to.
+///
+/// Borrowed and `Copy`, so the promotion loop can name the Ingress it is about
+/// to patch without allocating three `String`s per interval per canary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventSubject<'a> {
+    /// The object's namespace.
+    pub namespace: &'a str,
+    /// The object's name.
+    pub name: &'a str,
+    /// The object's `metadata.uid`.
+    ///
+    /// Not optional, and that is the point: `kubectl describe` searches by a
+    /// field selector that includes `involvedObject.uid`, so an Event written
+    /// without the right one is written to etcd, shown by nothing, and garbage
+    /// collected in an hour. A caller that does not have the uid has nothing
+    /// worth writing, and should pass `None` for the whole subject.
+    pub uid: &'a str,
+}
+
+impl EventSubject<'_> {
+    /// The `regarding` reference for an Event about this object.
+    fn reference(self) -> ObjectReference {
+        ObjectReference {
+            api_version: Some("networking.k8s.io/v1".to_owned()),
+            kind: Some("Ingress".to_owned()),
+            namespace: Some(self.namespace.to_owned()),
+            name: Some(self.name.to_owned()),
+            uid: Some(self.uid.to_owned()),
+            ..ObjectReference::default()
+        }
+    }
+}
+
 /// One automatic-promotion decision, with the window it was taken on.
 ///
 /// Borrowed rather than owned: the caller is holding all of this already, and a
@@ -453,8 +565,11 @@ impl AuditSink {
 /// of a log line.
 #[derive(Debug, Clone, Copy)]
 pub struct CanaryDecision<'a> {
-    /// `namespace/name` of the canary Ingress.
+    /// `namespace/name` of the canary Ingress, for the log line and the webhook.
     pub ingress: &'a str,
+    /// The same Ingress as an Event can name it, or `None` where its uid is not
+    /// known and no Event should be written.
+    pub subject: Option<EventSubject<'a>>,
     /// The weight before this decision.
     pub from_weight: u32,
     /// The weight after it.
@@ -523,6 +638,41 @@ mod tests {
         assert_eq!(AuditReason::ConfigApplied.as_str(), "ConfigApplied");
         assert_eq!(AuditReason::ConfigPinned.as_str(), "ConfigPinned");
         assert_eq!(AuditReason::ConfigResumed.as_str(), "ConfigResumed");
+        assert_eq!(AuditReason::CanaryStepped.as_str(), "CanaryStepped");
+        assert_eq!(AuditReason::CanaryPromoted.as_str(), "CanaryPromoted");
+        assert_eq!(AuditReason::CanaryRolledBack.as_str(), "CanaryRolledBack");
+    }
+
+    #[test]
+    fn a_canary_event_names_the_ingress_the_way_kubectl_searches_for_it() {
+        // `kubectl describe ingress` builds a field selector over
+        // involvedObject.{kind,namespace,name,uid} — every one of these — and an
+        // Event missing any of them is written to etcd, displayed by nothing,
+        // and garbage collected in an hour.
+        let reference = EventSubject {
+            namespace: "prod",
+            name: "web-canary",
+            uid: "3f2b1c0d-0000-4000-8000-000000000001",
+        }
+        .reference();
+
+        assert_eq!(reference.kind.as_deref(), Some("Ingress"));
+        assert_eq!(reference.api_version.as_deref(), Some("networking.k8s.io/v1"));
+        assert_eq!(reference.namespace.as_deref(), Some("prod"));
+        assert_eq!(reference.name.as_deref(), Some("web-canary"));
+        assert_eq!(
+            reference.uid.as_deref(),
+            Some("3f2b1c0d-0000-4000-8000-000000000001")
+        );
+    }
+
+    #[test]
+    fn a_rollback_is_the_only_canary_reason_kubectl_shows_in_yellow() {
+        // `kubectl describe` sorts and colours by this field. A step going to
+        // plan is not something to find without looking for it; a rollback is.
+        assert_eq!(AuditReason::CanaryRolledBack.severity(), "Warning");
+        assert_eq!(AuditReason::CanaryStepped.severity(), "Normal");
+        assert_eq!(AuditReason::CanaryPromoted.severity(), "Normal");
     }
 
     #[test]

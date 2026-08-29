@@ -99,7 +99,7 @@ pub use annotations::{
     DEFAULT_PROMOTE_MAX_5XX_PERCENT, DEFAULT_PROMOTE_MAX_LATENCY_FACTOR,
     DEFAULT_PROMOTE_MIN_REQUESTS, DEFAULT_PROMOTE_STEPS, STATUS_PROMOTED, STATUS_ROLLED_BACK,
 };
-pub use audit::{AuditReason, AuditSink, CanaryDecision, WebhookError};
+pub use audit::{AuditReason, AuditSink, CanaryDecision, EventSubject, WebhookError};
 pub use class::ClassFilter;
 pub use config::{
     BackendPort, CertMaterial, CompiledConfig, ControllerOpts, PromotionRoute, PromotionTarget,

@@ -111,8 +111,8 @@ A successful finish writes `ramjet.dev/auto-promote-status: promoted` and stops.
 
 ## Where the decisions show up
 
-Logged on the `audit` target **with their numbers**, written as Kubernetes
-Events on the IngressClass, and POSTed to `--audit-webhook`:
+Logged on the `audit` target **with their numbers**, written as a Kubernetes
+Event **on the canary Ingress**, and POSTed to `--audit-webhook`:
 
 | Event reason | When |
 |---|---|
@@ -121,8 +121,25 @@ Events on the IngressClass, and POSTed to `--audit-webhook`:
 | `CanaryRolledBack` | A gate was breached. Recorded as a **Warning** |
 
 ```sh
-kubectl describe ingressclass ramjet
+kubectl describe ingress web-canary
 ```
+
+```text
+Events:
+  Type     Reason            Age   From            Message
+  ----     ------            ----  ----            -------
+  Normal   CanaryStepped     4m    ramjet-ingress  canary healthy; weight 5 -> 10
+  Normal   CanaryStepped     3m    ramjet-ingress  canary healthy; weight 10 -> 25
+  Warning  CanaryRolledBack  2m    ramjet-ingress  rolled back from 25%: 5xx 4.10% over the 1% budget
+```
+
+On the Ingress, and only there. An Event exists to point at the object to go and
+look at, and after an automatic rollback that object is the canary — a second
+copy on the IngressClass would make `kubectl get events` show every promotion
+twice for a class-level view the `audit` log and the webhook already carry in
+full. Configuration-level events (`ConfigApplied`, `ConfigPinned`,
+`ConfigResumed`) still go on the IngressClass, because a compiled generation
+belongs to no single Ingress.
 
 **Holds are `debug` only.** On a quiet route they are the normal state, and an
 Event per interval per canary would bury the three that matter.

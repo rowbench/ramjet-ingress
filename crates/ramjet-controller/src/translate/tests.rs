@@ -1598,6 +1598,10 @@ fn a_mirror_changes_the_digest_so_editing_one_republishes() {
 // Automatic promotion candidates
 // ---------------------------------------------------------------------------
 
+/// The canary fixture's `metadata.uid`, which the promotion loop needs in order
+/// to write an Event `kubectl describe ingress` can find.
+const CANARY_UID: &str = "3f2b1c0d-0000-4000-8000-000000000001";
+
 /// A production Ingress plus a canary carrying `annotations`.
 fn canary_cluster(annotations: &[(&str, &str)]) -> ClusterSnapshot {
     let snapshot = backed(base(), "prod", "api", 80, 8080, &["10.0.0.1"]);
@@ -1611,14 +1615,17 @@ fn canary_cluster(annotations: &[(&str, &str)]) -> ClusterSnapshot {
         )),
         1,
     );
-    let mut canary = ours(ingress(
-        "prod",
-        "web-canary",
-        &[rule(
-            Some("app.example.com"),
-            &[path("/", "Prefix", "api-next", 80)],
-        )],
-    ));
+    let mut canary = with_uid(
+        ours(ingress(
+            "prod",
+            "web-canary",
+            &[rule(
+                Some("app.example.com"),
+                &[path("/", "Prefix", "api-next", 80)],
+            )],
+        )),
+        CANARY_UID,
+    );
     canary = annotate(canary, ANNOTATION_CANARY, "true");
     for (key, value) in annotations {
         canary = annotate(canary, key, value);
@@ -1658,6 +1665,66 @@ fn an_opted_in_canary_is_compiled_into_a_promotion_target() {
             path_type: PathType::Prefix,
         }],
         "the target names the production route, which is where the counters are"
+    );
+    assert_eq!(
+        target.uid.as_deref(),
+        Some(CANARY_UID),
+        "the promotion loop writes Events on this Ingress, and an Event whose \
+         involvedObject.uid is wrong is one kubectl describe never shows"
+    );
+}
+
+#[test]
+fn a_canary_with_no_uid_is_still_a_target_and_simply_gets_no_events() {
+    // Only reachable from a fixture — the API server sets a uid on everything —
+    // but the promotion loop must degrade to logs rather than write an Event
+    // that nothing will ever display.
+    let mut snapshot = canary_cluster(&[
+        (ANNOTATION_CANARY_WEIGHT, "5"),
+        (ANNOTATION_AUTO_PROMOTE, "true"),
+    ]);
+    for ingress in &mut snapshot.ingresses {
+        if ingress.metadata.name.as_deref() == Some("web-canary") {
+            let mut stripped = (**ingress).clone();
+            stripped.metadata.uid = None;
+            *ingress = std::sync::Arc::new(stripped);
+        }
+    }
+
+    let compiled = compile(&snapshot);
+    let target = &compiled.config.promotions[0];
+    assert_eq!(target.ingress.to_string(), "prod/web-canary");
+    assert_eq!(target.uid, None);
+}
+
+#[test]
+fn the_uid_is_identity_and_does_not_reach_the_digest() {
+    // A uid changes only when an object is deleted and recreated, which changes
+    // the rest of the plan too. Feeding it to the digest would make it a reason
+    // to republish the whole cluster's routing table on its own.
+    let with = compile(&canary_cluster(&[
+        (ANNOTATION_CANARY_WEIGHT, "5"),
+        (ANNOTATION_AUTO_PROMOTE, "true"),
+    ]));
+
+    let mut snapshot = canary_cluster(&[
+        (ANNOTATION_CANARY_WEIGHT, "5"),
+        (ANNOTATION_AUTO_PROMOTE, "true"),
+    ]);
+    for ingress in &mut snapshot.ingresses {
+        if ingress.metadata.name.as_deref() == Some("web-canary") {
+            let mut relabelled = (**ingress).clone();
+            relabelled.metadata.uid = Some("a-completely-different-uid".to_owned());
+            *ingress = std::sync::Arc::new(relabelled);
+        }
+    }
+    let without = compile(&snapshot);
+
+    assert_eq!(with.digest, without.digest);
+    assert_ne!(
+        with.config.promotions[0].uid,
+        without.config.promotions[0].uid,
+        "the two really did differ, or the assertion above proves nothing"
     );
 }
 

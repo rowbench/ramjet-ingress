@@ -475,7 +475,8 @@ CANARY AUTO-PROMOTION:
     backend stays a human edit, deliberately.
 
     Decisions are logged with their numbers on the `audit` target, written as
-    Events on the IngressClass (CanaryStepped, CanaryPromoted, CanaryRolledBack)
+    Events on the canary Ingress itself, where `kubectl describe ingress` shows
+    them (CanaryStepped, CanaryPromoted, CanaryRolledBack)
     and POSTed to --audit-webhook. Everything is paused while a rollback pin is
     held. RBAC: `networking.k8s.io` / `ingresses` / `patch`, which the chart's
     ClusterRole has.

@@ -1070,6 +1070,11 @@ fn collect_promotions(
 
         targets.push(PromotionTarget {
             ingress: owner,
+            // Deliberately not in the digest above: a uid is the object's
+            // identity, not its configuration, and the only way it changes is
+            // an Ingress being deleted and recreated — which changes the rest
+            // of the plan too, or changes nothing that should republish.
+            uid: ingress.uid(),
             routes: covered,
             weight: canary.weight,
             policy,

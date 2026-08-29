@@ -25,14 +25,23 @@ because a specific piece of the controller cannot run without it:
                        changes nothing; every other feature is unaffected, and
                        an Ingress that never sets `ramjet.dev/auto-promote`
                        is never touched either way.
-  events               the audit trail: one Event on the IngressClass per
-                       published generation, per rollback, and per resume, and
-                       one per automatic promotion step, promotion, or
-                       rollback, so `kubectl describe ingressclass` answers
-                       what this controller has been doing. Cluster-scoped
-                       objects get their Events in `default`, which is why this
-                       is not namespaced. Take it away and the Events are
-                       skipped at debug level; nothing else changes.
+  events               the audit trail, in two places. Configuration-level
+                       Events — one per published generation, per rollback, and
+                       per resume — go on the IngressClass, so
+                       `kubectl describe ingressclass` answers what this
+                       controller has been doing. Per-object Events — every
+                       automatic promotion step, promotion or rollback, and
+                       every annotation value the translator refused — go on the
+                       Ingress they are about, so `kubectl describe ingress`
+                       answers why one is not doing what its author expected.
+
+                       Both are `events.k8s.io/v1`, which is what the group
+                       below names, and this rule is a ClusterRole rather than a
+                       Role for exactly that second case: Events are namespaced
+                       objects, an Ingress can be in any namespace, and a
+                       cluster-scoped object's Events go in `default` by
+                       convention. Take it away and the Events are skipped at
+                       debug level; nothing else changes.
 
 Notably absent: pods (endpoints come from EndpointSlice, not from listing
 pods), nodes, configmaps, `create` or `delete` on anything but Events, and any

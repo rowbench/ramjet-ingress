@@ -118,6 +118,20 @@ pub struct PromotionRoute {
 pub struct PromotionTarget {
     /// The canary Ingress to patch.
     pub ingress: ObjectKey,
+    /// That Ingress's `metadata.uid`, for the Events the promotion loop writes.
+    ///
+    /// Carried here rather than looked up when an Event is written, because an
+    /// Event without the right uid is not one `kubectl describe ingress` will
+    /// ever show: it searches by a field selector that includes
+    /// `involvedObject.uid` whenever the object it was given has one. A `GET`
+    /// per decision would put that cost on the API server during a rollout;
+    /// this rides along on a translation pass that already had the object in
+    /// its hand.
+    ///
+    /// `None` where the object carried no uid, which in practice means a test
+    /// fixture. The Event is then skipped rather than written somewhere nothing
+    /// will look.
+    pub uid: Option<String>,
     /// The production routes it shadows.
     pub routes: Vec<PromotionRoute>,
     /// The weight it is currently set to, from `canary-weight`.

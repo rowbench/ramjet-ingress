@@ -186,9 +186,9 @@ is a human decision. Reaching the last step records `auto-promote-status:
 promoted` and stops — swapping the production Ingress's backend stays a
 deliberate human edit ([why](ARCHITECTURE.md#why-the-backend-swap-stays-human)).
 
-Decisions land in the logs with their numbers, as Events on the IngressClass
-(`CanaryStepped`, `CanaryPromoted`, `CanaryRolledBack`), and on
-`--audit-webhook`. Everything pauses while a rollback pin is held. Needs
+Decisions land in the logs with their numbers, as Events on the canary Ingress
+itself — `kubectl describe ingress web-canary` shows `CanaryStepped`,
+`CanaryPromoted`, `CanaryRolledBack` — and on `--audit-webhook`. Everything pauses while a rollback pin is held. Needs
 `networking.k8s.io`/`ingresses`/`patch`, which the chart grants.
 
 ## Watching it live
