@@ -127,8 +127,12 @@ controller:
   # What it protects: POST /admin/rollback republishes an old generation and
   # DELETE releases it, and without a token any pod that can reach the admin
   # port can do both. The port is a ClusterIP Service and never on the
-  # LoadBalancer, so "reachable" means the cluster — which on a cluster running
-  # code you did not write is not a small set.
+  # LoadBalancer, so on the default shape "reachable" means the cluster — which
+  # on a cluster running code you did not write is not a small set. Under
+  # `hostNetwork: true` it is larger still: the listener is on the node's own
+  # interfaces, so it is reachable from anything that can route to a node, and
+  # `networkPolicy` below cannot help because policy does not apply to a
+  # host-network pod. That is the shape where this value matters most.
   #
   # `secretName` names an existing Secret; the chart does not create one,
   # deliberately. A Secret templated from a value lands in the release manifest,

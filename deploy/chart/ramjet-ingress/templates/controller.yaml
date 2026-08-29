@@ -202,9 +202,15 @@ spec:
             items:
               - key: {{ .Values.controller.adminToken.key }}
                 path: {{ .Values.controller.adminToken.key }}
-                # Readable by the pod's user and nobody else. The container runs
-                # as 65532 with fsGroup 65532; 0400 is what keeps the token off
-                # a sidecar's `cat` if one is ever added.
+                # Not the mode that ends up on disk, and worth saying so rather
+                # than leaving a guarantee nobody checked. podSecurityContext
+                # sets fsGroup, and the kubelet chowns a read-only volume to
+                # root:<fsGroup> and ORs the mode with 0440 — so this lands as
+                # 0440 root:65532. fsGroup is in every container's supplementary
+                # groups, so a sidecar added later can read the token whatever
+                # this says. A second container in this pod is inside the trust
+                # boundary; the mode is here to keep it off any *other* user on
+                # a node whose kubelet does not apply fsGroup.
                 mode: 0400
       {{- end }}
       {{- with .Values.nodeSelector }}

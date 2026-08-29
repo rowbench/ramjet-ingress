@@ -92,6 +92,9 @@ the render is the cheaper place to find out.
 {{- if and .Values.http3.enabled (not .Values.ports.https) -}}
 {{- fail "http3.enabled needs ports.https: HTTP/3 is served on that port number in UDP, and the alt-svc header that advertises it rides on that listener's responses. The daemon refuses the combination at startup, so the pod would not start" -}}
 {{- end -}}
+{{- if and .Values.networkPolicy.enabled .Values.hostNetwork -}}
+{{- fail "networkPolicy.enabled with hostNetwork: true renders a NetworkPolicy that does not restrict the admin port. A host-network pod is in the node's network namespace and matches no podSelector, so no CNI enforces the policy on it — and the admin listener is bound on the node's own interfaces there rather than on a pod IP, so it is reachable from anything that can route to the node. An object that reads as a restriction and enforces nothing is worse than no object. Use controller.adminToken, which works in this shape; add controller.extraArgs: [--admin=127.0.0.1:10254] if nothing off-node scrapes it; or set hostNetwork: false" -}}
+{{- end -}}
 {{/*
 Deliberately not validated here: proxyProtocol.enabled without a matching
 provider annotation. It looks like the same class of mistake, but an external

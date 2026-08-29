@@ -132,6 +132,17 @@ const MAX_BODY: usize = 4 * 1024;
 /// requires.
 const BEARER: &str = "Bearer ";
 
+/// Paths a bearer token is never required on, whatever the method.
+///
+/// The three whose callers cannot be taught to send a header: `/metrics` is
+/// scraped by Prometheus, and `/healthz` and `/readyz` are called by the
+/// kubelet. Everything else is gated by method — see [`handle`] for why the rule
+/// is an exemption list rather than an `/admin/` prefix.
+///
+/// A non-`GET` to one of these is a 405 further down regardless, so exempting
+/// them costs nothing beyond the exemption itself.
+const UNGATED: [&str; 3] = ["/metrics", "/healthz", "/readyz"];
+
 /// Why a token file could not be turned into an [`AdminAuth`].
 #[derive(Debug)]
 pub enum TokenError {
@@ -316,14 +327,18 @@ pub struct AdminState {
 pub async fn handle(state: Arc<AdminState>, request: Request<Incoming>) -> Response<ProxyBody> {
     let path = request.uri().path().to_owned();
 
-    // Authentication is decided by method and prefix rather than by matching the
-    // path first, so an endpoint added later is covered by having been given a
-    // mutating method — which is the property that actually needs enforcing —
-    // rather than by somebody remembering to add it to a list here. The cost is
-    // that `POST /admin/nonsense` is a 401 before it is a 404, which is the
-    // right way round: an unauthenticated caller learns nothing about which
-    // admin endpoints exist.
-    if mutates(request.method()) && path.starts_with("/admin/") {
+    // Gated by method, with three paths exempted by name rather than gated by a
+    // prefix. The difference matters for the endpoint nobody has written yet: a
+    // mutating handler added anywhere — under `/admin/` or not — is covered by
+    // default, where a prefix test would have covered it only if somebody
+    // remembered where to put it. The exemptions are exactly the three callers
+    // that cannot send a header, and adding a fourth is a line somebody has to
+    // type here.
+    //
+    // The cost is that `POST /admin/nonsense` is a 401 before it is a 404,
+    // which is the right way round: an unauthenticated caller learns nothing
+    // about which admin endpoints exist.
+    if mutates(request.method()) && !UNGATED.contains(&path.as_str()) {
         if let Some(auth) = &state.auth {
             if !auth.authorizes(request.headers()) {
                 return unauthorized();
@@ -678,6 +693,34 @@ mod tests {
         assert!(!mutates(&Method::HEAD));
         for method in [Method::POST, Method::DELETE, Method::PUT, Method::PATCH] {
             assert!(mutates(&method), "{method}");
+        }
+    }
+
+    #[test]
+    fn a_method_nobody_thought_about_is_treated_as_a_write() {
+        // The case the fail-closed polarity exists for, and the one the list
+        // above cannot reach. `mutates` names the *safe* methods rather than the
+        // unsafe ones, so an extension method — or a lower-cased `post`, which
+        // `http` parses as one — is gated rather than waved through.
+        for name in ["PURGE", "post", "PROPFIND", "\u{1}"] {
+            let Ok(method) = Method::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            assert!(mutates(&method), "{name} must be treated as a write");
+        }
+    }
+
+    #[test]
+    fn the_exemptions_are_the_three_callers_that_cannot_send_a_header() {
+        // Prometheus and the kubelet, and nothing else. A path added to this
+        // list is a path that can be reached without a token, so the list is
+        // worth asserting on rather than trusting to review.
+        assert_eq!(UNGATED, ["/metrics", "/healthz", "/readyz"]);
+        for path in ["/admin/rollback", "/admin/generations", "/admin/routes", "/"] {
+            assert!(
+                !UNGATED.contains(&path),
+                "{path} must not be exempt from the token"
+            );
         }
     }
 

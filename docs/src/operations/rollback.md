@@ -45,6 +45,15 @@ This is the request worth authenticating: it is the one thing an arbitrary pod
 in the cluster could otherwise send to change what every replica serves. See
 [the admin listener](index.md#the-admin-listener).
 
+On a shared workstation, note that the shell expands `$TOKEN` before `exec`, so
+the token is in `curl`'s `argv` and visible to `ps` for the length of the
+request. `curl -K -` reads the header from stdin instead:
+
+```sh
+printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" |
+  curl -K - -XPOST :10254/admin/rollback -d '{"generation": 41}'
+```
+
 **It works when the API server is the thing that is wrong.** Every alternative
 route to the same outcome — re-applying the previous Ingress objects,
 `kubectl rollout undo`, waiting for a controller to recompile — goes back
