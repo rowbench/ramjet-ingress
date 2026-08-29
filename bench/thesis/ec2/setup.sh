@@ -142,6 +142,12 @@ sub "echo-a, echo-b, echo-c ready; baseline NodePort $NP_BASELINE serves echo-a 
 # ramjet-ingress, twice. Only the values two-controllers-in-one-cluster forces
 # are set, plus the engine and — for the uring arm alone — the seccomp profile
 # the reactor needs. No tuning value the chart does not already ship.
+#
+# `kind`, `hostNetwork` and the two ports are in that first category rather than
+# the second. The chart's default is now a hostNetwork DaemonSet on the node's
+# :80 and :443, and three contenders on one node cannot all hold those; putting
+# both ramjet arms in the pod network behind NodePorts is also the only way they
+# are reached the same way ingress-nginx is, which is the comparison.
 # ---------------------------------------------------------------------------
 
 install_ramjet() {
@@ -157,6 +163,10 @@ install_ramjet() {
         --set engine="$engine" \
         --set podSecurityContext.seccompProfile.type="$seccomp" \
         --set controller.ingressClass="$(class_for "$contender")" \
+        --set kind=Deployment \
+        --set hostNetwork=false \
+        --set ports.http=8080 \
+        --set ports.https=8443 \
         --set service.type=NodePort \
         --set service.http.nodePort="$np" \
         --set service.https.nodePort="$((np + 300))" \

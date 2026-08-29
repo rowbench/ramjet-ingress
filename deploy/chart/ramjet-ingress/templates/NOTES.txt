@@ -64,7 +64,39 @@ The traffic Service is a NodePort: reach it at any node's address on
 .status.loadBalancer, so Ingress status comes from controller.publishAddress or
 stays empty.
 {{- end }}
+{{- if .Values.hostNetwork }}
+
+The listeners are on the host network, so traffic does not go through a Service
+at all: any node's address on :{{ .Values.ports.http }}{{ if .Values.ports.https }} and :{{ .Values.ports.https }}{{ end }} reaches this directly, and
+the client's own address is on the socket. Point a DNS record at the nodes.
+
+The admin port ({{ .Values.ports.admin }}) is on every node's interfaces too. It carries /metrics
+and the probes, and a NetworkPolicy cannot restrict it here — policy does not
+apply to a host-network pod. The node firewall and controller.adminToken are
+what is left.
+{{- if and .Values.controller.updateStatus (ne (toString .Values.service.type) "LoadBalancer") (not .Values.controller.publishAddress) }}
+
+There is no address for Ingress status to read: the Service is a {{ .Values.service.type }} and
+traffic does not arrive through it. Set controller.publishAddress to the VIP,
+the DNS name, or whatever fronts the nodes, or the ADDRESS column stays empty.
+Routing is unaffected either way — that field is advertising, not configuration.
+{{- end }}
+{{- end }}
+{{- if lt (int .Values.ports.http) 1024 }}
+
+:{{ .Values.ports.http }} is a privileged port, and binding it as uid 65532 works because the image's
+binary carries a `cap_net_bind_service` file capability and
+securityContext.capabilities keeps that capability in the container's bounding
+set. Nothing else is relaxed: allowPrivilegeEscalation is still false and every
+other capability is still dropped.
+
+If the pods crash-loop with "Permission denied", the log names the port and the
+remedies — the usual cause is an image built before the capability was added:
+
+    kubectl -n {{ .Release.Namespace }} logs {{ .Values.kind | lower }}/{{ include "ramjet-ingress.fullname" . }}
+{{- end }}
 {{- if and .Values.hostNetwork (ne .Values.kind "DaemonSet") }}
+
 Warning: hostNetwork is on but this is a {{ .Values.kind }}. The listeners bind
 the node's ports directly, so a second pod scheduled onto the same node cannot
 start. Use kind=DaemonSet, which gives exactly one per node.

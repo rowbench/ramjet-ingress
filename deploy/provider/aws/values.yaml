@@ -12,6 +12,22 @@
 # forever with no event explaining why nothing is reconciling it:
 #   https://kubernetes-sigs.github.io/aws-load-balancer-controller/
 
+# The other shape, spelled out rather than inherited.
+#
+# The chart's default is a hostNetwork DaemonSet on the node's own :80 and :443,
+# which is what a cluster with no cloud behind it needs. Here the balancer is
+# what makes the pod reachable, so the pod goes back into its own network
+# namespace on 8080/8443 behind a Deployment, and the NLB does the translation.
+# Every cloud preset in this directory repeats these four lines on purpose:
+# a preset that inherited them would change meaning the next time the chart's
+# defaults moved.
+kind: Deployment
+hostNetwork: false
+
+ports:
+  http: 8080
+  https: 8443
+
 service:
   type: LoadBalancer
 

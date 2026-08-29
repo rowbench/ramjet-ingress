@@ -173,8 +173,26 @@ step "Installing chart into $SYS_NS"
 
 K create namespace "$SYS_NS" --dry-run=client -o yaml | K apply -f - >/dev/null
 
+# Explicitly the pod-network Deployment shape, which is no longer the chart's
+# default — that is now a hostNetwork DaemonSet on the node's :80 and :443.
+#
+# Two reasons to pin it rather than to test what a bare `helm install` gives.
+# This suite asserts routing, canary splitting, TLS and status writeback through
+# a port-forward, none of which is a question about the network namespace; and
+# binding the Docker Desktop VM's :80 would collide with whatever else is on it
+# and make a failure here mean nothing about the change under test. What the
+# default shape actually turns on is the privileged bind, and this cluster
+# cannot test that at all: Docker Desktop's node ships
+# net.ipv4.ip_unprivileged_port_start=0, so :80 binds for anybody and the very
+# failure the capability exists to prevent is masked. That one is verified on a
+# stock node — see deploy/README.md, "Binding :80".
 H upgrade --install "$RELEASE" "$CHART" \
   --namespace "$SYS_NS" \
+  --set kind=Deployment \
+  --set hostNetwork=false \
+  --set ports.http=8080 \
+  --set ports.https=8443 \
+  --set service.type=LoadBalancer \
   --set image.repository="${IMAGE%:*}" \
   --set image.tag="${IMAGE##*:}" \
   --set image.pullPolicy="$PULL_POLICY" \

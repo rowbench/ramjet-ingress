@@ -4,6 +4,12 @@
 #     --namespace ramjet-ingress --create-namespace \
 #     -f deploy/provider/baremetal-hostnetwork/values.yaml
 #
+# This is the chart's default shape, so the same install with no -f at all gets
+# it. The file is kept, and kept explicit, for two reasons: it is what
+# deploy/static/provider/baremetal-hostnetwork.yaml is rendered from, and a
+# preset that inherited its whole meaning from the defaults would change
+# silently the next time those moved.
+#
 # No NodePort translation and no balancer: the listeners bind the node's own
 # interfaces, so a client reaching any node on :80 reaches this directly and
 # the source address on the socket is the client's. That is the whole appeal,
@@ -39,17 +45,18 @@ ports:
   http: 80
   https: 443
 
-# Binding below 1024 as uid 65532 needs the capability back. The pod stays
-# non-root and still drops everything else — this adds one capability to a set
-# that is otherwise empty, rather than relaxing the security context.
-securityContext:
-  allowPrivilegeEscalation: false
-  readOnlyRootFilesystem: true
-  capabilities:
-    drop:
-      - ALL
-    add:
-      - NET_BIND_SERVICE
+# Deliberately no securityContext block here — the chart's default already is
+# this one, NET_BIND_SERVICE included.
+#
+# There used to be a copy of it in this file, and the copy is what made the
+# fault look like a preset problem: the pod crash-looped on a stock node with
+# "Permission denied (os error 13)" binding :80, because Kubernetes puts an
+# added capability in the container's permitted set and a non-root process drops
+# it again on execve. Nothing in a values file can fix that; only a file
+# capability on the binary raises one into a non-root effective set, and the
+# image now carries `setcap cap_net_bind_service=+ep`. The chart's
+# `securityContext` note has the rest, including why the capability has to stay
+# in the bounding set even on ports above 1024.
 
 service:
   # A ClusterIP Service, kept only so in-cluster clients have a name to resolve

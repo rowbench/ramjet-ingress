@@ -23,6 +23,19 @@
 #     address clients actually use, or the status field stays empty. Routing is
 #     unaffected either way; the field is advertising, not configuration.
 
+# Not the chart's default shape. The default is a hostNetwork DaemonSet on the
+# node's own :80 and :443, which needs nothing in front and is what most bare
+# metal wants; this preset is for a node whose :80 is already spoken for, or a
+# cluster that would rather not have an ingress controller on the host network
+# at all. The listeners stay in the pod's own network namespace above 1024 and
+# kube-proxy translates the NodePorts onto them.
+kind: Deployment
+hostNetwork: false
+
+ports:
+  http: 8080
+  https: 8443
+
 service:
   type: NodePort
   http:

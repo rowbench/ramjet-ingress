@@ -15,6 +15,16 @@
 # annotation, so wiring it up is a console or Terraform job — turn on
 # proxyProtocol.enabled once you have.
 
+# The other shape, spelled out rather than inherited — see the aws preset. The
+# chart's default is a hostNetwork DaemonSet on the node's :80 and :443; behind
+# a balancer the pod belongs in its own network namespace on 8080/8443.
+kind: Deployment
+hostNetwork: false
+
+ports:
+  http: 8080
+  https: 8443
+
 service:
   type: LoadBalancer
   externalTrafficPolicy: Local

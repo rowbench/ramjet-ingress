@@ -33,11 +33,14 @@ fullnameOverride: ""
 
 # Deployment or DaemonSet.
 #
-# Deployment is right nearly everywhere: the pod sits behind a Service and the
-# cloud load balancer reaches it through that Service's endpoints, wherever the
-# scheduler happened to put it. DaemonSet is for the cases where being *on* a
-# node is what makes the pod reachable at all — hostNetwork binding node ports
-# directly, or a provider whose load balancer targets every node.
+# DaemonSet, because the default shape is hostNetwork on :80 and :443 (see
+# `hostNetwork` below) and those ports belong to the node: exactly one pod per
+# node is not a preference there, it is the only arrangement that starts. A
+# second copy on the same node would sit in CrashLoopBackOff with a bind error.
+#
+# Deployment is what every cloud preset sets, and it is right wherever a load
+# balancer reaches the pod through a Service: the pod sits behind that Service
+# and the scheduler puts it wherever it likes.
 #
 # The cost of DaemonSet, stated plainly rather than discovered: every pod runs
 # its own status writer, because there is no leader election. N pods do not
@@ -46,7 +49,7 @@ fullnameOverride: ""
 # debounce, and the resulting API traffic is nodes x Ingresses. Where that
 # matters more than a populated status field, set controller.updateStatus=false
 # and let the address be whatever the cluster's DNS says it is.
-kind: Deployment
+kind: DaemonSet
 
 controller:
   # IngressClass this replica answers to. An Ingress naming any other class is
@@ -71,10 +74,16 @@ controller:
 
   # Where that status points. `publishService` names a Service whose own
   # .status.loadBalancer supplies the address, and defaults to this chart's own
-  # LoadBalancer Service — which is the whole mechanism by which an Ingress in
-  # some other namespace learns the address traffic actually arrives on.
-  # `publishAddress` is the literal fallback used when that Service has no
+  # Service — which, under a cloud preset, is the whole mechanism by which an
+  # Ingress in some other namespace learns the address traffic actually arrives
+  # on. `publishAddress` is the literal fallback used when that Service has no
   # address yet (or is not a LoadBalancer at all).
+  #
+  # On the default hostNetwork shape it is always the fallback: the Service is a
+  # ClusterIP with no external address, and traffic never goes through it
+  # anyway. Set publishAddress to the VIP, the DNS name, or whatever fronts the
+  # nodes, or the ADDRESS column stays empty. Routing does not care either way —
+  # the status field is advertising, not configuration.
   publishService: ""     # defaults to "<release-namespace>/<fullname>"
   publishAddress: ""
 
@@ -265,21 +274,49 @@ engine: hyper
 h2Dispatch:
   enabled: true
 
+# The ports the listeners bind, inside the pod's network namespace — or, under
+# the default `hostNetwork: true`, on the node itself.
+#
+# 80 and 443, because that is what a browser asks for and the default shape has
+# nothing in front to translate. Every cloud preset moves them back to 8080 and
+# 8443, where the load balancer does the translation.
+#
+# Binding below 1024 takes more than a number: the process runs as uid 65532, so
+# the kernel needs CAP_NET_BIND_SERVICE in its *effective* set, and a non-root
+# process gets one there only from a file capability on the binary. The image
+# carries it and `securityContext` at the bottom of this file keeps it in the
+# container's bounding set — read that note before changing either, because it
+# is also what lets the container start on 8080.
+#
+# Where that is not wanted at all, the other lever is on the node rather than in
+# this file: `sysctl -w net.ipv4.ip_unprivileged_port_start=80` makes :80
+# unprivileged for everything on it. That one cannot be set from the pod — a
+# host-network pod is in the node's own network namespace, and the kubelet
+# refuses namespaced net.* sysctls for such a pod.
 ports:
-  http: 8080
+  http: 80
   # The TLS listener, or 0 to have none at all. Zero is what you want when
   # something in front terminates TLS and forwards plaintext — see the
   # aws-nlb-tls preset. The container port goes away with it and the daemon
   # gets --no-https, so nothing is listening, rather than something listening
   # with no certificate to offer.
-  https: 8443
+  https: 443
   admin: 10254
 
 service:
-  # LoadBalancer is the default because publishService above needs an address
-  # to publish. On a cluster with no load balancer controller the Service stays
-  # pending, the status falls back to publishAddress, and routing is unaffected.
-  type: LoadBalancer
+  # ClusterIP, because under the default `hostNetwork: true` external traffic
+  # never goes through a Service at all — it arrives on the node's own :80 and
+  # :443. The Service is kept so in-cluster clients have a name to resolve and
+  # so the chart's objects stay consistent; a LoadBalancer here would ask a
+  # cloud for an address nothing routes through, and a NodePort would allocate
+  # ports nobody uses.
+  #
+  # Every cloud preset sets LoadBalancer, which is also what makes status
+  # writeback work there: `controller.publishService` above reads that Service's
+  # own .status.loadBalancer. A ClusterIP Service has no address to read, so on
+  # the default shape the Ingress ADDRESS column stays empty unless
+  # controller.publishAddress is set to whatever clients actually use.
+  type: ClusterIP
   annotations: {}
   labels: {}
   loadBalancerIP: ""
@@ -438,13 +475,33 @@ priorityClassName: ""
 # NodePort translation in between, and it is the only shape on bare metal that
 # preserves the client address without a load balancer in front.
 #
-# What it costs: the ports are the node's, so a second pod on the same node
-# cannot bind them and will sit in CrashLoopBackOff — pair this with
-# kind: DaemonSet, which gives exactly one per node. Anything else already on
-# the node's :80 (another ingress controller, a stray host process) collides
-# the same way, and the error is a bind failure in the log rather than
-# anything Kubernetes reports as a scheduling problem.
-hostNetwork: false
+# On by default, which is the shape `helm install` with no values file gets: a
+# DaemonSet serving :80 and :443 on every node, reachable the moment a DNS
+# record points at any of them. That is the install that works on a cluster with
+# no cloud behind it, which is the cluster most people are holding when they try
+# this. Every cloud preset turns it off and goes back to a Deployment behind a
+# LoadBalancer Service, because there the balancer is what makes the pod
+# reachable and the node's ports are not involved.
+#
+# What it costs:
+#
+#  * The ports are the node's, so a second pod on the same node cannot bind
+#    them and will sit in CrashLoopBackOff — which is why `kind` above is a
+#    DaemonSet, giving exactly one per node. Anything else already on the
+#    node's :80 (another ingress controller, a stray host process) collides the
+#    same way, and the error is a bind failure in the log rather than anything
+#    Kubernetes reports as a scheduling problem.
+#
+#  * The admin port is on the host too, on every node. It carries /metrics and
+#    the probes, and `networkPolicy` cannot protect it here — policy does not
+#    apply to a host-network pod — so the node firewall and
+#    `controller.adminToken` are what is left.
+#
+#  * Binding :80 needs the file capability described under `ports` above and the
+#    matching entry in `securityContext.capabilities.add`. Both are already
+#    here; neither relaxes anything else, and the note on `securityContext`
+#    explains why.
+hostNetwork: true
 
 # Left empty, the template picks ClusterFirstWithHostNet whenever hostNetwork
 # is on and ClusterFirst otherwise. That default is not cosmetic: a
@@ -466,12 +523,40 @@ podSecurityContext:
   seccompProfile:
     type: RuntimeDefault
 
+# NET_BIND_SERVICE is not optional here, and not only for the shapes that bind
+# :80. Removing it stops the container from starting **at all**, on every port.
+#
+# The image's binary carries a file capability — `setcap cap_net_bind_service=+ep`
+# in the Dockerfile — because that is the only way a *non-root* process gets a
+# capability into its effective set: Kubernetes' `capabilities.add` puts one in
+# the container's permitted and bounding sets, and the kernel then drops it again
+# on execve unless the binary itself carries it. Without the file capability the
+# pod crash-loops with "Permission denied (os error 13)" on :80, which was this
+# chart's own bug until a stock node found it.
+#
+# The catch is the other direction. A binary whose file capability has the
+# *effective* bit set cannot be exec'd at all when that capability is outside the
+# container's bounding set: the kernel returns EPERM from execve — "insufficient
+# to execute correctly" — and the kubelet reports
+# `exec /usr/local/bin/ramjet-ingressd: operation not permitted`. So dropping
+# ALL without adding this back does not produce a slightly less privileged pod;
+# it produces one that never runs, on 8080 as surely as on 80.
+#
+# What it does not cost: nothing here relaxes anything else.
+# allowPrivilegeEscalation stays false — no_new_privs downgrades a capability set
+# by *intersecting* it with the one the container already had, and this one is in
+# that set, so the file capability survives. Verified on a stock node, not
+# assumed. The PodSecurity `restricted` profile also allows exactly this one
+# addition on top of a dropped ALL, so a release on ports above 1024 is still a
+# `restricted` pod.
 securityContext:
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
   capabilities:
     drop:
       - ALL
+    add:
+      - NET_BIND_SERVICE
 
 # A ServiceMonitor is deliberately absent: it would make the chart depend on
 # the Prometheus operator's CRDs being installed. The admin Service carries the

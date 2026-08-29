@@ -29,7 +29,14 @@
 #
 # Needs the AWS Load Balancer Controller.
 
+# The other shape, spelled out rather than inherited — see the aws preset. The
+# chart's default is a hostNetwork DaemonSet on the node's :80 and :443; behind
+# a balancer the pod belongs in its own network namespace.
+kind: Deployment
+hostNetwork: false
+
 ports:
+  http: 8080
   # No TLS listener. Opening one with no certificate to offer would fail every
   # handshake on a port the balancer believes is healthy, which is worse than
   # not listening.
