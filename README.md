@@ -236,10 +236,13 @@ the image, so the binary is copied out inside the same `RUN`.
 helm install ramjet deploy/chart/ramjet-ingress --namespace ramjet-system --create-namespace
 ```
 
-The chart installs a Deployment, a ServiceAccount, a ClusterRole and binding, a
-LoadBalancer Service for traffic, a separate ClusterIP Service for the admin
-port, and an `IngressClass` named `ramjet` whose controller is
-`ramjet.dev/ingress`. Point workloads at it with `ingressClassName: ramjet`, or
+That is a `hostNetwork` DaemonSet serving :80 and :443 on every node — the shape
+that works on a cluster with no load balancer behind it. It also installs a
+ServiceAccount, a ClusterRole and binding, a ClusterIP Service, a separate
+ClusterIP Service for the admin port, and an `IngressClass` named `ramjet` whose
+controller is `ramjet.dev/ingress`. On a cloud, use the preset for your
+provider: each one goes back to a Deployment on 8080/8443 behind a
+`LoadBalancer` Service. Point workloads at it with `ingressClassName: ramjet`, or
 set `ingressClass.isDefaultClass=true` to catch Ingresses that name no class.
 
 **[deploy/README.md](deploy/README.md) is the deployment guide** — a values
@@ -278,10 +281,12 @@ deliberately kept out of the Service, because an empty table would 404
 everything sent to it. `/healthz`, which the liveness probe uses, answers as
 soon as the process does.
 
-`--publish-service` defaults to the chart's own LoadBalancer Service. That is
-the mechanism by which an Ingress in an unrelated namespace ends up advertising
-the address traffic really arrives on; set `controller.publishAddress` as a
-fallback on clusters with no load balancer controller.
+`--publish-service` defaults to the chart's own Service, which under a cloud
+preset is a LoadBalancer: reading its address is the mechanism by which an
+Ingress in an unrelated namespace ends up advertising the address traffic really
+arrives on. The default `hostNetwork` shape has no such address, so set
+`controller.publishAddress` to whatever clients use or the ADDRESS column stays
+empty. Routing is unaffected either way.
 
 RBAC is exactly the six rules the controller's five watches and its status
 writer need. It creates nothing, deletes nothing, and holds no write verb

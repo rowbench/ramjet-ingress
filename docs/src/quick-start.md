@@ -137,10 +137,13 @@ helm install ramjet deploy/chart/ramjet-ingress \
   --namespace ramjet-system --create-namespace
 ```
 
-The chart installs a Deployment, a ServiceAccount, a ClusterRole and binding, a
-LoadBalancer Service for traffic, a separate ClusterIP Service for the admin
-port, and an `IngressClass` named `ramjet` whose controller is
-`ramjet.dev/ingress`.
+That is a `hostNetwork` DaemonSet serving :80 and :443 on every node — the shape
+that works on a cluster with nothing underneath it. It also installs a
+ServiceAccount, a ClusterRole and binding, a ClusterIP Service, a separate
+ClusterIP Service for the admin port, and an `IngressClass` named `ramjet` whose
+controller is `ramjet.dev/ingress`. On a cloud, add the preset for your provider
+(see [Deployment](./deployment.md)), which goes back to a Deployment on
+8080/8443 behind a `LoadBalancer` Service.
 
 Point workloads at it with `ingressClassName: ramjet`:
 

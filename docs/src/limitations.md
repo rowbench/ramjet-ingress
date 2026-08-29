@@ -3,10 +3,7 @@
 Known gaps, each with the reason it is a gap rather than a bug. Read this before
 you deploy.
 
-## Run one replica
-
-**There is no leader election.** The chart hard-codes `replicas: 1`, and there
-is no values entry to find at 3am.
+## There is no leader election
 
 Every replica watches the API server independently and writes Ingress status
 independently. Routing is unaffected by that — each replica compiles the same
@@ -15,12 +12,42 @@ controllers server-side-applying the same subtree under the same field manager
 will fight over `.status.loadBalancer` if their `--publish-address` values
 differ.
 
+A `Deployment` from this chart therefore hard-codes `replicas: 1`, and there is
+no values entry to find at 3am. **Scale by making the one replica bigger**, and
+use `--no-status-update` if you must run more.
+
+The chart's default is a `DaemonSet`, where the node count *is* the replica
+count and that hard-coding has nothing to bite on. Every node's replica is
+configured identically, so they write the same address through the same field
+manager and the patches converge — what it costs is volume, not correctness:
+API traffic of nodes x Ingresses, each on its own debounce. Set
+`controller.updateStatus=false` on a large pool and let the address be whatever
+DNS says it is.
+
 The fix is a `coordination.k8s.io` `Lease` and gating the status writer on
 holding it. The writer is already isolated behind one optional value, so it is a
 contained change.
 
-Until then: **scale by making the one replica bigger**, and use
-`--no-status-update` if you must run more.
+## The image needs `NET_BIND_SERVICE` in the bounding set, on every port
+
+The binary carries a `cap_net_bind_service` file capability, because that is the
+only way a non-root process binds :80 — see
+[Deployment](./deployment.md#binding-80). The consequence runs the other way
+too: a file capability with the effective bit set makes `execve` fail with
+`EPERM` when that capability is outside the container's bounding set, so a pod
+spec that drops `ALL` and adds nothing back **will not start at all**, on 8080
+as surely as on 80. The kubelet reports it as `exec
+/usr/local/bin/ramjet-ingressd: operation not permitted`.
+
+The chart adds it unconditionally and nothing else is relaxed —
+`allowPrivilegeEscalation` stays `false`, and the PodSecurity `restricted`
+profile permits exactly this one addition. It is a constraint on hand-written
+manifests, not on the chart.
+
+The default install is still outside `baseline`, but for `hostNetwork` rather
+than for anything about capabilities. Where a namespace enforces that profile,
+use `baremetal-nodeport`, a cloud preset, or the default with `hostNetwork`
+off and the ports back above 1024.
 
 ## There is no TLS to the upstream
 

@@ -13,7 +13,7 @@ helm install ramjet deploy/chart/ramjet-ingress \
 kubectl apply -f deploy/static/provider/aws.yaml
 ```
 
-Both install the same thing: a Deployment (or DaemonSet), a ServiceAccount, a
+Both install the same thing: a DaemonSet (or Deployment), a ServiceAccount, a
 ClusterRole and binding, a Service for traffic, a separate ClusterIP Service for
 the admin port, and an `IngressClass` named `ramjet`. Point workloads at it with
 `ingressClassName: ramjet`.
@@ -21,20 +21,31 @@ the admin port, and an `IngressClass` named `ramjet`. Point workloads at it with
 The static manifests are generated from the presets. Edit the preset, not the
 manifest — see [Regenerating the static manifests](#regenerating-the-static-manifests).
 
-## Generic install
+## The default install
 
-No provider preset, cluster defaults everywhere:
+No provider preset:
 
 ```sh
 helm install ramjet deploy/chart/ramjet-ingress \
   --namespace ramjet-ingress --create-namespace
 ```
 
-This gives you a `LoadBalancer` Service and whatever your cluster makes of it.
-On a cluster with no load balancer controller the Service stays `<pending>`
-forever; routing still works, and Ingress status falls back to
-`controller.publishAddress`. If that is your situation, you want
-[bare metal](#bare-metal) rather than this.
+That is a **`hostNetwork` DaemonSet serving :80 and :443 on every node**. There
+is no load balancer, no NodePort translation and no address to wait for: point a
+DNS record at the nodes and the thing is reachable, with the client's own
+address on the socket.
+
+It is the default because it is the shape that works on a cluster with nothing
+underneath it, which is the cluster most people are holding the first time they
+install an ingress controller. On a cloud, use the preset for your provider —
+each one turns this off and goes back to a Deployment behind a `LoadBalancer`
+Service on 8080/8443, which is where the balancer is what makes the pod
+reachable.
+
+Three things follow from it, all covered under [bare metal](#bare-metal) below:
+the node's ports have to be free, binding them takes a capability the image
+carries and the chart enables, and Ingress status has no address to read unless
+you set `controller.publishAddress`.
 
 ## Providers
 
@@ -50,7 +61,7 @@ forever; routing still works, and Ingress status falls back to
 | `oracle` | `oci-load-balancer-shape: flexible` (+ flex min/max) |
 | `exoscale` | `exoscale-loadbalancer-service-strategy: source-hash`, as a DaemonSet |
 | `baremetal-nodeport` | none; `NodePort` pinned to 30080/30443 |
-| `baremetal-hostnetwork` | none; `hostNetwork` DaemonSet on :80/:443 |
+| `baremetal-hostnetwork` | none; `hostNetwork` DaemonSet on :80/:443 — **the chart's default shape** |
 
 Each preset lives at `deploy/provider/<name>/values.yaml` and carries the
 reasoning for every line in it. Read the one you are about to use — several of
@@ -197,7 +208,8 @@ See [HTTP/3](./operations/http3.md) for the protocol-side detail.
 
 ## Bare metal
 
-Two shapes, and the choice is about which ports you need.
+The default shape and its fallback. The choice is about which ports you need
+and whether the node's :80 is yours to take.
 
 **`baremetal-nodeport`** — a NodePort Service pinned to 30080 and 30443. Works
 on any cluster, needs no load balancer controller, and is the right thing for
@@ -208,24 +220,106 @@ upstream configs naming them do not go stale when the Service is recreated.
 
 **`baremetal-hostnetwork`** — a DaemonSet on the host network, binding :80 and
 :443 on every node. No translation, no balancer, and the socket already carries
-the client's address. The ports belong to the node, so a second copy on the same
-node cannot start — which is why it is a DaemonSet — and the admin port is now
-on every node's external interface, with the node firewall as the only thing
-keeping it private.
+the client's address. **This is the chart's default**, so a `helm install` with
+no values file at all gets it; the preset exists to say so explicitly and to be
+the source of the rendered manifest. The ports belong to the node, so a second
+copy on the same node cannot start — which is why it is a DaemonSet — and the
+admin port is now on every node's external interface, with the node firewall as
+the only thing keeping it private.
 
-Binding below 1024 as uid 65532 needs `NET_BIND_SERVICE`, which the preset adds
-back to an otherwise-empty capability set. If a pod still fails to bind, the
-node's `net.ipv4.ip_unprivileged_port_start` is the other lever (it cannot be
-set from the pod: Kubernetes rejects network sysctls on host-network pods).
+### Binding :80
 
-**MetalLB** is the third option and often the best one: put it in front and use
-the generic install with `service.type=LoadBalancer`. MetalLB assigns a real
-address out of an `IPAddressPool`, the Service behaves like a cloud one, and
-Ingress status writeback works because there is finally an address to publish.
-<https://metallb.universe.tf/>
+This is the part that is genuinely surprising, and it was this chart's own bug
+until a stock node found it.
 
-Neither bare-metal preset can populate Ingress status on its own — there is no
-`LoadBalancer` Service with an address to read. Set
+The process runs as uid 65532, and a port below 1024 needs
+`CAP_NET_BIND_SERVICE` in its **effective** set. Adding the capability in the
+`securityContext` is not enough on its own: Kubernetes puts it in the
+container's permitted and bounding sets, and the kernel raises a capability into
+a *non-root* process's effective set only from a **file capability on the
+binary**. So the obvious configuration is the one that cannot work, and it fails
+as `Permission denied (os error 13)` in a CrashLoopBackOff.
+
+The fix is in the image. Its binary carries `cap_net_bind_service=+ep`, set by a
+`setcap` in the Dockerfile's builder stage and carried into the runtime stage in
+the layer's `security.capability` extended attribute. That is the same mechanism
+ingress-nginx uses on its nginx binary.
+
+**`allowPrivilegeEscalation` stays `false`.** This is worth stating because the
+opposite is widely assumed: `no_new_privs` does not discard a file capability, it
+downgrades the new permitted set by *intersecting* it with the one the process
+already had — and `capabilities.add` has already put `NET_BIND_SERVICE` there.
+Verified on a stock node rather than reasoned about. Nothing about this shape is
+more privileged than a release on 8080.
+
+### The obligation it creates
+
+A file capability with the **effective** bit set cannot be exec'd at all when
+that capability is outside the container's bounding set. The kernel refuses with
+`EPERM` — "insufficient to execute correctly" — and the kubelet reports:
+
+```
+exec /usr/local/bin/ramjet-ingressd: operation not permitted
+```
+
+That happens before a line of the program runs, and it does not care what port
+anything was going to bind. So **every** pod spec for this image has to keep
+`NET_BIND_SERVICE` in `securityContext.capabilities.add`, on 8080 exactly as
+much as on 80. The chart does that unconditionally; a hand-written manifest that
+drops `ALL` and adds nothing back will not start.
+
+The PodSecurity `restricted` profile permits exactly this one addition on top of
+a dropped `ALL`, so nothing here costs a profile.
+
+Checking that an image you have pulled really carries it (distroless has no
+shell, so the check happens somewhere that does):
+
+```sh
+IMAGE=sofelia/ramjet-ingress:0.1.0
+docker build -q - <<EOF >/dev/null && echo "capability present in $IMAGE"
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends libcap2-bin
+COPY --from=$IMAGE /usr/local/bin/ramjet-ingressd /d
+RUN getcap /d | grep -q cap_net_bind_service
+EOF
+```
+
+The capability is only in images built from the commit that added the `setcap`,
+so a tag older than that fails this check — which is also what a pod running one
+will tell you in its log.
+
+Two ways out for a cluster that will not run this image at all:
+
+- `sysctl -w net.ipv4.ip_unprivileged_port_start=80` on every node, which makes
+  :80 unprivileged for everything on that node. It has to be set on the node —
+  a host-network pod is in the node's own network namespace and the kubelet
+  refuses namespaced `net.*` sysctls for it.
+- `baremetal-nodeport`, or a balancer in front, and leave the listeners above
+  1024.
+
+A pod that fails to bind says all of this in its log, naming the port, the uid
+and both remedies — `kubectl logs` it rather than working back from `os error
+13`.
+
+One reason this went unnoticed for so long: containerd sets
+`net.ipv4.ip_unprivileged_port_start=0` inside every pod sandbox it creates
+(`enable_unprivileged_ports`, on by default), so a pod on the **pod** network
+binds :80 whatever its capabilities say. `hostNetwork` is the shape that has no
+sandbox netns of its own, and therefore the only one where the node's own
+setting — 1024 on a stock node — applies.
+
+
+**MetalLB** is the third option and often the best one where a real address
+matters more than the node's ports: put it in front and install with
+`--set service.type=LoadBalancer --set kind=Deployment --set hostNetwork=false
+--set ports.http=8080 --set ports.https=8443`, which is the cloud shape without
+a cloud. MetalLB assigns an address out of an `IPAddressPool`, the Service
+behaves like a cloud one, and Ingress status writeback works because there is
+finally an address to publish. <https://metallb.universe.tf/>
+
+Neither bare-metal preset can populate Ingress status on its own — and neither
+can the default install, for the same reason: there is no `LoadBalancer` Service
+with an address to read. Set
 `controller.publishAddress` to whatever clients actually use. Routing is
 unaffected either way; the status field is advertising, not configuration.
 
@@ -256,7 +350,7 @@ image:
   pullPolicy: IfNotPresent
   pullSecrets: []
 
-kind: Deployment                 # or DaemonSet
+kind: DaemonSet                  # or Deployment
 
 controller:
   ingressClass: ramjet
@@ -282,12 +376,14 @@ http3:
   enabled: false
 
 ports:
-  http: 8080
-  https: 8443
+  http: 80                       # cloud presets set 8080
+  https: 443                     # cloud presets set 8443
   admin: 10254
 
+hostNetwork: true                # cloud presets set false
+
 service:
-  type: LoadBalancer
+  type: ClusterIP                # cloud presets set LoadBalancer
   annotations: {}
   externalTrafficPolicy: ""
   http:  { port: 80,  nodePort: "", targetPort: http }
@@ -315,10 +411,13 @@ podSecurityContext:
   fsGroup: 65532
   seccompProfile: { type: RuntimeDefault }
 
+# NET_BIND_SERVICE is not optional: the image's binary carries a file capability
+# and cannot be exec'd at all unless that capability is in the container's
+# bounding set — on 8080 as much as on 80. See [Binding :80](#binding-80).
 securityContext:
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
-  capabilities: { drop: [ALL] }
+  capabilities: { drop: [ALL], add: [NET_BIND_SERVICE] }
 
 metrics:
   scrapeAnnotations: true
@@ -339,10 +438,15 @@ hidden the finding rather than fixed it. See
 
 ### `--publish-service` and Ingress status
 
-`--publish-service` defaults to the chart's own LoadBalancer Service. That is
-the mechanism by which an Ingress in an unrelated namespace ends up advertising
-the address traffic really arrives on; set `controller.publishAddress` as a
-fallback on clusters with no load balancer controller.
+`--publish-service` defaults to the chart's own Service. Under a cloud preset
+that Service is a `LoadBalancer`, and reading its address is the mechanism by
+which an Ingress in an unrelated namespace ends up advertising the address
+traffic really arrives on.
+
+On the default `hostNetwork` shape there is no such address — the Service is a
+`ClusterIP` and traffic does not go through it at all — so set
+`controller.publishAddress` to whatever clients actually use, or the ADDRESS
+column stays empty. Routing is unaffected either way.
 
 ### RBAC
 
@@ -403,6 +507,13 @@ NodePorts on the host, so the traffic assertions run *inside* the node container
 against the node's own address. That is the more faithful test anyway — it is
 the real NodePort path, where a port-forward would have proven only that the pod
 serves.
+
+One thing this cannot prove, and it is the reason the default shape is verified
+by hand on a real node as well: Docker Desktop's node ships
+`net.ipv4.ip_unprivileged_port_start=0`, so :80 binds for any uid there. The
+privileged-bind failure the file capability exists to prevent is invisible on
+this cluster — a chart that could not bind :80 anywhere else would pass here.
+See [Binding :80](#binding-80).
 
 ## End-to-end proof
 
