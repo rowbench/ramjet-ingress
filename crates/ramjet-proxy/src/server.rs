@@ -131,7 +131,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_rustls::TlsAcceptor;
 
-use crate::admin::{self, AdminState, ReadinessFlag};
+use crate::admin::{self, AdminAuth, AdminState, ReadinessFlag};
 use crate::body::ProxyBody;
 use crate::forward::{self, ConnInfo, ProxyState, Scheme};
 use crate::history::{GenerationHistory, DEFAULT_HISTORY_SIZE};
@@ -252,6 +252,12 @@ pub struct ProxyConfig {
     pub https: Option<ListenerConfig>,
     /// Admin listener, or `None` to disable metrics and probes.
     pub admin: Option<ListenerConfig>,
+    /// Bearer token the mutating `/admin/` endpoints require, or `None` to
+    /// accept them from anything that can reach the port.
+    ///
+    /// Never covers `GET`: see [`admin`](crate::admin) for why the probes and
+    /// `/metrics` cannot be gated.
+    pub admin_auth: Option<AdminAuth>,
     /// Upstream timeouts and pooling.
     pub upstream: UpstreamConfig,
     /// How long in-flight requests get to finish after a shutdown signal.
@@ -324,6 +330,7 @@ impl Default for ProxyConfig {
             http: Some(all(DEFAULT_HTTP_PORT)),
             https: Some(all(DEFAULT_HTTPS_PORT)),
             admin: Some(all(DEFAULT_ADMIN_PORT)),
+            admin_auth: None,
             upstream: UpstreamConfig::default(),
             // Kubernetes' default `terminationGracePeriodSeconds` is 30, so a
             // longer drain would just be interrupted by SIGKILL — the deadline
@@ -468,6 +475,7 @@ impl Server {
             routes: Arc::clone(&routes),
             readiness: readiness.clone(),
             history: Arc::clone(&history),
+            auth: config.admin_auth,
         });
 
         let (handoff_tx, handoffs) = mpsc::channel(HANDOFF_QUEUE_DEPTH);

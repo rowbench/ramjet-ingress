@@ -34,6 +34,13 @@ pin-project-lite = "0.2"
 # and writing its response.
 serde_json = "1.0"
 socket2 = { version = "0.6", features = ["all"] }
+# Comparing the admin bearer token, and nothing else. Six lines of `|= a ^ b`
+# would look the same and be a promise this crate cannot keep: nothing stops
+# LLVM turning an accumulator loop back into an early exit, and a secret
+# comparison that leaks a byte at a time under a timing attack is exactly the
+# bug that is invisible in a test. `subtle` exists to hold that guarantee across
+# optimiser releases, and rustls already links it, so it costs no build time.
+subtle = "2.6"
 # One event, on the connection-drop path when a PROXY header is rejected. The
 # binary already links this through `ramjet-controller`, and a filtered-out
 # event is an atomic load, so the alternative — dropping connections with no

@@ -32,8 +32,47 @@ no values entry can accidentally publish it.
 kubectl port-forward -n ramjet-ingress svc/ramjet-ingress-admin 10254:10254
 ```
 
-There is no authentication and there is not going to be: anything that can reach
-this port can already reach the pod's ServiceAccount token. What *is* enforced
-is the shape — the mutating endpoint answers to `POST` and `DELETE` and nothing
-else, so a link, a browser prefetch, a scraper following URLs, or a health
-checker walking paths cannot roll a cluster back by accident.
+Three things stand between the mutating endpoints and an accident or an
+attacker, and they are deliberately different in kind.
+
+**The shape**, unconditionally: the mutating endpoint answers to `POST` and
+`DELETE` and nothing else, so a link, a browser prefetch, a scraper following
+URLs, or a health checker walking paths cannot roll a cluster back by accident.
+
+**The network**: a ClusterIP Service and nothing in front of it. The chart's
+optional `networkPolicy.enabled` narrows that further, to the release namespace.
+
+**A bearer token**, with `--admin-token-file` (chart:
+`controller.adminToken.secretName`). Set it and every mutating `/admin/` request
+must carry `Authorization: Bearer <token>`:
+
+```sh
+kubectl -n ramjet-ingress create secret generic ramjet-admin \
+  --from-literal=token="$(openssl rand -hex 32)"
+helm upgrade ramjet ... --set controller.adminToken.secretName=ramjet-admin
+```
+
+```sh
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -d '{"generation": 41}' localhost:10254/admin/rollback
+```
+
+Without it, the daemon logs one warning at startup and accepts a rollback from
+anything that can reach the port. This page used to argue that a token was
+pointless because anything reaching the port could already read the pod's
+ServiceAccount token — which was wrong in one specific way. That token is on
+*our* filesystem, not on the network. A pod in some other namespace cannot read
+it, and until now the only thing stopping that pod from rolling the ingress
+table back was that it had not thought of it.
+
+`GET` is never gated. `/metrics` is scraped by Prometheus and `/healthz` and
+`/readyz` are called by the kubelet, and neither can be taught to send a header —
+gating them would trade a rollback for a pod that restarts every time its
+liveness probe is refused. `/admin/generations` and `/admin/routes` stay open for
+the same reason they are `GET` at all: they report what a replica is serving,
+which is not a secret from anything that can already send it traffic.
+
+The token is read once, at startup, so rotating it is `kubectl rollout restart`
+after replacing the Secret. A `read(2)` per request to make a yearly event
+convenient is the wrong trade. `ramjet-top` sends the token with `--token-file`,
+and only on its pin and unpin keys.

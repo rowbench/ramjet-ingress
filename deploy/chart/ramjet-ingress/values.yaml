@@ -113,6 +113,37 @@ controller:
   # point it at a collector inside the cluster.
   auditWebhook: ""
 
+  # Require a bearer token on every mutating /admin/ request.
+  #
+  # Off by default, and off is the state the daemon warns about once at startup.
+  # What it protects: POST /admin/rollback republishes an old generation and
+  # DELETE releases it, and without a token any pod that can reach the admin
+  # port can do both. The port is a ClusterIP Service and never on the
+  # LoadBalancer, so "reachable" means the cluster — which on a cluster running
+  # code you did not write is not a small set.
+  #
+  # `secretName` names an existing Secret; the chart does not create one,
+  # deliberately. A Secret templated from a value lands in the release manifest,
+  # in `helm get values`, and in whatever git repository holds the values file.
+  # Create it separately:
+  #
+  #   kubectl -n ramjet-ingress create secret generic ramjet-admin \
+  #     --from-literal=token="$(openssl rand -hex 32)"
+  #
+  # Reads are never gated: /metrics is scraped by Prometheus, /healthz and
+  # /readyz are called by the kubelet, and neither can send a header — gating
+  # them would trade a rollback for a crash loop. /admin/generations and
+  # /admin/routes stay open too; they report what this replica serves, which is
+  # not a secret from anything that can already send it traffic.
+  #
+  # Rotation is a restart: the token is read once at startup. Replace the
+  # Secret, then `kubectl rollout restart`.
+  #
+  # `ramjet-top` sends it with --token-file; only its pin and unpin keys need it.
+  adminToken:
+    secretName: ""
+    key: token
+
   # Anything not covered above. Appended verbatim after the generated flags,
   # and a flag always beats its environment twin.
   extraArgs: []
@@ -270,6 +301,60 @@ adminService:
   port: 10254
   annotations: {}
   labels: {}
+
+# A default-deny NetworkPolicy on the controller pods, with holes for the
+# traffic ports and for the admin port from inside this namespace.
+#
+# OFF BY DEFAULT, and the reason is that turning it on breaks the most common
+# monitoring setup: Prometheus almost always runs in another namespace, and this
+# policy admits the admin port from *this* namespace only. Enable it and your
+# scrapes stop, silently, until you add the rule below.
+#
+# What it buys, when you do want it: the admin port is the one place in this
+# deployment where a request from an arbitrary pod changes what the cluster
+# serves. `controller.adminToken` makes that require a secret; this makes it
+# require being somewhere. The two are independent and compose — a token is
+# worth having even behind a policy, because a policy is a cluster-wide object
+# somebody else can edit.
+#
+# What it does NOT do: nothing here restricts egress. The controller has to
+# reach the API server, every backend pod in the cluster, and the audit webhook,
+# and a chart that guessed at those CIDRs would produce an outage on the first
+# cluster whose API server is not where it assumed.
+#
+# The traffic ports are admitted from everywhere, because that is what an
+# ingress controller is for; a policy narrowing those belongs to whatever sits
+# in front of it.
+#
+# To let Prometheus scrape from its own namespace, add a rule with
+# `extraIngress` — label the namespace first, since a namespaceSelector matches
+# on labels rather than on name:
+#
+#   extraIngress:
+#     - from:
+#         - namespaceSelector:
+#             matchLabels:
+#               kubernetes.io/metadata.name: monitoring
+#       ports:
+#         - port: 10254
+#           protocol: TCP
+#
+# `kubernetes.io/metadata.name` is set automatically by the API server on every
+# namespace, so that selector needs no labelling step of its own.
+#
+# The kubelet's probes get no rule of their own, deliberately: they come from
+# the node, which matches no pod or namespace selector, and the only ipBlock
+# wide enough to cover "whichever node this landed on" also covers every pod in
+# the cluster — which would re-open the admin port and leave the object doing
+# nothing while looking like it does something. Every CNI this is likely to meet
+# admits node-to-pod traffic already; if yours does not, the pods restart within
+# a minute of enabling this and you add the node CIDR here having seen the
+# tradeoff.
+networkPolicy:
+  enabled: false
+  # Rules appended verbatim to `spec.ingress`, for the scrapers and consoles
+  # this chart cannot know about.
+  extraIngress: []
 
 ingressClass:
   # The IngressClass object naming this controller. Cluster-scoped: disable it

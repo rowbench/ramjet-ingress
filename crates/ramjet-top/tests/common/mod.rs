@@ -41,6 +41,12 @@ pub struct Bodies {
     ///
     /// `Some(generation)` for a pin, `None` for a release.
     pub rollbacks: Vec<Option<u64>>,
+    /// Every request seen, as `(path, Authorization)`.
+    ///
+    /// The header rather than a boolean, because the interesting failure is not
+    /// "no token was sent" but "the token was sent on the polls too", and a
+    /// count of requests that carried one cannot tell those apart.
+    pub authorization: Vec<(String, Option<String>)>,
 }
 
 impl Default for Bodies {
@@ -51,6 +57,7 @@ impl Default for Bodies {
             metrics: metrics_text(10_007, 12, 37, 42),
             failing: false,
             rollbacks: Vec::new(),
+            authorization: Vec::new(),
         }
     }
 }
@@ -118,6 +125,15 @@ impl MockAdmin {
     pub fn rollbacks(&self) -> Vec<Option<u64>> {
         self.state.lock().expect("the fixture lock").rollbacks.clone()
     }
+
+    /// The `Authorization` header seen on each request, in arrival order.
+    pub fn authorization(&self) -> Vec<(String, Option<String>)> {
+        self.state
+            .lock()
+            .expect("the fixture lock")
+            .authorization
+            .clone()
+    }
 }
 
 /// Answers one request.
@@ -127,6 +143,16 @@ async fn handle(
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let path = request.uri().path().to_string();
     let method = request.method().clone();
+    let authorization = request
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    state
+        .lock()
+        .expect("the fixture lock")
+        .authorization
+        .push((path.clone(), authorization));
 
     // The rollback endpoints are recorded rather than acted on; what these
     // tests care about is that the client sent the right thing.

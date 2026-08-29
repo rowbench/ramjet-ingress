@@ -30,8 +30,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use ramjet_proxy::{
-    CertStore, ListenerConfig, ProxyConfig, ReadinessFlag, Server, Shutdown, SniResolver,
-    UpstreamConfig,
+    AdminAuth, CertStore, ListenerConfig, ProxyConfig, ReadinessFlag, Server, Shutdown,
+    SniResolver, UpstreamConfig,
 };
 use ramjet_router::SharedRouteTable;
 use tracing_subscriber::EnvFilter;
@@ -236,7 +236,7 @@ async fn dev_mode(
 
     let readiness = ReadinessFlag::new();
     let server = Server::bind_with(
-        proxy_config(args, https),
+        proxy_config(args, https, admin_auth(args)?),
         Arc::clone(&routes),
         certs,
         readiness.clone(),
@@ -462,6 +462,7 @@ async fn uring_mode(
                 routes: Arc::clone(&routes),
                 readiness: readiness_flag.clone(),
                 history,
+                auth: admin_auth(args)?,
             });
             tokio::spawn(ramjet_proxy::serve_admin_only(
                 listener,
@@ -605,6 +606,9 @@ fn start_hyper_lane(
         http: None,
         https: None,
         admin: None,
+        // No admin listener means nothing here to authenticate; the process's
+        // one admin listener carries the token.
+        admin_auth: None,
         upstream: upstream_config(args),
         shutdown_grace: args.shutdown_grace,
         worker_threads: args.worker_threads,
@@ -656,16 +660,52 @@ pub(crate) fn upstream_config(args: &Args) -> UpstreamConfig {
     }
 }
 
+/// The bearer token the mutating admin endpoints will require, if any.
+///
+/// Read here, once, before anything binds: a path that does not exist is a
+/// refusal to start rather than a listener that has been quietly accepting
+/// unauthenticated rollbacks since the Secret failed to mount.
+///
+/// With no flag this logs one warning and returns `None`. Once per process, at
+/// `warn`, naming the flag — the failure it guards against is an operator who
+/// believes the port is authenticated because it is only reachable inside the
+/// cluster, and the only place to correct that belief is before the first
+/// request.
+pub(crate) fn admin_auth(args: &Args) -> Result<Option<AdminAuth>, Box<dyn std::error::Error>> {
+    let Some(path) = &args.admin_token_file else {
+        if args.admin.is_some() {
+            tracing::warn!(
+                flag = "--admin-token-file",
+                "the mutating /admin/ endpoints accept any caller that can reach the \
+                 admin port; set --admin-token-file to require a bearer token"
+            );
+        }
+        return Ok(None);
+    };
+    let auth = AdminAuth::from_file(path)
+        .map_err(|error| format!("--admin-token-file {}: {error}", path.display()))?;
+    tracing::info!(
+        path = %path.display(),
+        "mutating /admin/ endpoints require a bearer token"
+    );
+    Ok(Some(auth))
+}
+
 /// The listener and upstream configuration both modes share.
 ///
 /// `https` is passed separately because it is the one setting the two modes
 /// disagree about; everything else here is the same question with the same
 /// answer regardless of where the route table comes from.
-fn proxy_config(args: &Args, https: Option<SocketAddr>) -> ProxyConfig {
+fn proxy_config(
+    args: &Args,
+    https: Option<SocketAddr>,
+    admin_auth: Option<AdminAuth>,
+) -> ProxyConfig {
     ProxyConfig {
         http: args.http.map(ListenerConfig::new),
         https: https.map(ListenerConfig::new),
         admin: args.admin.map(ListenerConfig::new),
+        admin_auth,
         upstream: upstream_config(args),
         shutdown_grace: args.shutdown_grace,
         worker_threads: args.worker_threads,

@@ -24,18 +24,46 @@
 //! # The trust model, because two of these endpoints change what is served
 //!
 //! `POST /admin/rollback` republishes an old generation and `DELETE` releases
-//! it. There is no authentication here and there is not going to be: the
-//! listener is bound to the pod and exposed through a ClusterIP Service, the
-//! chart never puts it behind an Ingress or a LoadBalancer, and anything that
-//! can reach it can already reach the API server's Service account token on the
-//! same pod. Adding a shared secret to a port that is reachable only from
-//! inside the cluster would be a login screen on a door that is already in a
-//! locked building.
+//! it. Three things stand between that and an accident or an attacker, and they
+//! are deliberately different in kind.
 //!
-//! What *is* enforced is the shape: the mutating endpoints answer to `POST` and
-//! `DELETE` and nothing else. A `GET` cannot change what this replica serves,
-//! so a link, a browser prefetch, a scraper following URLs, or a health checker
-//! walking paths cannot roll a cluster back by accident.
+//! **The shape.** The mutating endpoints answer to `POST` and `DELETE` and
+//! nothing else. A `GET` cannot change what this replica serves, so a link, a
+//! browser prefetch, a scraper following URLs, or a health checker walking paths
+//! cannot roll a cluster back by accident. This is unconditional and needs no
+//! configuration.
+//!
+//! **The network.** The listener is bound to the pod and exposed through a
+//! ClusterIP Service; the chart never puts it behind an Ingress or a
+//! LoadBalancer. That bounds the reachable set to the cluster, and the chart's
+//! optional `networkPolicy` narrows it further to the release namespace.
+//!
+//! **A bearer token**, when [`AdminState::auth`] carries one. The earlier
+//! argument here was that a secret on a port reachable only from inside the
+//! cluster is a login screen on a door in a locked building, and that argument
+//! was wrong in one specific way: "inside the cluster" is every pod in every
+//! namespace, including the ones running somebody else's code. A pod that can
+//! reach this port cannot read the API server token on *our* pod — it is on our
+//! filesystem, not on the network — so the only thing that was stopping any
+//! workload in the cluster from rolling back the ingress table was that it had
+//! not thought of it. With a token configured, every mutating `/admin/` request
+//! must carry `Authorization: Bearer <token>`; without one, they are refused
+//! with 401 and nothing changes.
+//!
+//! What the token deliberately does **not** cover is `GET`: `/metrics` is
+//! scraped by Prometheus and `/healthz` and `/readyz` are called by the kubelet,
+//! and none of the three can be taught to send a header. Gating them would trade
+//! a rollback an attacker has to reach the port to perform for a pod that
+//! restarts every time its liveness probe is refused. `/admin/generations` and
+//! `/admin/routes` stay open for the same reason they are `GET` at all: they
+//! report what this replica is serving, which is not a secret from anything that
+//! can already send it traffic.
+//!
+//! Rotation is a restart. The token is read once at startup rather than on every
+//! request — a per-request `read(2)` on the mutating path would be a syscall
+//! bought to make a yearly event convenient — so replacing the Secret means
+//! rolling the Deployment, which is one command and the thing an operator was
+//! going to do anyway.
 //!
 //! # Why the per-route data is JSON and not Prometheus
 //!
@@ -54,15 +82,17 @@
 //! every existing reader already handles because `canary` has always been
 //! nullable.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::{header, HeaderValue, Method, Request, Response, StatusCode};
+use http::{header, HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use ramjet_router::{RouteSlot, RouteTable, SharedRouteTable};
 use serde_json::{json, Value};
+use subtle::ConstantTimeEq;
 
 use crate::body::ProxyBody;
 use crate::history::{self, GenerationHistory, PinError};
@@ -77,6 +107,134 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 /// body from a socket is how an endpoint with no other resource cost acquires
 /// one.
 const MAX_BODY: usize = 4 * 1024;
+
+/// The scheme name in `Authorization`, matched case-insensitively as RFC 7235
+/// requires.
+const BEARER: &str = "Bearer ";
+
+/// Why a token file could not be turned into an [`AdminAuth`].
+#[derive(Debug)]
+pub enum TokenError {
+    /// The file could not be read.
+    Unreadable(std::io::Error),
+    /// The file held nothing but whitespace.
+    ///
+    /// Refused rather than accepted as an empty token, which would mean every
+    /// mutating request had to send the header `Authorization: Bearer ` and
+    /// exactly that — authentication that looks configured, passes a smoke
+    /// test, and protects nothing an attacker could not also type.
+    Empty,
+}
+
+impl std::fmt::Display for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenError::Unreadable(error) => write!(f, "cannot read the admin token file: {error}"),
+            TokenError::Empty => f.write_str(
+                "the admin token file is empty; a blank token would authenticate \
+                 anything that sends an empty bearer header",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TokenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TokenError::Unreadable(error) => Some(error),
+            TokenError::Empty => None,
+        }
+    }
+}
+
+/// The bearer token the mutating admin endpoints require.
+///
+/// Cheap to clone. Read once, at startup — see the module docs on rotation.
+#[derive(Clone)]
+pub struct AdminAuth {
+    token: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for AdminAuth {
+    /// Deliberately says only that there is one.
+    ///
+    /// `AdminState` derives `Debug` and is logged at startup on two of the three
+    /// paths that build one. A derived field here would put the token in the
+    /// pod's logs, where it outlives the process and reaches whatever ships them.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AdminAuth(<redacted>)")
+    }
+}
+
+impl AdminAuth {
+    /// Reads the token from `path`.
+    ///
+    /// Trailing whitespace is trimmed, because a Secret written by `echo` or by
+    /// a person's editor ends in a newline and refusing that would be a
+    /// half-hour nobody gets back. Interior bytes are taken as they are.
+    ///
+    /// # Errors
+    ///
+    /// The file could not be read, or held nothing but whitespace.
+    pub fn from_file(path: &Path) -> Result<Self, TokenError> {
+        let raw = std::fs::read(path).map_err(TokenError::Unreadable)?;
+        let trimmed: &[u8] = {
+            let start = raw.iter().position(|b| !b.is_ascii_whitespace());
+            let end = raw.iter().rposition(|b| !b.is_ascii_whitespace());
+            match (start, end) {
+                (Some(start), Some(end)) => &raw[start..=end],
+                _ => &[],
+            }
+        };
+        if trimmed.is_empty() {
+            return Err(TokenError::Empty);
+        }
+        Ok(AdminAuth {
+            token: Arc::from(trimmed),
+        })
+    }
+
+    /// A token supplied directly, for tests and embedders.
+    ///
+    /// # Errors
+    ///
+    /// The token was empty.
+    pub fn from_token(token: &str) -> Result<Self, TokenError> {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return Err(TokenError::Empty);
+        }
+        Ok(AdminAuth {
+            token: Arc::from(trimmed.as_bytes()),
+        })
+    }
+
+    /// Whether these headers carry the right bearer token.
+    ///
+    /// The comparison is constant-time in the value, so a caller cannot find the
+    /// token one byte at a time by timing the refusals. It is *not* constant-time
+    /// in the length — `ct_eq` on unequal slices is a length check — which leaks
+    /// how long the token is and nothing about what it says.
+    fn authorizes(&self, headers: &HeaderMap) -> bool {
+        let Some(value) = headers.get(header::AUTHORIZATION) else {
+            return false;
+        };
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        // Case-insensitive on the scheme only. RFC 7235 makes the scheme name
+        // case-insensitive and the credentials opaque, and a client library
+        // that sends `bearer` is not wrong.
+        let Some(offered) = value
+            .get(..BEARER.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(BEARER))
+            .and_then(|_| value.get(BEARER.len()..))
+        else {
+            return false;
+        };
+        offered.as_bytes().ct_eq(&self.token).into()
+    }
+}
 
 /// Whether this replica should receive traffic.
 ///
@@ -126,11 +284,32 @@ pub struct AdminState {
     pub readiness: ReadinessFlag,
     /// The generations this replica has applied, and the publication gate.
     pub history: Arc<GenerationHistory>,
+    /// The bearer token mutating `/admin/` requests must carry, or `None` to
+    /// accept them from anything that can reach the port.
+    ///
+    /// See the module docs for what this covers and what it deliberately does
+    /// not.
+    pub auth: Option<AdminAuth>,
 }
 
 /// Answers one admin request.
 pub async fn handle(state: Arc<AdminState>, request: Request<Incoming>) -> Response<ProxyBody> {
     let path = request.uri().path().to_owned();
+
+    // Authentication is decided by method and prefix rather than by matching the
+    // path first, so an endpoint added later is covered by having been given a
+    // mutating method — which is the property that actually needs enforcing —
+    // rather than by somebody remembering to add it to a list here. The cost is
+    // that `POST /admin/nonsense` is a 401 before it is a 404, which is the
+    // right way round: an unauthenticated caller learns nothing about which
+    // admin endpoints exist.
+    if mutates(request.method()) && path.starts_with("/admin/") {
+        if let Some(auth) = &state.auth {
+            if !auth.authorizes(request.headers()) {
+                return unauthorized();
+            }
+        }
+    }
 
     // Split by mutating and not, rather than by path first: the property worth
     // enforcing is that nothing reachable with a `GET` changes what is served.
@@ -336,6 +515,34 @@ fn resume(state: &AdminState) -> Response<ProxyBody> {
     json(StatusCode::OK, json!({ "pinned": Value::Null }))
 }
 
+/// Whether this method can change what the replica serves.
+///
+/// Everything that is not a read. `GET` and `HEAD` are the two the rest of this
+/// module answers, and listing the safe ones rather than the unsafe ones means a
+/// method nobody thought about is treated as a write.
+fn mutates(method: &Method) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD)
+}
+
+/// The refusal when a mutating request carries no usable token.
+///
+/// `WWW-Authenticate` because a 401 without one is not a 401 an HTTP client can
+/// act on, and because it is how `curl --oauth2-bearer` and every other tool
+/// learns what to send. The body says nothing about whether the token was
+/// missing, malformed, or wrong: all three are the same answer to whoever sent
+/// it, and distinguishing them is free information for something guessing.
+fn unauthorized() -> Response<ProxyBody> {
+    let mut response = text(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized: this endpoint requires Authorization: Bearer <token>\n",
+    );
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer"),
+    );
+    response
+}
+
 fn json(status: StatusCode, value: Value) -> Response<ProxyBody> {
     let body = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
     let mut response = Response::new(ProxyBody::once(Bytes::from(body)));
@@ -362,6 +569,106 @@ mod tests {
     use super::*;
     use crate::tls::CertStore;
     use ramjet_router::{Endpoint, LbPolicy, PathType, RouteTableBuilder};
+
+    fn bearer(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(value).expect("a header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn only_the_configured_token_authorizes() {
+        let auth = AdminAuth::from_token("s3cret").expect("a token");
+        assert!(auth.authorizes(&bearer("Bearer s3cret")));
+        assert!(!auth.authorizes(&bearer("Bearer s3cre")), "a prefix is not the token");
+        assert!(!auth.authorizes(&bearer("Bearer s3crett")));
+        assert!(!auth.authorizes(&bearer("Bearer ")));
+        assert!(!auth.authorizes(&HeaderMap::new()), "no header at all");
+    }
+
+    #[test]
+    fn the_scheme_is_case_insensitive_and_the_token_is_not() {
+        // RFC 7235: the scheme name is case-insensitive, the credentials are
+        // opaque. A client library that sends `bearer` is not wrong; one that
+        // upper-cases the secret is.
+        let auth = AdminAuth::from_token("Ab").expect("a token");
+        assert!(auth.authorizes(&bearer("bearer Ab")));
+        assert!(auth.authorizes(&bearer("BEARER Ab")));
+        assert!(!auth.authorizes(&bearer("Bearer aB")));
+    }
+
+    #[test]
+    fn a_credential_that_is_not_a_bearer_is_refused() {
+        let auth = AdminAuth::from_token("s3cret").expect("a token");
+        assert!(!auth.authorizes(&bearer("s3cret")), "no scheme");
+        assert!(!auth.authorizes(&bearer("Basic s3cret")));
+        assert!(!auth.authorizes(&bearer("Bearers3cret")), "no separator");
+    }
+
+    #[test]
+    fn a_token_file_is_trimmed_but_not_otherwise_edited() {
+        let dir = std::env::temp_dir().join(format!("ramjet-admin-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let path = dir.join("token");
+
+        // What `kubectl create secret generic --from-literal` and every editor
+        // produce: a trailing newline that is not part of the secret.
+        std::fs::write(&path, b"  a token with spaces\n").expect("writes");
+        let auth = AdminAuth::from_file(&path).expect("a token");
+        assert!(auth.authorizes(&bearer("Bearer a token with spaces")));
+        assert!(
+            !auth.authorizes(&bearer("Bearer  a token with spaces")),
+            "the padding the file carried is not part of the token"
+        );
+
+        std::fs::write(&path, b"\n\t \n").expect("writes");
+        assert!(
+            matches!(AdminAuth::from_file(&path), Err(TokenError::Empty)),
+            "whitespace is not a token"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("cleans up");
+    }
+
+    #[test]
+    fn a_missing_token_file_is_named_rather_than_ignored() {
+        let error = AdminAuth::from_file(Path::new("/nonexistent/ramjet/token"))
+            .expect_err("no such file");
+        assert!(matches!(error, TokenError::Unreadable(_)), "{error:?}");
+        assert!(error.to_string().contains("admin token file"), "{error}");
+    }
+
+    #[test]
+    fn the_token_never_reaches_a_log_line() {
+        // `AdminState` derives Debug and is built next to a startup log on two
+        // paths. A derived field here would put the secret in the pod's logs.
+        let auth = AdminAuth::from_token("s3cret").expect("a token");
+        let rendered = format!("{auth:?}");
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+    }
+
+    #[test]
+    fn only_the_methods_that_can_change_something_are_gated() {
+        assert!(!mutates(&Method::GET), "a scrape must never need a token");
+        assert!(!mutates(&Method::HEAD));
+        for method in [Method::POST, Method::DELETE, Method::PUT, Method::PATCH] {
+            assert!(mutates(&method), "{method}");
+        }
+    }
+
+    #[test]
+    fn the_refusal_says_what_to_send() {
+        let response = unauthorized();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::WWW_AUTHENTICATE).map(HeaderValue::as_bytes),
+            Some(&b"Bearer"[..]),
+            "a 401 with no challenge is not one a client can act on"
+        );
+    }
 
     #[test]
     fn readiness_starts_false_and_is_shared_by_clones() {
@@ -439,6 +746,7 @@ mod tests {
             routes,
             readiness: ReadinessFlag::new(),
             history,
+            auth: None,
         })
     }
 

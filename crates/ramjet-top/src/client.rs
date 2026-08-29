@@ -21,10 +21,21 @@
 //! bounded by what a cluster holds and a client that will buffer any number of
 //! bytes handed to it is a client that can be made to exhaust memory by
 //! pointing it at the wrong port.
+//!
+//! # The bearer token, on two requests out of five
+//!
+//! A daemon started with `--admin-token-file` refuses a mutating `/admin/`
+//! request that carries no `Authorization: Bearer` header. That is `pin` and
+//! `unpin` and nothing else — the three requests a poll makes are `GET`s, which
+//! the admin listener never gates — so the header is attached by method rather
+//! than to every request. Sending it on the polls would put the secret on the
+//! wire once a second to answer a question that never asked for it.
 
+use std::path::Path;
 use std::time::Duration;
 
 use bytes::Bytes;
+use http::header::HeaderValue;
 use http::{Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -89,6 +100,9 @@ pub enum ClientError {
         #[source]
         source: serde_json::Error,
     },
+    /// The `--token-file` could not be turned into a header.
+    #[error("cannot use the token file: {0}")]
+    Token(String),
 }
 
 impl ClientError {
@@ -102,6 +116,7 @@ impl ClientError {
             }
             Self::Status { path, status } => format!("{path}: HTTP {status}"),
             Self::Body { path, .. } => format!("{path}: unreadable body"),
+            Self::Token(reason) => reason.clone(),
         }
     }
 }
@@ -147,11 +162,29 @@ impl Snapshot {
 }
 
 /// A client for one ingressd admin port.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdminClient {
     base: String,
     timeout: Duration,
     http: Client<HttpConnector, Full<Bytes>>,
+    /// Sent on mutating requests only. Pre-built so a keystroke that pins a
+    /// generation cannot fail on a header that was invalid all along.
+    bearer: Option<HeaderValue>,
+}
+
+impl std::fmt::Debug for AdminClient {
+    /// Says whether there is a token, never what it is.
+    ///
+    /// Hand-written rather than derived because `HeaderValue`'s own `Debug`
+    /// prints the value, and a client is the sort of thing that ends up in a
+    /// panic message.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminClient")
+            .field("base", &self.base)
+            .field("timeout", &self.timeout)
+            .field("bearer", &self.bearer.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AdminClient {
@@ -192,7 +225,43 @@ impl AdminClient {
             base,
             timeout,
             http,
+            bearer: None,
         })
+    }
+
+    /// Sends the token in `path` on `pin` and `unpin`.
+    ///
+    /// Read once, here, rather than per request: the file is a mounted Secret or
+    /// something a person put next to their port-forward script, and re-reading
+    /// it on a keystroke would turn a missing file into a failure at the moment
+    /// somebody is rolling a cluster back.
+    ///
+    /// # Errors
+    ///
+    /// The file could not be read, held nothing but whitespace, or held bytes no
+    /// header can carry.
+    pub fn with_token_file(mut self, path: &Path) -> Result<Self, ClientError> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|error| ClientError::Token(format!("{}: {error}", path.display())))?;
+        let token = raw.trim();
+        if token.is_empty() {
+            return Err(ClientError::Token(format!(
+                "{} is empty; there is no token in it to send",
+                path.display()
+            )));
+        }
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+            ClientError::Token(format!(
+                "{} holds bytes an HTTP header cannot carry",
+                path.display()
+            ))
+        })?;
+        // Keeps the token out of any `Debug` rendering `http` does of a request
+        // this header ends up on — which on the error paths below is a thing
+        // that reaches a terminal.
+        value.set_sensitive(true);
+        self.bearer = Some(value);
+        Ok(self)
     }
 
     /// The URL this client polls, normalized.
@@ -257,7 +326,14 @@ impl AdminClient {
             }
         })?;
 
-        let mut builder = Request::builder().method(method).uri(uri);
+        // Attached by method, mirroring the rule the admin listener enforces:
+        // everything that is not a read needs the token, and a read never does.
+        let mut builder = Request::builder().method(&method).uri(uri);
+        if method != Method::GET && method != Method::HEAD {
+            if let Some(bearer) = &self.bearer {
+                builder = builder.header(http::header::AUTHORIZATION, bearer.clone());
+            }
+        }
         if let Some(content_type) = content_type {
             builder = builder.header(http::header::CONTENT_TYPE, content_type);
         }

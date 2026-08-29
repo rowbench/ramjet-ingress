@@ -116,6 +116,12 @@ spec:
             {{- with .Values.controller.auditWebhook }}
             - --audit-webhook={{ . }}
             {{- end }}
+            {{- if .Values.controller.adminToken.secretName }}
+            # The mount path, not the value: passing the token as an argument
+            # would put it in `ps`, in the pod spec, and in every `kubectl
+            # describe pod` anybody runs.
+            - --admin-token-file=/etc/ramjet/admin-token/{{ .Values.controller.adminToken.key }}
+            {{- end }}
             {{- with .Values.controller.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -177,6 +183,30 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- if .Values.controller.adminToken.secretName }}
+          volumeMounts:
+            - name: admin-token
+              mountPath: /etc/ramjet/admin-token
+              readOnly: true
+          {{- end }}
+      {{- if .Values.controller.adminToken.secretName }}
+      volumes:
+        - name: admin-token
+          secret:
+            secretName: {{ .Values.controller.adminToken.secretName }}
+            # Not optional: a missing Secret leaves the pod Pending with a
+            # readable event, where `optional: true` would start it with no
+            # token file, fail to read it, and crash — or worse, if the flag
+            # were ever made lenient, serve unauthenticated while the values
+            # file said otherwise.
+            items:
+              - key: {{ .Values.controller.adminToken.key }}
+                path: {{ .Values.controller.adminToken.key }}
+                # Readable by the pod's user and nobody else. The container runs
+                # as 65532 with fsGroup 65532; 0400 is what keeps the token off
+                # a sidecar's `cat` if one is ever added.
+                mode: 0400
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -151,6 +151,12 @@ pub struct Args {
     pub https: Option<SocketAddr>,
     /// Admin listener, or `None` if disabled.
     pub admin: Option<SocketAddr>,
+    /// File holding the bearer token mutating `/admin/` requests must carry.
+    ///
+    /// `None` — the default — leaves those endpoints open to anything that can
+    /// reach the port, and says so at startup. Read once, at startup; see the
+    /// admin listener's docs on rotation.
+    pub admin_token_file: Option<PathBuf>,
     /// Whether `--https` or `--no-https` was given explicitly.
     ///
     /// Without it, dev mode skips the TLS listener when the configuration
@@ -218,6 +224,7 @@ impl Default for Args {
             http: Some(all(DEFAULT_HTTP_PORT)),
             https: Some(all(DEFAULT_HTTPS_PORT)),
             admin: Some(all(DEFAULT_ADMIN_PORT)),
+            admin_token_file: None,
             https_explicit: false,
             connect_timeout: Duration::from_secs(5),
             response_timeout: Duration::from_secs(60),
@@ -306,6 +313,10 @@ LISTENERS:
     --http <ADDR>             Plaintext listener        [default: 0.0.0.0:8080]
     --https <ADDR>            TLS listener              [default: 0.0.0.0:8443]
     --admin <ADDR>            Metrics and probes        [default: 0.0.0.0:10254]
+    --admin-token-file <PATH>
+                              Require `Authorization: Bearer <token>` on every
+                              mutating /admin/ request, where <token> is the
+                              contents of PATH.
     --no-http, --no-https, --no-admin
                               Disable a listener.
 
@@ -481,7 +492,7 @@ Every option has an environment twin (RAMJET_STATIC_ROUTES, RAMJET_INGRESS_CLASS
 RAMJET_WATCH_NAMESPACE, RAMJET_DEFAULT_BACKEND, RAMJET_DEFAULT_TLS_SECRET,
 RAMJET_PUBLISH_ADDRESS, RAMJET_PUBLISH_SERVICE, RAMJET_UPDATE_STATUS,
 RAMJET_HISTORY_SIZE, RAMJET_AUDIT_WEBHOOK,
-RAMJET_HTTP, RAMJET_HTTPS, RAMJET_ADMIN, RAMJET_CONNECT_TIMEOUT,
+RAMJET_HTTP, RAMJET_HTTPS, RAMJET_ADMIN, RAMJET_ADMIN_TOKEN_FILE, RAMJET_CONNECT_TIMEOUT,
 RAMJET_RESPONSE_TIMEOUT, RAMJET_MAX_CONNECT_ATTEMPTS, RAMJET_UPSTREAM_POOL_IDLE,
 RAMJET_MAX_BUF_SIZE, RAMJET_MIRROR_MAX_BODY, RAMJET_WORKER_THREADS,
 RAMJET_SHUTDOWN_GRACE,
@@ -519,10 +530,31 @@ ADMIN ENDPOINTS:
     every scrape. /metrics gains only ramjet_pinned, which is 1 while a rollback
     is holding publication.
 
-    The listener has no authentication and is not meant to be reachable from
-    outside the cluster; the chart puts it behind a ClusterIP Service. Only POST
-    and DELETE can change what is served, so nothing that follows links can roll
-    a cluster back by accident.
+    Only POST and DELETE can change what is served, so nothing that follows
+    links can roll a cluster back by accident. That is unconditional. What is
+    optional is --admin-token-file: give it a path and every mutating /admin/
+    request must carry `Authorization: Bearer <token>` or be refused with 401.
+
+    GET is never gated, deliberately. /metrics is scraped by Prometheus and
+    /healthz and /readyz are called by the kubelet, and none of the three can be
+    taught to send a header — gating them would trade a rollback an attacker has
+    to reach the port to perform for a pod that restarts every time its liveness
+    probe is refused. /admin/generations and /admin/routes stay open for the same
+    reason they are GET at all: they report what this replica serves, which is
+    not a secret from anything that can already send it traffic.
+
+    Without the flag the mutating endpoints are open to anything that can reach
+    the port, and the process says so once at startup. The listener is not meant
+    to be reachable from outside the cluster and the chart puts it behind a
+    ClusterIP Service — but \"inside the cluster\" is every pod in every
+    namespace, so on a cluster running code you did not write, set the flag. The
+    chart's `adminToken.secretName` mounts a Secret and passes it, and its
+    optional `networkPolicy.enabled` narrows who can reach the port at all.
+
+    The token is read once, at startup. Rotating it means restarting the pod,
+    which for a mounted Secret is `kubectl rollout restart` — the alternative
+    would be a read(2) on the request path bought to make a yearly event
+    convenient.
 ";
 
 impl Args {
@@ -585,6 +617,9 @@ impl Args {
                     args.https_explicit = true;
                 }
                 "--admin" => args.admin = Some(address(&name, &value()?)?),
+                "--admin-token-file" => {
+                    args.admin_token_file = Some(PathBuf::from(value()?));
+                }
                 "--no-h2-dispatch" => args.h2_dispatch = false,
                 "--no-http" => args.http = None,
                 "--no-https" => {
@@ -705,6 +740,9 @@ impl Args {
         }
         if let Some(value) = env("RAMJET_ADMIN") {
             args.admin = Some(address("RAMJET_ADMIN", &value)?);
+        }
+        if let Some(value) = env("RAMJET_ADMIN_TOKEN_FILE") {
+            args.admin_token_file = Some(PathBuf::from(value));
         }
         if let Some(value) = env("RAMJET_CONNECT_TIMEOUT") {
             args.connect_timeout = seconds("RAMJET_CONNECT_TIMEOUT", &value)?;
@@ -1160,8 +1198,59 @@ mod tests {
             "--proxy-protocol-timeout",
             "--history-size",
             "--audit-webhook",
+            "--admin-token-file",
         ] {
             assert!(USAGE.contains(option), "{option} is undocumented");
+        }
+    }
+
+    #[test]
+    fn the_admin_token_file_takes_a_flag_and_an_environment_twin() {
+        assert_eq!(
+            parse(&[]).expect("valid").admin_token_file,
+            None,
+            "unauthenticated is the default, and the process warns about it"
+        );
+        assert_eq!(
+            parse(&["--admin-token-file", "/etc/ramjet/token"])
+                .expect("valid")
+                .admin_token_file,
+            Some(PathBuf::from("/etc/ramjet/token"))
+        );
+        assert_eq!(
+            parse(&["--admin-token-file=/inline/token"])
+                .expect("valid")
+                .admin_token_file,
+            Some(PathBuf::from("/inline/token"))
+        );
+
+        let env = |name: &str| match name {
+            "RAMJET_ADMIN_TOKEN_FILE" => Some("/from/env".to_owned()),
+            _ => None,
+        };
+        let args = Args::parse(Vec::<String>::new(), env).expect("valid");
+        assert_eq!(args.admin_token_file, Some(PathBuf::from("/from/env")));
+
+        // A flag beats its twin, as every other option here does.
+        let args = Args::parse(
+            ["--admin-token-file=/from/flag".to_owned()],
+            env,
+        )
+        .expect("valid");
+        assert_eq!(args.admin_token_file, Some(PathBuf::from("/from/flag")));
+    }
+
+    #[test]
+    fn the_usage_text_states_what_the_token_does_not_cover() {
+        // The paragraph exists to stop somebody deciding the probes should be
+        // gated too and finding out from a crash loop.
+        for phrase in [
+            "GET is never gated",
+            "Authorization: Bearer",
+            "/healthz",
+            "restarting the pod",
+        ] {
+            assert!(USAGE.contains(phrase), "{phrase} is undocumented");
         }
     }
 

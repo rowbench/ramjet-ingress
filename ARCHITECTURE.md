@@ -374,11 +374,21 @@ ClusterIP Service and never through an Ingress or a LoadBalancer.
 | `POST /admin/rollback` | pin a generation. `404` if it is not in the ring, `409` if something is already pinned — and the body says what |
 | `DELETE /admin/rollback` | release the pin and publish the newest generation. Idempotent |
 
-There is no authentication and there is not going to be: anything that can reach
-this port can already reach the pod's ServiceAccount token. What *is* enforced is
-the shape — the mutating endpoint answers to `POST` and `DELETE` and nothing
-else, so a link, a browser prefetch, a scraper following URLs, or a health
-checker walking paths cannot roll a cluster back by accident.
+Three defences, different in kind. The **shape** is unconditional: the mutating
+endpoint answers to `POST` and `DELETE` and nothing else, so a link, a browser
+prefetch, a scraper following URLs, or a health checker walking paths cannot roll
+a cluster back by accident. The **network** is the ClusterIP Service, optionally
+narrowed to one namespace by the chart's `networkPolicy`. And with
+`--admin-token-file`, a **bearer token** on every mutating `/admin/` request.
+
+The token is optional and the absence of one is logged at startup. The argument
+that used to stand here — that a secret is pointless because anything reaching
+this port can already reach the pod's ServiceAccount token — does not hold: that
+token is on the pod's filesystem, not on the network, and "anything that can
+reach this port" is every pod in every namespace.
+
+`GET` is never gated, because Prometheus and the kubelet cannot send a header and
+a probe that 401s is a crash loop.
 
 ### Dev mode
 

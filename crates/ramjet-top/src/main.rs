@@ -47,7 +47,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let options = match parsed {
+    let mut options = match parsed {
         Parsed::Help => {
             print!("{}", args::help());
             return ExitCode::SUCCESS;
@@ -58,6 +58,7 @@ fn main() -> ExitCode {
         }
         Parsed::Run(options) => *options,
     };
+    args::apply_env(&mut options, |name| std::env::var(name).ok());
 
     // The runtime is built by hand rather than with `#[tokio::main]` so that a
     // failure to build it is an error message instead of a panic, and so the
@@ -76,7 +77,13 @@ fn main() -> ExitCode {
         }
     };
 
-    let client = match AdminClient::new(&options.url, options.timeout) {
+    let built = AdminClient::new(&options.url, options.timeout).and_then(|client| {
+        match &options.token_file {
+            Some(path) => client.with_token_file(path),
+            None => Ok(client),
+        }
+    });
+    let client = match built {
         Ok(client) => client,
         Err(error) => {
             eprintln!("ramjet-top: {error}");

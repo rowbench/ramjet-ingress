@@ -1,0 +1,80 @@
+{{- if .Values.networkPolicy.enabled -}}
+{{/*
+Default-deny ingress to the controller pods, with three holes.
+
+The traffic ports are open to everything, because that is what an ingress
+controller is: a policy narrowing those belongs to whatever sits in front of it,
+not here. The admin port is open to this namespace only, which is the actual
+point of the object — /admin/rollback is the one request an arbitrary pod can
+send that changes what the cluster serves, and this is the half of the answer
+that is about *where* rather than about *who*. controller.adminToken is the
+other half, and they are worth having together: a token survives somebody
+editing this policy, and a policy survives a token leaking.
+
+Ingress only. Egress is deliberately untouched — the controller talks to the
+API server, to every backend pod in the cluster, and to the audit webhook, and a
+chart that guessed at those CIDRs would take out the first cluster whose API
+server is not where it assumed.
+
+Nothing here is namespaced by *name*. A namespaceSelector matches labels, and
+`kubernetes.io/metadata.name` is the one the API server sets on every namespace
+itself — so "this namespace" needs no labelling step, and neither does the
+extraIngress example in values.yaml.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ramjet-ingress.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ramjet-ingress.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ramjet-ingress.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # The data plane, from anywhere. An empty `from` is "every source".
+    - ports:
+        - port: {{ .Values.ports.http }}
+          protocol: TCP
+        {{- if .Values.ports.https }}
+        - port: {{ .Values.ports.https }}
+          protocol: TCP
+        {{- if .Values.http3.enabled }}
+        - port: {{ .Values.ports.https }}
+          protocol: UDP
+        {{- end }}
+        {{- end }}
+    # The admin port, from this namespace only. This is the rule that breaks a
+    # Prometheus running anywhere else, which is why the whole object is off by
+    # default; add an extraIngress rule for the scraper's namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+      ports:
+        - port: {{ .Values.ports.admin }}
+          protocol: TCP
+    {{/*
+    No rule for the kubelet's probes, and that is a decision rather than an
+    omission. They come from the node, which matches no podSelector and no
+    namespaceSelector, so the only rule that would admit them is an ipBlock —
+    and an ipBlock wide enough to cover "whichever node this pod landed on"
+    covers every pod IP too, which would re-open the admin port to the whole
+    cluster and leave this object doing nothing but looking like it does
+    something.
+
+    Every CNI this chart is likely to meet allows node-to-pod traffic for
+    exactly this reason: Calico has host-endpoint failsafes, Cilium admits the
+    host by default, and the Kubernetes docs say policy may not apply to traffic
+    from the node a pod runs on. If yours does not, the probes fail and the pod
+    restarts within a minute of enabling this — which is loud, and is why it is
+    better than the silent alternative. Add the node CIDR with extraIngress
+    then, having decided what that costs.
+    */}}
+    {{- with .Values.networkPolicy.extraIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

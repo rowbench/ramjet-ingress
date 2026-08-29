@@ -318,6 +318,57 @@ async fn the_emergency_brake_sends_what_the_contract_specifies() {
     );
 }
 
+/// The token goes on the two requests that change something, and nowhere else.
+///
+/// The failure worth catching is not a missing header — that is a 401 the
+/// operator sees immediately — but a token sent on every poll, which puts the
+/// secret on the wire once a second to answer a question that never asked for
+/// it and would never be noticed.
+#[tokio::test]
+async fn the_bearer_token_rides_on_pin_and_unpin_and_on_nothing_else() {
+    let dir = std::env::temp_dir().join(format!("ramjet-top-token-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a temp directory");
+    let path = dir.join("token");
+    std::fs::write(&path, "s3cret\n").expect("writes");
+
+    let mock = MockAdmin::start().await;
+    let client = AdminClient::new(&mock.url(), Duration::from_secs(5))
+        .expect("a usable URL")
+        .with_token_file(&path)
+        .expect("a usable token");
+
+    client.snapshot().await.expect("a snapshot");
+    client.pin(41).await.expect("a pin");
+    client.unpin().await.expect("a release");
+
+    let mut seen = mock.authorization();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("/admin/generations".to_owned(), None),
+            ("/admin/rollback".to_owned(), Some("Bearer s3cret".to_owned())),
+            ("/admin/rollback".to_owned(), Some("Bearer s3cret".to_owned())),
+            ("/admin/routes".to_owned(), None),
+            ("/metrics".to_owned(), None),
+        ],
+        "the trailing newline is not part of the token, and a GET carries none"
+    );
+
+    std::fs::remove_dir_all(&dir).expect("cleans up");
+}
+
+#[tokio::test]
+async fn an_unusable_token_file_is_refused_before_anything_is_polled() {
+    let mock = MockAdmin::start().await;
+    let error = AdminClient::new(&mock.url(), Duration::from_secs(5))
+        .expect("a usable URL")
+        .with_token_file(std::path::Path::new("/nonexistent/ramjet/token"))
+        .expect_err("no such file");
+    assert!(error.brief().contains("/nonexistent/ramjet/token"), "{error}");
+    assert!(!error.brief().contains('\n'), "one line only");
+}
+
 #[tokio::test]
 async fn sorting_and_filtering_apply_to_rows_that_came_off_the_wire() {
     let mock = MockAdmin::start().await;

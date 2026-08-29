@@ -11,10 +11,18 @@
 //! left over in a shell profile pointing at the wrong cluster is a worse
 //! failure than typing the URL again.
 //!
+//! `--token-file` is the one exception, and the exception proves the rule rather
+//! than breaking it. A stale `RAMJET_TOP_URL` reads the wrong cluster and looks
+//! like it worked; a stale `RAMJET_TOP_TOKEN_FILE` produces a 401 on the one
+//! keystroke that uses it, which is a failure that announces itself. What it
+//! buys is that the token path lives next to the `kubectl port-forward` in
+//! whatever script set the port up, rather than being retyped per invocation.
+//!
 //! The URL may be given positionally, because `ramjet-top 10.0.0.5:10254` is
 //! what a person's hands do.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::client::DEFAULT_ADMIN_URL;
@@ -92,6 +100,12 @@ pub struct Options {
     pub json: bool,
     /// Disable pin and unpin.
     pub read_only: bool,
+    /// File holding the bearer token `pin` and `unpin` must send.
+    ///
+    /// Only those two: everything this program polls is a `GET`, which the admin
+    /// listener never gates. A token configured here and not needed costs one
+    /// header on a keystroke nobody presses.
+    pub token_file: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -103,6 +117,7 @@ impl Default for Options {
             once: false,
             json: false,
             read_only: false,
+            token_file: None,
         }
     }
 }
@@ -127,10 +142,16 @@ OPTIONS:
         --json               with --once, print the merged snapshot as JSON
                              (implies --once)
         --read-only          disable pin and unpin
+        --token-file <PATH>  bearer token for pin and unpin, when the daemon was
+                             started with --admin-token-file
+                             [env: RAMJET_TOP_TOKEN_FILE]
     -h, --help               print this
     -V, --version            print the version
 
     TIME accepts `500ms`, `2s`, `1m`, or a bare number meaning seconds.
+
+    Reading needs no token: everything this program polls is a GET, and the
+    admin listener never gates those.
 
 KEYS (interactive):
     q, Ctrl-C   quit                    Tab         routes / generations
@@ -179,6 +200,22 @@ fn parse_duration(option: &str, value: &str) -> Result<Duration, ArgError> {
     Ok(Duration::from_millis(millis as u64))
 }
 
+/// Fills in from the environment anything the command line left unset.
+///
+/// Kept out of [`parse`] so that the parser stays a pure function of its
+/// arguments: a test that had to own the process environment to check an option
+/// would be a test that cannot run alongside another one.
+pub fn apply_env<E>(options: &mut Options, env: E)
+where
+    E: Fn(&str) -> Option<String>,
+{
+    if options.token_file.is_none() {
+        if let Some(path) = env("RAMJET_TOP_TOKEN_FILE").filter(|p| !p.trim().is_empty()) {
+            options.token_file = Some(PathBuf::from(path));
+        }
+    }
+}
+
 /// Parses an argument list that does *not* include the program name.
 pub fn parse<I>(args: I) -> Result<Parsed, ArgError>
 where
@@ -225,6 +262,7 @@ where
                 options.once = true;
             }
             "--read-only" => options.read_only = true,
+            "--token-file" => options.token_file = Some(PathBuf::from(value("--token-file")?)),
             other if other.starts_with('-') && other != "-" => {
                 return Err(ArgError::Unknown(other.to_string()))
             }
@@ -283,6 +321,42 @@ mod tests {
         assert!(!options.once);
         assert!(!options.json);
         assert!(!options.read_only);
+    }
+
+    #[test]
+    fn the_token_file_comes_from_a_flag_or_the_environment() {
+        assert_eq!(options(&[]).token_file, None);
+        assert_eq!(
+            options(&["--token-file", "/etc/ramjet/token"]).token_file,
+            Some(PathBuf::from("/etc/ramjet/token"))
+        );
+
+        let env = |name: &str| match name {
+            "RAMJET_TOP_TOKEN_FILE" => Some("/from/env".to_owned()),
+            _ => None,
+        };
+        let mut from_env = options(&[]);
+        apply_env(&mut from_env, env);
+        assert_eq!(from_env.token_file, Some(PathBuf::from("/from/env")));
+
+        // The flag wins, and an empty variable is not a path.
+        let mut from_flag = options(&["--token-file", "/from/flag"]);
+        apply_env(&mut from_flag, env);
+        assert_eq!(from_flag.token_file, Some(PathBuf::from("/from/flag")));
+
+        let mut blank = options(&[]);
+        apply_env(&mut blank, |_| Some("   ".to_owned()));
+        assert_eq!(blank.token_file, None, "a blank variable is not a path");
+    }
+
+    #[test]
+    fn the_help_text_says_reading_needs_no_token() {
+        // The question somebody has after the daemon grew --admin-token-file is
+        // whether this program still works without one. It does, for everything
+        // but the two keys that change what is served.
+        let help = help();
+        assert!(help.contains("--token-file"), "{help}");
+        assert!(help.contains("Reading needs no token"), "{help}");
     }
 
     #[test]

@@ -49,6 +49,10 @@ ramjet-top --interval 5s
 # Somebody else's cluster: watch, but do not touch.
 ramjet-top --read-only
 
+# Against a daemon started with --admin-token-file. Only `p` and `u` send it;
+# everything polled is a GET, which the admin listener never gates.
+ramjet-top --token-file /path/to/token      # or RAMJET_TOP_TOKEN_FILE
+
 # One shot, for a script, a CI log, or an incident channel.
 ramjet-top --once
 ramjet-top --json | jq '.routes.routes[] | select(.errors_5xx_total > 0)'
@@ -82,7 +86,8 @@ if the command line was wrong.
 `p` and `u` are the emergency brake — they drive `POST`/`DELETE
 /admin/rollback`, which freezes the data plane on one generation until it is
 released. Both need a `y` to confirm, anything else cancels, and `--read-only`
-refuses them outright and stops advertising them.
+refuses them outright and stops advertising them. Against a daemon started with
+`--admin-token-file` they also need `--token-file`, and answer `401` without it.
 
 ## What the numbers mean
 

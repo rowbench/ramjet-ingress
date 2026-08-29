@@ -24,10 +24,26 @@ curl -XDELETE :10254/admin/rollback
 | Response | Meaning |
 |---|---|
 | `200` | Pinned |
+| `401` | The listener was started with `--admin-token-file` and this request carried no usable token |
 | `404` | That generation is not in the history |
 | `409` | Something is already pinned — and the body says what |
 
 `DELETE` is idempotent.
+
+Where the daemon was started with `--admin-token-file` — the chart's
+`controller.adminToken.secretName` — both verbs need the token, and the `GET`
+above does not:
+
+```sh
+TOKEN=$(kubectl -n ramjet-ingress get secret ramjet-admin \
+  -o jsonpath='{.data.token}' | base64 -d)
+curl -XPOST -H "Authorization: Bearer $TOKEN" \
+  :10254/admin/rollback -d '{"generation": 41}'
+```
+
+This is the request worth authenticating: it is the one thing an arbitrary pod
+in the cluster could otherwise send to change what every replica serves. See
+[the admin listener](index.md#the-admin-listener).
 
 **It works when the API server is the thing that is wrong.** Every alternative
 route to the same outcome — re-applying the previous Ingress objects,
@@ -37,7 +53,9 @@ for this lever to route around.
 
 `ramjet-top` drives both verbs from the generation timeline: `p` to pin the
 selected generation, `u` to release. Both ask for a `y` first, and
-`--read-only` refuses them outright.
+`--read-only` refuses them outright. Against a daemon with a token, give it
+`--token-file <PATH>` (or `RAMJET_TOP_TOKEN_FILE`); everything it polls is a
+`GET` and needs none.
 
 ## A rollback is a pin, not a rewind
 

@@ -56,6 +56,7 @@ worse way to say it.
 | `--http <ADDR>` | `RAMJET_HTTP` | `0.0.0.0:8080` | Plaintext listener |
 | `--https <ADDR>` | `RAMJET_HTTPS` | `0.0.0.0:8443` | TLS listener |
 | `--admin <ADDR>` | `RAMJET_ADMIN` | `0.0.0.0:10254` | Metrics and probes |
+| `--admin-token-file <PATH>` | `RAMJET_ADMIN_TOKEN_FILE` | — | Require `Authorization: Bearer <token>` on mutating `/admin/` requests, where `<token>` is the contents of `PATH` |
 | `--no-http` | — | — | Disable the plaintext listener |
 | `--no-https` | — | — | Disable the TLS listener |
 | `--no-admin` | — | — | Disable the admin listener |
@@ -63,6 +64,26 @@ worse way to say it.
 An address may be `host:port`, `:port`, or a bare port — `--http :8080` and
 `--http 8080` both bind every interface. IPv6 takes the bracketed form,
 `[::1]:8443`.
+
+`--admin-token-file` covers `POST` and `DELETE` on `/admin/` and nothing else. A
+request without the header, or with the wrong token, is a `401` carrying
+`WWW-Authenticate: Bearer`. Trailing whitespace in the file is trimmed, so a
+Secret written by `echo` works; a file holding only whitespace is refused at
+startup rather than accepted as an empty token.
+
+`GET` is never gated — Prometheus and the kubelet cannot send a header, and a
+`/healthz` that 401s is a crash loop. Without the flag, the mutating endpoints
+accept anything that can reach the port and the daemon says so once at startup:
+
+```text
+WARN the mutating /admin/ endpoints accept any caller that can reach the admin
+     port; set --admin-token-file to require a bearer token
+```
+
+The token is read once, at startup. Rotating it means restarting the process; on
+the chart, replace the Secret and `kubectl rollout restart`. See
+[the admin listener](../operations/index.md#the-admin-listener) for the whole
+trust model, and `controller.adminToken` and `networkPolicy` in the chart.
 
 The three `--no-*` flags have no environment twins; setting the corresponding
 `RAMJET_*` variable to an address is how you move a listener from the

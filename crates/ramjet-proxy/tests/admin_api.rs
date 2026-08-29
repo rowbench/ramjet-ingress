@@ -67,15 +67,21 @@ async fn admin_json(addr: SocketAddr, path: &str) -> (StatusCode, Value) {
 }
 
 async fn rollback(addr: SocketAddr, generation: u64) -> (StatusCode, Value) {
+    rollback_as(addr, generation, None).await
+}
+
+/// `POST /admin/rollback`, optionally with an `Authorization` header.
+async fn rollback_as(
+    addr: SocketAddr,
+    generation: u64,
+    authorization: Option<&str>,
+) -> (StatusCode, Value) {
     let body = format!("{{\"generation\":{generation}}}");
-    let reply = send(
-        addr,
-        request("admin", "/admin/rollback")
-            .method(Method::POST)
-            .body(full(body))
-            .expect("a request"),
-    )
-    .await;
+    let mut builder = request("admin", "/admin/rollback").method(Method::POST);
+    if let Some(value) = authorization {
+        builder = builder.header(http::header::AUTHORIZATION, value);
+    }
+    let reply = send(addr, builder.body(full(body)).expect("a request")).await;
     let value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
     (reply.status, value)
 }
@@ -325,6 +331,106 @@ async fn the_mutating_endpoint_answers_only_post_and_delete() {
     .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert_eq!(proxy.history.pinned(), None);
+
+    proxy.shutdown().await.expect("drains");
+}
+
+/// Everything the bearer token covers, on a listener that has one.
+///
+/// One test rather than five, because the property is a single line — mutating
+/// `/admin/` needs the token, nothing else does — and splitting it across five
+/// proxies would be five accept loops to assert one rule.
+#[tokio::test]
+async fn a_token_gates_the_mutating_endpoints_and_only_those() {
+    let upstream = spawn_echo("api").await;
+    let proxy = proxy_with(ProxyOptions {
+        admin_token: Some("s3cret"),
+        ..ProxyOptions::default()
+    })
+    .await;
+    record(&proxy, table(1, upstream), 0);
+    record(&proxy, table(2, upstream), 0);
+
+    // No header at all.
+    let (status, _) = rollback_as(proxy.admin, 1, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(proxy.history.pinned(), None, "the refusal must not pin");
+
+    // The wrong token, and a right token under the wrong scheme.
+    for offered in ["Bearer wrong", "Basic s3cret", "s3cret"] {
+        let (status, _) = rollback_as(proxy.admin, 1, Some(offered)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{offered}");
+        assert_eq!(proxy.history.pinned(), None, "{offered}");
+    }
+
+    // The right token.
+    let (status, body) = rollback_as(proxy.admin, 1, Some("Bearer s3cret")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pinned"], 1);
+    assert_eq!(proxy.history.pinned(), Some(1));
+
+    // DELETE is gated too, and refusing it leaves the pin standing — which is
+    // the failure that would matter: an attacker who cannot pin but can unpin
+    // has still taken the emergency brake away from whoever pulled it.
+    let reply = send(
+        proxy.admin,
+        request("admin", "/admin/rollback")
+            .method(Method::DELETE)
+            .body(empty_body())
+            .expect("a request"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        reply.headers.get(http::header::WWW_AUTHENTICATE).map(|v| v.as_bytes()),
+        Some(&b"Bearer"[..]),
+        "a 401 has to say what to send"
+    );
+    assert_eq!(proxy.history.pinned(), Some(1));
+
+    let reply = send(
+        proxy.admin,
+        request("admin", "/admin/rollback")
+            .method(Method::DELETE)
+            .header(http::header::AUTHORIZATION, "Bearer s3cret")
+            .body(empty_body())
+            .expect("a request"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(proxy.history.pinned(), None);
+
+    // Nothing a kubelet or Prometheus sends may need a token, and neither may
+    // the read-only half of the admin API.
+    for path in ["/healthz", "/readyz", "/metrics", "/admin/generations", "/admin/routes"] {
+        let reply = get(proxy.admin, "admin", path).await;
+        assert_ne!(
+            reply.status,
+            StatusCode::UNAUTHORIZED,
+            "{path} must answer without a token; the kubelet cannot send one"
+        );
+    }
+
+    proxy.shutdown().await.expect("drains");
+}
+
+/// With no token configured, the endpoints behave exactly as they always did.
+#[tokio::test]
+async fn without_a_token_the_mutating_endpoints_are_unchanged() {
+    let upstream = spawn_echo("api").await;
+    let proxy = proxy().await;
+    record(&proxy, table(1, upstream), 0);
+    record(&proxy, table(2, upstream), 0);
+
+    let (status, _) = rollback_as(proxy.admin, 1, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(proxy.history.pinned(), Some(1));
+
+    // And a header nobody asked for is ignored rather than rejected.
+    let (status, _) = resume(proxy.admin).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = rollback_as(proxy.admin, 1, Some("Bearer whatever")).await;
+    assert_eq!(status, StatusCode::OK);
 
     proxy.shutdown().await.expect("drains");
 }

@@ -22,8 +22,8 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use ramjet_proxy::{
-    CertStore, GenerationHistory, ListenerConfig, Metrics, ProxyConfig, ReadinessFlag, Server,
-    Shutdown, ShutdownHandle, UpstreamConfig,
+    AdminAuth, CertStore, GenerationHistory, ListenerConfig, Metrics, ProxyConfig, ReadinessFlag,
+    Server, Shutdown, ShutdownHandle, UpstreamConfig,
 };
 use ramjet_router::{
     Endpoint, LbPolicy, PathType, RouteTable, RouteTableBuilder, SharedRouteTable,
@@ -282,6 +282,8 @@ pub struct ProxyOptions {
     pub mirror_max_body: usize,
     /// Also serve HTTP/3 on an ephemeral UDP port.
     pub http3: bool,
+    /// Require this bearer token on mutating `/admin/` requests.
+    pub admin_token: Option<&'static str>,
 }
 
 impl Default for ProxyOptions {
@@ -296,6 +298,7 @@ impl Default for ProxyOptions {
             history_size: ramjet_proxy::DEFAULT_HISTORY_SIZE,
             mirror_max_body: ramjet_proxy::DEFAULT_MIRROR_MAX_BODY,
             http3: false,
+            admin_token: None,
         }
     }
 }
@@ -335,6 +338,9 @@ impl TestProxy {
             // Port 0: the kernel picks, and `http3_addr` reports what it
             // picked, exactly as it does for the TCP listeners.
             http3: options.http3.then(loopback),
+            admin_auth: options
+                .admin_token
+                .map(|token| AdminAuth::from_token(token).expect("a usable token")),
             ..ProxyConfig::default()
         };
 

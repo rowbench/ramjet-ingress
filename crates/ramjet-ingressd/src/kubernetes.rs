@@ -179,7 +179,7 @@ pub async fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // first list yet, and refusing to bind 443 because of that would mean a
     // restart could never recover a cluster's HTTPS. `/readyz` is what keeps
     // traffic away in the meantime.
-    let config = crate::proxy_config(args, args.https);
+    let config = crate::proxy_config(args, args.https, crate::admin_auth(args)?);
     let server = Server::bind_with(
         config,
         Arc::clone(&routes),
@@ -469,6 +469,7 @@ pub async fn run_uring(args: &Args) -> Result<ExitCode, Box<dyn std::error::Erro
                 routes: Arc::clone(&routes),
                 readiness,
                 history: Arc::clone(&history),
+                auth: crate::admin_auth(args)?,
             });
             Some(tokio::spawn(ramjet_proxy::serve_admin_only(
                 listener,
