@@ -235,6 +235,52 @@ metadata:
 See [Canary auto-promotion](../operations/canary.md) for the state machine and
 the interlocks.
 
+## Written by the controller
+
+Two keys go the other way — this controller writes them onto your Ingresses, and
+reads neither back.
+
+| Annotation | On | Value | Means |
+|---|---|---|---|
+| `ramjet.dev/observed-generation` | every managed Ingress | integer | The compiled generation that last included this Ingress |
+| `ramjet.dev/auto-promote-status` | a canary that opted in | `promoted`, or `rolled-back: <reason>` | What [automatic promotion](../operations/canary.md) last did |
+
+`observed-generation` answers the question an operator has straight after an
+edit: *did it land?*
+
+```console
+$ kubectl get ingress -o custom-columns=\
+NAME:.metadata.name,GEN:'.metadata.annotations.ramjet\.dev/observed-generation'
+NAME        GEN
+web         57
+shop        57
+api         57
+```
+
+An Ingress stuck a generation behind its neighbours is one the controller
+compiled and then stopped including — nearly always because it was rejected, in
+which case the Events above say why.
+
+It is **not** the generation being served. That is what
+[`/admin/routes`](../operations/observability.md) reports, per replica, and the
+two differ exactly while a
+[rollback pin](../operations/rollback.md#a-rollback-is-a-pin-not-a-rewind) is
+held: the annotation follows what the controller compiled, and the pin lives in
+one data plane's memory where no control plane can see it. Two numbers that
+agree mean a replica is serving what the cluster describes.
+
+The write is a server-side apply under the `ramjet-ingress` field manager, sent
+only when the value on the object differs from the one being written — a steady
+cluster rebuilds on every watch event and sends nothing. The key is read by no
+parser here, so the controller's own write cannot change a compiled digest and
+cannot cause the republish that would write it again.
+
+`--no-status-update` switches this off along with the address writeback; it is
+the flag for "do not write to my Ingresses". A stale value is left behind on an
+Ingress that moves to another controller, deliberately: removing it would take
+an apply under the same field manager that owns `canary-weight`, and that clear
+would silently zero somebody's canary.
+
 ## A refused value says so on the object
 
 Every annotation above falls back rather than failing the Ingress — a

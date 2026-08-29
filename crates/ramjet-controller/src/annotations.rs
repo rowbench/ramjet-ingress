@@ -70,6 +70,21 @@ pub const ANNOTATION_AUTO_PROMOTE_MIN_REQUESTS: &str = "ramjet.dev/auto-promote-
 /// Written *by* the controller: what automatic promotion last did.
 pub const ANNOTATION_AUTO_PROMOTE_STATUS: &str = "ramjet.dev/auto-promote-status";
 
+/// Written *by* the controller: the compiled generation that last included this
+/// Ingress.
+///
+/// Read by nobody, and that is a rule rather than an accident. This key is
+/// written back onto an object the controller is watching, so anything here
+/// that fed a compiled table would be a feedback loop: our own write would wake
+/// the rebuild loop, produce a different digest, publish a new generation, and
+/// write the annotation again. The parsers in this module take named keys and
+/// never the whole map, so the loop cannot close by accident — but a future
+/// parser that walks `metadata.annotations` looking for a prefix has to skip
+/// this one, and
+/// [`the_observed_generation_annotation_cannot_feed_a_rebuild`](crate::translate)
+/// is the test that will notice if it does not.
+pub const ANNOTATION_OBSERVED_GENERATION: &str = "ramjet.dev/observed-generation";
+
 /// Mirror everything, unless told otherwise.
 ///
 /// The opposite default would make an operator who added `mirror-backend` and

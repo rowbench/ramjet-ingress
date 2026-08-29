@@ -14,7 +14,7 @@ use crate::annotations::{
     ANNOTATION_AUTO_PROMOTE_STATUS, ANNOTATION_AUTO_PROMOTE_STEPS, ANNOTATION_BACKEND_PROTOCOL,
     ANNOTATION_CANARY,
     ANNOTATION_CANARY_WEIGHT, ANNOTATION_MIRROR_HOST, ANNOTATION_MIRROR_PERCENT,
-    DEFAULT_PROMOTE_INTERVAL, DEFAULT_PROMOTE_STEPS,
+    ANNOTATION_OBSERVED_GENERATION, DEFAULT_PROMOTE_INTERVAL, DEFAULT_PROMOTE_STEPS,
 };
 use crate::config::CONTROLLER_NAME;
 
@@ -1695,6 +1695,53 @@ fn a_canary_with_no_uid_is_still_a_target_and_simply_gets_no_events() {
     let target = &compiled.config.promotions[0];
     assert_eq!(target.ingress.to_string(), "prod/web-canary");
     assert_eq!(target.uid, None);
+}
+
+/// The guard on the one annotation this controller writes back onto an object
+/// it is watching.
+///
+/// Every write bumps the Ingress's `resourceVersion`, which wakes the rebuild
+/// loop. If the value it wrote reached the compiled digest, that rebuild would
+/// publish a new generation, which would write a new value, which would wake the
+/// loop — a controller that reconciles itself forever and republishes a
+/// cluster's routing table on a timer nobody set.
+///
+/// The parsers in `annotations` take named keys and never the whole map, so the
+/// loop cannot close today. This is the test that will fail if that ever stops
+/// being true.
+#[test]
+fn the_observed_generation_annotation_cannot_feed_a_rebuild() {
+    let clean = compile(&canary_cluster(&[(ANNOTATION_CANARY_WEIGHT, "10")]));
+
+    for value in ["1", "42", "not-a-number"] {
+        let mut snapshot = canary_cluster(&[(ANNOTATION_CANARY_WEIGHT, "10")]);
+        for ingress in &mut snapshot.ingresses {
+            let mut annotated = (**ingress).clone();
+            annotated
+                .metadata
+                .annotations
+                .get_or_insert_default()
+                .insert(
+                    ANNOTATION_OBSERVED_GENERATION.to_owned(),
+                    value.to_owned(),
+                );
+            *ingress = std::sync::Arc::new(annotated);
+        }
+
+        let compiled = compile(&snapshot);
+        assert_eq!(
+            compiled.digest, clean.digest,
+            "`{ANNOTATION_OBSERVED_GENERATION}: {value}` changed the digest, so \
+             this controller's own write is now a reason to republish"
+        );
+        assert_eq!(
+            compiled.warnings.len(),
+            clean.warnings.len(),
+            "and it must not produce a warning either, or the Warning Events \
+             would re-fire on every generation"
+        );
+        assert_eq!(compiled.managed, clean.managed);
+    }
 }
 
 #[test]

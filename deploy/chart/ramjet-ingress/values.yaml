@@ -58,7 +58,15 @@ controller:
   # does not narrow the RBAC below — see rbac.create.
   watchNamespace: ""
 
-  # Write .status.loadBalancer on managed Ingresses.
+  # Write back to managed Ingresses: `.status.loadBalancer`, which is the
+  # ADDRESS column and what cert-manager and external-dns read, and
+  # `ramjet.dev/observed-generation`, which names the compiled generation that
+  # last included each one.
+  #
+  # Both are sent only when the value on the object differs from the one being
+  # written, so a steady cluster costs no API calls however often the rebuild
+  # loop runs. Turn it off for a DaemonSet, where every node's replica writes
+  # them on its own schedule — see the note above `kind`.
   updateStatus: true
 
   # Where that status points. `publishService` names a Service whose own

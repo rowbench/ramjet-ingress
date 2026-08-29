@@ -330,3 +330,23 @@ The split is by what the Event is about: a compiled generation belongs to no
 single Ingress, and a promotion decision or a refused value belongs to exactly
 one. Per-object Events are written only when what they say changes, so a steady
 broken state costs one Event rather than one per rebuild.
+
+## Which generation reached which Ingress
+
+Every managed Ingress carries
+[`ramjet.dev/observed-generation`](../configuration/annotations.md#written-by-the-controller),
+the compiled generation that last included it:
+
+```sh
+kubectl get ingress -A -o custom-columns=\
+NS:.metadata.namespace,NAME:.metadata.name,GEN:'.metadata.annotations.ramjet\.dev/observed-generation'
+```
+
+That is what the **controller compiled**. `/admin/routes`'s top-level
+`generation` is what a **replica is serving**. They agree in the steady state and
+diverge in exactly one place — while a
+[rollback pin](rollback.md#a-rollback-is-a-pin-not-a-rewind) is held, the
+controller keeps compiling and annotating while the data plane stays where it was
+put. So the pair is a useful diagnostic on its own: annotation ahead of
+`/admin/routes` means something is holding publication back, and the same
+annotation lagging its neighbours means one Ingress stopped being included.

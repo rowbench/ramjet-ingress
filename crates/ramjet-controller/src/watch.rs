@@ -17,6 +17,7 @@
 //! check each of those would bump the generation and hand the data plane a
 //! table identical to the one it already has.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -35,12 +36,13 @@ use tokio::sync::{mpsc, watch as watch_channel};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
+use crate::annotations::ANNOTATION_OBSERVED_GENERATION;
 use crate::config::{CompiledConfig, ControllerOpts};
 use crate::diagnostics::WarningEvents;
 use crate::snapshot::ClusterSnapshot;
 use crate::status::StatusWriter;
 use crate::tls::TLS_SECRET_TYPE;
-use crate::translate::{translate, WarningKind};
+use crate::translate::{translate, ObjectKey, WarningKind};
 
 /// Starts the controller.
 ///
@@ -392,8 +394,37 @@ async fn rebuild(
     }
 
     if let Some(status) = status {
-        status.sync(&translation.managed).await;
+        // The generation this controller has compiled, which is what the
+        // annotation reports. Not what a replica is *serving* — a rollback pin
+        // holds that back, and the pin lives in one data plane's memory where no
+        // control plane can see it. `/admin/routes` answers the other question.
+        let generation = current
+            .as_ref()
+            .map_or(0, |config| config.table.generation());
+        status
+            .sync(&translation.managed, generation, &observed_generations(&snapshot))
+            .await;
     }
+}
+
+/// What each Ingress currently claims in `ramjet.dev/observed-generation`.
+///
+/// Built from the reflector store, so it costs a pass over the mirror rather
+/// than a `GET` per object. Ingresses that carry no such annotation, or one that
+/// is not a number, are simply absent — which reads as "needs writing", the safe
+/// answer either way.
+fn observed_generations(snapshot: &ClusterSnapshot) -> HashMap<ObjectKey, u64> {
+    snapshot
+        .ingresses
+        .iter()
+        .filter_map(|ingress| {
+            ingress
+                .annotations()
+                .get(ANNOTATION_OBSERVED_GENERATION)
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(|generation| (ObjectKey::of(ingress.as_ref()), generation))
+        })
+        .collect()
 }
 
 #[cfg(test)]

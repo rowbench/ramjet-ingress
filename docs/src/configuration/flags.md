@@ -38,7 +38,7 @@ race.
 | `--default-tls-secret <REF>` | `RAMJET_DEFAULT_TLS_SECRET` | — | Secret (`namespace/name`) serving a handshake whose SNI matches nothing |
 | `--publish-address <ADDR>` | `RAMJET_PUBLISH_ADDRESS` | — | Written into managed Ingresses' status |
 | `--publish-service <REF>` | `RAMJET_PUBLISH_SERVICE` | — | Service (`namespace/name`) whose own status supplies that address. **Beats `--publish-address`** |
-| `--no-status-update` | `RAMJET_UPDATE_STATUS` (boolean, default `true`) | status writeback on | Never write Ingress status |
+| `--no-status-update` | `RAMJET_UPDATE_STATUS` (boolean, default `true`) | writeback on | Never write to managed Ingresses: neither `.status.loadBalancer` nor [`ramjet.dev/observed-generation`](annotations.md#written-by-the-controller) |
 
 The Kubernetes client is configured the way every Kubernetes tool configures
 one: the in-cluster ServiceAccount if there is one, otherwise the current
