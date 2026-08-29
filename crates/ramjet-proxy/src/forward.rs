@@ -135,6 +135,26 @@ const BODY_TIMEOUT: &[u8] = b"504 Gateway Timeout: the upstream sent no response
 const BODY_GRPC: &[u8] = b"502 Bad Gateway: gRPC requires an HTTP/2 backend; \
 set nginx.ingress.kubernetes.io/backend-protocol: GRPC on the Ingress\n";
 
+/// Names the capability a 502 was refused for, in one token.
+///
+/// The body already says it in a sentence, which is the right thing for the
+/// person who ran `curl` and the wrong thing for everything else: a body is not
+/// in an access log, not in a client library's error, and not something a script
+/// should be matching on with a substring. The vocabulary is closed — this and
+/// `h2c-upstream`, which only the uring engine can produce — so a check for it
+/// is a check for equality.
+///
+/// Only on the refusals an operator can act on by changing an annotation or a
+/// flag. A 502 from an upstream that hung up is not a capability gap and gets no
+/// header, because a header on every gateway error would say nothing.
+pub const UNSUPPORTED_HEADER: &str = "x-ramjet-unsupported";
+
+/// A gRPC request reached a backend nobody annotated `backend-protocol: GRPC`.
+///
+/// The same token the uring engine sends for the same refusal: a client must not
+/// be able to tell which engine answered it.
+pub const UNSUPPORTED_GRPC: &str = "grpc-needs-backend-protocol";
+
 /// Which listener a request arrived on, which is what `X-Forwarded-Proto` says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
@@ -294,7 +314,8 @@ async fn dispatch(
     // Only for an HTTP/1.1 backend. An h2c backend is exactly what gRPC needs,
     // and refusing there would be refusing the feature.
     if protocol == BackendProtocol::Http1 && is_grpc(request.headers()) {
-        return static_response(StatusCode::BAD_GATEWAY, BODY_GRPC);
+        state.metrics.record_unsupported_grpc();
+        return unsupported_response(StatusCode::BAD_GATEWAY, BODY_GRPC, UNSUPPORTED_GRPC);
     }
 
     let endpoints = backend.endpoints();
@@ -744,6 +765,24 @@ pub fn static_response(status: StatusCode, body: &'static [u8]) -> Response<Prox
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
+    response
+}
+
+/// The same, additionally naming the capability that was missing.
+///
+/// See [`UNSUPPORTED_HEADER`].
+pub fn unsupported_response(
+    status: StatusCode,
+    body: &'static [u8],
+    feature: &'static str,
+) -> Response<ProxyBody> {
+    let mut response = static_response(status, body);
+    if let (Ok(name), Ok(value)) = (
+        header::HeaderName::from_bytes(UNSUPPORTED_HEADER.as_bytes()),
+        HeaderValue::from_str(feature),
+    ) {
+        response.headers_mut().insert(name, value);
+    }
     response
 }
 

@@ -337,6 +337,47 @@ async fn grpc_at_an_http1_backend_is_refused_and_the_body_names_the_annotation()
         None,
         "the request must not have reached the HTTP/1.1 backend at all"
     );
+    assert_eq!(
+        reply.header("x-ramjet-unsupported"),
+        Some("grpc-needs-backend-protocol"),
+        "the sentence in the body is for a person; a client library and an \
+         access log need a token, and it must be the one the uring engine \
+         sends for the same refusal"
+    );
+    let scrape = get(proxy.admin, "admin", "/metrics").await;
+    assert!(
+        scrape
+            .text()
+            .contains("ramjet_engine_unsupported_grpc_total 1"),
+        "and it has to be countable without reading bodies: {}",
+        scrape.text()
+    );
+
+    proxy.shutdown().await.expect("clean shutdown");
+}
+
+/// A 502 that is not a capability gap carries no such header.
+///
+/// Without this the token would appear on every gateway error and mean nothing.
+#[tokio::test]
+async fn an_ordinary_bad_gateway_names_no_missing_capability() {
+    // An endpoint nothing is listening on: a real 502, and not one an operator
+    // fixes with an annotation or an engine flag.
+    let dead = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+    let proxy = TestProxy::start(table_with(BackendProtocol::Http1, &[dead])).await;
+
+    let reply = get(proxy.http, "app.example.com", "/api").await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(reply.header("x-ramjet-unsupported"), None);
+
+    let scrape = get(proxy.admin, "admin", "/metrics").await;
+    assert!(
+        scrape
+            .text()
+            .contains("ramjet_engine_unsupported_grpc_total 0"),
+        "{}",
+        scrape.text()
+    );
 
     proxy.shutdown().await.expect("clean shutdown");
 }

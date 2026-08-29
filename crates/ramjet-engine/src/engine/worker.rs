@@ -1506,7 +1506,14 @@ impl Worker {
         // misconfiguration to fix on the Ingress, it is this engine's gap.
         if backend.protocol() == BackendProtocol::H2c {
             *self.slot(fd) = Slot::Client(conn);
-            self.fail(fd, 502, limits::NO_H2C_UPSTREAM, false);
+            self.metrics.core(self.core).unsupported_h2c();
+            self.fail_unsupported(
+                fd,
+                502,
+                limits::NO_H2C_UPSTREAM,
+                false,
+                Some(limits::UNSUPPORTED_H2C_UPSTREAM),
+            );
             return Ok(());
         }
 
@@ -1514,7 +1521,14 @@ impl Worker {
         // unrouted gRPC request is a 404 rather than a 502.
         if headers::is_grpc(&conn.head, &conn.inbox) {
             *self.slot(fd) = Slot::Client(conn);
-            self.fail(fd, 502, limits::GRPC, false);
+            self.metrics.core(self.core).unsupported_grpc();
+            self.fail_unsupported(
+                fd,
+                502,
+                limits::GRPC,
+                false,
+                Some(limits::UNSUPPORTED_GRPC),
+            );
             return Ok(());
         }
 
@@ -2100,6 +2114,22 @@ impl Worker {
 
     /// Queue a response this proxy invented, and optionally end the connection.
     fn fail(&mut self, fd: RawFd, status: u16, body: &[u8], close: bool) {
+        self.fail_unsupported(fd, status, body, close, None);
+    }
+
+    /// The same, additionally naming a capability this engine does not have.
+    ///
+    /// A wrapper rather than a fifth parameter on `fail`, because fifteen call
+    /// sites would each have grown a `None` that says nothing, and the two that
+    /// pass something would have stopped standing out.
+    fn fail_unsupported(
+        &mut self,
+        fd: RawFd,
+        status: u16,
+        body: &[u8],
+        close: bool,
+        unsupported: Option<&'static str>,
+    ) {
         let Slot::Client(mut conn) = std::mem::replace(self.slot(fd), Slot::Taken) else {
             *self.slot(fd) = Slot::Empty;
             return;
@@ -2133,9 +2163,15 @@ impl Worker {
         self.record_response(&mut conn, status);
         let mut out = std::mem::take(&mut conn.outbox);
         if conn.method_was_head {
-            limits::write_static_head_only(&mut out, status, body.len(), close);
+            limits::write_static_head_only_unsupported(
+                &mut out,
+                status,
+                body.len(),
+                close,
+                unsupported,
+            );
         } else {
-            limits::write_static(&mut out, status, body, close);
+            limits::write_static_unsupported(&mut out, status, body, close, unsupported);
         }
         conn.outbox = out;
 

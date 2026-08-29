@@ -65,15 +65,32 @@ ramjet_mirror_failures_total
 ramjet_h3_connections_total
 ramjet_h3_requests_total
 ramjet_h3_handshake_failures_total
+ramjet_engine_unsupported_h2c_total
+ramjet_engine_unsupported_grpc_total
 ```
 
-Two of them deserve naming:
+Four of them deserve naming:
 
 - **`ramjet_route_table_generation`** is how you tell whether a replica is
   actually serving the configuration you think it is.
 - **`ramjet_pinned`** is `1` while a rollback is holding publication — so a
   replica frozen on purpose is distinguishable from one whose control plane has
   died.
+- **`ramjet_engine_unsupported_h2c_total`** counts requests refused because
+  their backend is annotated `backend-protocol: GRPC` and the serving engine
+  dials HTTP/1.1 only. It can only move on `--engine uring`; the hyper engine
+  emits it at zero, so a dashboard does not lose a line when somebody switches.
+  Anything above zero means those routes are down on this replica and the fix is
+  `--engine hyper`.
+- **`ramjet_engine_unsupported_grpc_total`** counts gRPC requests refused
+  because the backend is *not* annotated. Both engines can move it, and the fix
+  is on the Ingress rather than on the daemon.
+
+Both refusals also carry an `x-ramjet-unsupported` response header —
+`h2c-upstream` and `grpc-needs-backend-protocol` respectively — so an access log
+or a client library can tell them from an ordinary 502 without reading the body.
+The vocabulary is closed and no other response carries the header, which is what
+makes a check for it a check for equality.
 
 An HTTP/3 request is counted in `ramjet_requests_total` like any other, because
 it is one; the `h3` series are in addition.

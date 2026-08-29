@@ -88,7 +88,55 @@ fn drive(engine: &EngineMetrics, hyper: &Arc<Metrics>) -> Vec<ConnectionGuard> {
     engine.core(0).tls_handshake_failure();
     hyper.record_tls_handshake_failure();
 
+    // A misconfiguration both engines refuse the same way, so both count it and
+    // the two renderings still have to agree.
+    for _ in 0..3 {
+        engine.core(1).unsupported_grpc();
+        hyper.record_unsupported_grpc();
+    }
+    // `ramjet_engine_unsupported_h2c_total` is deliberately *not* driven here.
+    // Only the uring engine can produce it — the hyper engine dials h2c
+    // upstreams perfectly well — so there is no pair of calls that would leave
+    // the two renderings equal. What this test still pins about it is that both
+    // engines emit the series at all, at zero, which is the property that keeps
+    // a dashboard from losing a line when an operator changes engine. The
+    // uring-only path is covered by `limits.rs` and by
+    // `an_h2c_refusal_is_counted` below.
+
     held
+}
+
+/// The series only one engine can move, and the shape both have to emit.
+#[test]
+fn the_h2c_series_exists_on_both_engines_and_moves_on_one() {
+    let engine = EngineMetrics::new(2);
+    let hyper = Arc::new(Metrics::new());
+
+    for text in [
+        engine.render_prometheus(1, false),
+        hyper.render_prometheus(1, false),
+    ] {
+        assert!(
+            text.contains("ramjet_engine_unsupported_h2c_total 0"),
+            "both engines emit the series, or a dashboard loses a line when an \
+             operator changes engine:\n{text}"
+        );
+    }
+
+    engine.core(0).unsupported_h2c();
+    engine.core(1).unsupported_h2c();
+    assert!(
+        engine
+            .render_prometheus(1, false)
+            .contains("ramjet_engine_unsupported_h2c_total 2"),
+        "the counter has to be summed across cores like every other one"
+    );
+    assert!(
+        hyper
+            .render_prometheus(1, false)
+            .contains("ramjet_engine_unsupported_h2c_total 0"),
+        "the hyper engine dials h2c upstreams, so it has nothing to count here"
+    );
 }
 
 #[test]

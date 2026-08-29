@@ -52,6 +52,33 @@ pub const UPGRADE_FAILED: &[u8] =
 pub const NO_HTTP2: &[u8] =
     b"502 Bad Gateway: the uring engine speaks HTTP/1.1 only; use --engine hyper\n";
 
+/// Names the capability a 502 was refused for, in one token.
+///
+/// The body already says it in a sentence, and a sentence is the right thing for
+/// the person who ran `curl`. It is the wrong thing for everything else: a body
+/// is not on the response until it has been read, it is not in an access log, it
+/// is not in a client library's error, and it is not something a script should
+/// be matching on with a substring. This header is, and it is
+/// [`UNSUPPORTED_H2C_UPSTREAM`] or [`UNSUPPORTED_GRPC`] and nothing else — a
+/// closed vocabulary, so a check for it is a check for equality.
+///
+/// Deliberately only on the refusals an operator can *act* on by changing a
+/// flag or an annotation. A 502 from an upstream that hung up is not a
+/// capability gap and gets no header, because a header that appeared on every
+/// gateway error would say nothing.
+pub const UNSUPPORTED_HEADER: &str = "x-ramjet-unsupported";
+
+/// The backend needs an HTTP/2 upstream and this engine dials HTTP/1.1.
+///
+/// The fix is `--engine hyper`. Only the uring lane can produce it.
+pub const UNSUPPORTED_H2C_UPSTREAM: &str = "h2c-upstream";
+
+/// A gRPC request reached a backend nobody annotated `backend-protocol: GRPC`.
+///
+/// The fix is that annotation, on the Ingress. Both engines produce it, and both
+/// say the same thing — a client must not be able to tell which one answered.
+pub const UNSUPPORTED_GRPC: &str = "grpc-needs-backend-protocol";
+
 /// The client's request could not be read.
 ///
 /// The status varies with the fault — 400, 413, 431 or 501 — so the body is
@@ -64,24 +91,49 @@ pub fn bad_request_body(status: u16, detail: &str) -> Vec<u8> {
     body.into_bytes()
 }
 
+/// The header block one of this module's responses carries.
+///
+/// Returned as a fixed-capacity array plus a length rather than a `Vec`,
+/// because these are written on the connection's own path and a heap allocation
+/// per refusal would be one this engine does not otherwise make.
+fn static_headers(close: bool, unsupported: Option<&str>) -> ([(&str, &str); 3], usize) {
+    let mut headers = [("Content-Type", "text/plain; charset=utf-8"); 3];
+    let mut len = 1;
+    if close {
+        headers[len] = ("Connection", "close");
+        len += 1;
+    }
+    if let Some(feature) = unsupported {
+        headers[len] = (UNSUPPORTED_HEADER, feature);
+        len += 1;
+    }
+    (headers, len)
+}
+
 /// Write a complete, self-framed response with a plain-text body.
 ///
 /// `ramjet_http::encode` owns the framing — a caller cannot supply its own
 /// `Content-Length` — which is exactly the property wanted for the responses
 /// the proxy invents, as opposed to the ones it relays.
 pub fn write_static(out: &mut Vec<u8>, status: u16, body: &[u8], close: bool) {
-    let headers: &[(&str, &str)] = if close {
-        &[
-            ("Content-Type", "text/plain; charset=utf-8"),
-            ("Connection", "close"),
-        ]
-    } else {
-        &[("Content-Type", "text/plain; charset=utf-8")]
-    };
+    write_static_unsupported(out, status, body, close, None);
+}
+
+/// The same, additionally naming a capability this engine does not have.
+///
+/// See [`UNSUPPORTED_HEADER`] for why the sentence in the body is not enough.
+pub fn write_static_unsupported(
+    out: &mut Vec<u8>,
+    status: u16,
+    body: &[u8],
+    close: bool,
+    unsupported: Option<&str>,
+) {
+    let (headers, len) = static_headers(close, unsupported);
     // The only way this fails is an out-of-range status or an invalid header,
     // and every call site passes literals that are neither. Writing nothing at
     // all would leave the client hanging, so a failure degrades to a bare 500.
-    if encode::response(out, status, headers, body).is_err() {
+    if encode::response(out, status, &headers[..len], body).is_err() {
         out.extend_from_slice(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
     }
 }
@@ -89,15 +141,24 @@ pub fn write_static(out: &mut Vec<u8>, status: u16, body: &[u8], close: bool) {
 /// Write a response to a `HEAD` request: the head a `GET` would have had,
 /// without the body bytes.
 pub fn write_static_head_only(out: &mut Vec<u8>, status: u16, body_len: usize, close: bool) {
-    let headers: &[(&str, &str)] = if close {
-        &[
-            ("Content-Type", "text/plain; charset=utf-8"),
-            ("Connection", "close"),
-        ]
-    } else {
-        &[("Content-Type", "text/plain; charset=utf-8")]
-    };
-    if encode::response_head_only(out, status, headers, body_len).is_err() {
+    write_static_head_only_unsupported(out, status, body_len, close, None);
+}
+
+/// The same, additionally naming a capability this engine does not have.
+///
+/// A `HEAD` gets the header for the same reason it gets the `Content-Length`:
+/// the head of a `HEAD` response is the head the `GET` would have had, and a
+/// diagnostic that vanished for one method would be one somebody's probe never
+/// sees.
+pub fn write_static_head_only_unsupported(
+    out: &mut Vec<u8>,
+    status: u16,
+    body_len: usize,
+    close: bool,
+    unsupported: Option<&str>,
+) {
+    let (headers, len) = static_headers(close, unsupported);
+    if encode::response_head_only(out, status, &headers[..len], body_len).is_err() {
         out.extend_from_slice(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
     }
 }

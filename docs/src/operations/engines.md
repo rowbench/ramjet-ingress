@@ -133,6 +133,21 @@ annotated, and deliberately so: that one says *add the annotation*, this one say
 *the annotation is right and this engine cannot honour it*. Two problems, two
 fixes, two sentences.
 
+Two tokens, too. A body is for the person who ran `curl`; it is not in an access
+log and not in a client library's error, so each refusal also carries a header
+and moves a counter:
+
+| | Header | Counter | Fix |
+|---|---|---|---|
+| Annotated backend, uring engine | `x-ramjet-unsupported: h2c-upstream` | `ramjet_engine_unsupported_h2c_total` | `--engine hyper` |
+| Unannotated backend, either engine | `x-ramjet-unsupported: grpc-needs-backend-protocol` | `ramjet_engine_unsupported_grpc_total` | the annotation |
+
+No other response carries `x-ramjet-unsupported`, and an ordinary 502 — an
+upstream that hung up, a connect that failed — carries none, so a check for it
+is a check for equality rather than a guess. Both counters exist on both engines
+and the h2c one is permanently zero on hyper, so a dashboard does not lose a line
+when an operator changes engine.
+
 The refusal is route-level rather than request-level. Any request to that
 backend gets it, not only the ones with a gRPC content type — because the
 backend was declared to speak HTTP/2, and sending it HTTP/1.1 anyway is the

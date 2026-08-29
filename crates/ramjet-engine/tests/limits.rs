@@ -215,9 +215,65 @@ fn an_h2c_backend_is_refused_rather_than_dialled_as_http_1() {
         response.text()
     );
     assert_eq!(
+        response.header("x-ramjet-unsupported"),
+        Some("h2c-upstream"),
+        "a sentence in the body is for a person; a log pipeline and a client \
+         library need a token: {:?}",
+        response.headers
+    );
+    assert_eq!(
         upstream.seen.requests(),
         0,
         "nothing may reach an h2c backend from this engine"
+    );
+}
+
+/// The two refusals are told apart by the header as well as by the prose.
+///
+/// The distinction is the whole reason there are two bodies: one is fixed by
+/// `--engine hyper` and the other by an annotation on the Ingress. Anything
+/// reading these mechanically has to be able to tell them apart without parsing
+/// English.
+#[test]
+fn the_two_capability_refusals_name_themselves_differently() {
+    let upstream = echo();
+
+    let annotated = Proxy::start(h2c_table_for("app.example.com", &[upstream.addr]));
+    let engine_gap = get(annotated.addr, "/", "app.example.com");
+    assert_eq!(
+        engine_gap.header("x-ramjet-unsupported"),
+        Some("h2c-upstream")
+    );
+
+    let plain = Proxy::start(table_for("app.example.com", &[upstream.addr]));
+    let mut client = Client::connect(plain.addr);
+    let misconfigured = client.send(
+        b"POST /svc/Method HTTP/1.1\r\nHost: app.example.com\r\n\
+          Content-Type: application/grpc\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_eq!(
+        misconfigured.header("x-ramjet-unsupported"),
+        Some("grpc-needs-backend-protocol")
+    );
+}
+
+/// A 502 that is *not* a capability gap carries no header.
+///
+/// Without this the token would appear on every gateway error and mean nothing.
+#[test]
+fn an_ordinary_bad_gateway_names_no_missing_capability() {
+    // A backend with an endpoint nothing is listening on: a real 502, and not
+    // one an operator fixes by changing an engine or an annotation.
+    let dead = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+    let proxy = Proxy::start(table_for("app.example.com", &[dead]));
+
+    let response = get(proxy.addr, "/", "app.example.com");
+    assert_eq!(response.status, 502);
+    assert_eq!(
+        response.header("x-ramjet-unsupported"),
+        None,
+        "{:?}",
+        response.headers
     );
 }
 

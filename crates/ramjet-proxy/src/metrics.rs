@@ -164,6 +164,10 @@ pub struct Totals {
     pub mirror_skipped: u64,
     /// Copies a mirror backend refused or did not answer.
     pub mirror_failures: u64,
+    /// Requests refused because the backend needs an HTTP/2 upstream.
+    pub unsupported_h2c: u64,
+    /// gRPC requests refused because the backend was not annotated for HTTP/2.
+    pub unsupported_grpc: u64,
 }
 
 /// Every series the data plane exports.
@@ -198,6 +202,12 @@ pub struct Metrics {
     h3_connections: AtomicU64,
     h3_requests: AtomicU64,
     h3_handshake_failures: AtomicU64,
+    /// Structurally zero on this engine, and kept as a field for the reason
+    /// `dispatch_uring` is: this engine dials h2c upstreams perfectly well, so
+    /// it has nothing to count here, but the series has to exist or a dashboard
+    /// loses a line when an operator changes engine.
+    unsupported_h2c: AtomicU64,
+    unsupported_grpc: AtomicU64,
 }
 
 impl Metrics {
@@ -231,6 +241,8 @@ impl Metrics {
             mirror_dropped: self.mirror_dropped.load(Ordering::Relaxed),
             mirror_skipped: self.mirror_skipped.load(Ordering::Relaxed),
             mirror_failures: self.mirror_failures.load(Ordering::Relaxed),
+            unsupported_h2c: self.unsupported_h2c.load(Ordering::Relaxed),
+            unsupported_grpc: self.unsupported_grpc.load(Ordering::Relaxed),
             ..Totals::default()
         };
         for (slot, counter) in totals.requests.iter_mut().zip(&self.requests) {
@@ -366,6 +378,18 @@ impl Metrics {
     #[inline]
     pub fn record_mirror_failure(&self) {
         self.mirror_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a gRPC request refused because its backend is not annotated for
+    /// HTTP/2.
+    ///
+    /// A misconfiguration rather than an engine gap — both engines answer the
+    /// same way — and the counter exists because the alternative diagnosis is
+    /// somebody noticing 502s and going looking for the cause. The fix is
+    /// `backend-protocol: GRPC` on the Ingress.
+    #[inline]
+    pub fn record_unsupported_grpc(&self) {
+        self.unsupported_grpc.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Copies the mirror backend accepted.
@@ -557,6 +581,16 @@ impl Metrics {
                 "ramjet_mirror_failures_total",
                 "Copies a mirror backend refused, failed, or did not answer in time.",
                 &self.mirror_failures,
+            ),
+            (
+                "ramjet_engine_unsupported_h2c_total",
+                "Requests refused because the backend needs an HTTP/2 upstream this engine does not dial.",
+                &self.unsupported_h2c,
+            ),
+            (
+                "ramjet_engine_unsupported_grpc_total",
+                "gRPC requests refused because the backend is not annotated backend-protocol: GRPC.",
+                &self.unsupported_grpc,
             ),
         ] {
             let _ = writeln!(out, "# HELP {name} {help}");

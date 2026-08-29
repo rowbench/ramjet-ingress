@@ -58,6 +58,8 @@ pub struct CoreMetrics {
     tls_handshake_failures: AtomicU64,
     dispatched_here: AtomicU64,
     dispatched_away: AtomicU64,
+    unsupported_h2c: AtomicU64,
+    unsupported_grpc: AtomicU64,
 }
 
 impl CoreMetrics {
@@ -140,6 +142,24 @@ impl CoreMetrics {
     /// A connection handed to the other engine.
     pub fn dispatched_away(&self) {
         self.dispatched_away.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A request refused because its backend needs an HTTP/2 upstream.
+    ///
+    /// This engine dials HTTP/1.1 and nothing else, so a backend annotated
+    /// `backend-protocol: GRPC` is a 502 here and works on `--engine hyper`.
+    /// The counter is what makes that visible from a dashboard rather than from
+    /// somebody noticing 502s and going looking.
+    pub fn unsupported_h2c(&self) {
+        self.unsupported_h2c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A gRPC request refused because its backend is not annotated for HTTP/2.
+    ///
+    /// A misconfiguration rather than an engine gap: both engines answer the
+    /// same way, and the fix is `backend-protocol: GRPC` on the Ingress.
+    pub fn unsupported_grpc(&self) {
+        self.unsupported_grpc.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -366,6 +386,16 @@ impl EngineMetrics {
                 "ramjet_mirror_failures_total",
                 "Copies a mirror backend refused, failed, or did not answer in time.",
                 peer.mirror_failures,
+            ),
+            (
+                "ramjet_engine_unsupported_h2c_total",
+                "Requests refused because the backend needs an HTTP/2 upstream this engine does not dial.",
+                self.sum(|c| &c.unsupported_h2c) + peer.unsupported_h2c,
+            ),
+            (
+                "ramjet_engine_unsupported_grpc_total",
+                "gRPC requests refused because the backend is not annotated backend-protocol: GRPC.",
+                self.sum(|c| &c.unsupported_grpc) + peer.unsupported_grpc,
             ),
         ] {
             let _ = writeln!(out, "# HELP {name} {help}");

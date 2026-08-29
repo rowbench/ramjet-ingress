@@ -55,6 +55,11 @@ nginx.ingress.kubernetes.io/backend-protocol: GRPC on the Ingress
 Add it and the request is forwarded like any other. This is a refusal to guess,
 not a missing feature.
 
+The response also carries `x-ramjet-unsupported: grpc-needs-backend-protocol`
+and increments `ramjet_engine_unsupported_grpc_total`, so this shows up on a
+dashboard rather than as an unexplained rise in 502s. Both engines answer
+identically.
+
 ## WebSocket does not cross an h2c backend
 
 `Connection` and `Upgrade` are forbidden in HTTP/2, so an upgrade request sent to
@@ -116,6 +121,12 @@ annotated `backend-protocol: GRPC` answers `502` there, naming the engine, and
 gRPC to it is refused with it. The h2 dispatch above does not help: it moves the
 *downstream* connection, and the backend protocol is a property of the route.
 A cluster serving gRPC wants `--engine hyper`.
+
+That refusal is diagnosable without reading bodies: the 502 carries
+`x-ramjet-unsupported: h2c-upstream` and moves
+`ramjet_engine_unsupported_h2c_total`, which is the series to alert on if you run
+`--engine uring` at all — anything above zero means those routes are down on that
+replica.
 
 [Engines](./operations/engines.md) has the full parity matrix, and the
 differential test that keeps it honest.
