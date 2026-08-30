@@ -32,10 +32,10 @@ metadata:
   name: ramjet-ramjet-ingress
   namespace: ramjet-ingress
   labels:
-    helm.sh/chart: ramjet-ingress-0.1.0
+    helm.sh/chart: ramjet-ingress-0.1.1
     app.kubernetes.io/name: ramjet-ingress
     app.kubernetes.io/instance: ramjet
-    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/version: "0.1.1"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/component: controller
 automountServiceAccountToken: true
@@ -46,10 +46,10 @@ kind: ClusterRole
 metadata:
   name: ramjet-ramjet-ingress
   labels:
-    helm.sh/chart: ramjet-ingress-0.1.0
+    helm.sh/chart: ramjet-ingress-0.1.1
     app.kubernetes.io/name: ramjet-ingress
     app.kubernetes.io/instance: ramjet
-    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/version: "0.1.1"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/component: controller
 rules:
@@ -125,10 +125,10 @@ kind: ClusterRoleBinding
 metadata:
   name: ramjet-ramjet-ingress
   labels:
-    helm.sh/chart: ramjet-ingress-0.1.0
+    helm.sh/chart: ramjet-ingress-0.1.1
     app.kubernetes.io/name: ramjet-ingress
     app.kubernetes.io/instance: ramjet
-    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/version: "0.1.1"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/component: controller
 roleRef:
@@ -147,10 +147,10 @@ metadata:
   name: ramjet-ramjet-ingress-admin
   namespace: ramjet-ingress
   labels:
-    helm.sh/chart: ramjet-ingress-0.1.0
+    helm.sh/chart: ramjet-ingress-0.1.1
     app.kubernetes.io/name: ramjet-ingress
     app.kubernetes.io/instance: ramjet
-    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/version: "0.1.1"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/component: controller
   annotations:
@@ -179,10 +179,10 @@ metadata:
   name: ramjet-ramjet-ingress
   namespace: ramjet-ingress
   labels:
-    helm.sh/chart: ramjet-ingress-0.1.0
+    helm.sh/chart: ramjet-ingress-0.1.1
     app.kubernetes.io/name: ramjet-ingress
     app.kubernetes.io/instance: ramjet
-    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/version: "0.1.1"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/component: controller
   annotations:
@@ -215,10 +215,10 @@ metadata:
   name: ramjet-ramjet-ingress
   namespace: ramjet-ingress
   labels:
-    helm.sh/chart: ramjet-ingress-0.1.0
+    helm.sh/chart: ramjet-ingress-0.1.1
     app.kubernetes.io/name: ramjet-ingress
     app.kubernetes.io/instance: ramjet
-    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/version: "0.1.1"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/component: controller
 spec:
@@ -260,7 +260,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: controller
-          image: "sofelia/ramjet-ingress:0.1.0"
+          image: "sofelia/ramjet-ingress:0.1.1"
           imagePullPolicy: IfNotPresent
           args:
             - --http=:8080
@@ -342,10 +342,10 @@ kind: IngressClass
 metadata:
   name: ramjet
   labels:
-    helm.sh/chart: ramjet-ingress-0.1.0
+    helm.sh/chart: ramjet-ingress-0.1.1
     app.kubernetes.io/name: ramjet-ingress
     app.kubernetes.io/instance: ramjet
-    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/version: "0.1.1"
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/component: controller
 spec:
