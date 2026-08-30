@@ -69,12 +69,12 @@
 //! # GitOps
 //!
 //! This loop writes to `canary-weight`, which in a GitOps cluster is a field
-//! something else believes it owns. The patches are server-side applies under
-//! the `ramjet-ingress` field manager, so ownership is explicit and a
-//! reconciler that also claims the field will fight this loop and win on its
-//! own schedule. That is a real interaction and there is no clever way around
-//! it: either exclude `canary-weight` from the reconciler's managed fields, or
-//! do not opt that Ingress in.
+//! something else believes it owns. The patches name the `ramjet-ingress` field
+//! manager, so ownership is recorded and visible, and a reconciler that also
+//! claims the field will fight this loop and win on its own schedule. That is a
+//! real interaction and there is no clever way around it: either exclude
+//! `canary-weight` from the reconciler's managed fields, or do not opt that
+//! Ingress in.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -252,7 +252,7 @@ pub trait IngressPatcher {
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 }
 
-/// Patches through the Kubernetes API, as a server-side apply.
+/// Patches through the Kubernetes API.
 #[derive(Clone)]
 pub struct KubePatcher {
     client: kube::Client,
@@ -268,8 +268,8 @@ impl KubePatcher {
 impl IngressPatcher for KubePatcher {
     /// One line, deliberately. Every API object this binary would otherwise
     /// have to name stays behind `ramjet-controller`; see
-    /// [`patch_ingress_annotations`] for the server-side-apply semantics and
-    /// why the apply is forced.
+    /// [`patch_ingress_annotations`] for the patch semantics, and for why it is
+    /// a merge rather than an apply.
     async fn patch(
         &self,
         ingress: &ObjectKey,

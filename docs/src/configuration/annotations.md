@@ -269,17 +269,20 @@ held: the annotation follows what the controller compiled, and the pin lives in
 one data plane's memory where no control plane can see it. Two numbers that
 agree mean a replica is serving what the cluster describes.
 
-The write is a server-side apply under the `ramjet-ingress` field manager, sent
-only when the value on the object differs from the one being written — a steady
+The write is a merge patch under the `ramjet-ingress` field manager, sent only
+when the value on the object differs from the one being written — a steady
 cluster rebuilds on every watch event and sends nothing. The key is read by no
 parser here, so the controller's own write cannot change a compiled digest and
-cannot cause the republish that would write it again.
+cannot cause the republish that would write it again. A merge patch rather than
+an apply because the same field manager also writes `canary-weight`, and an
+apply states everything a manager owns: each write would delete the other's key.
 
 `--no-status-update` switches this off along with the address writeback; it is
 the flag for "do not write to my Ingresses". A stale value is left behind on an
-Ingress that moves to another controller, deliberately: removing it would take
-an apply under the same field manager that owns `canary-weight`, and that clear
-would silently zero somebody's canary.
+Ingress that moves to another controller, deliberately: clearing it would cost a
+write to an object we have just decided is not ours, at the moment somebody else
+is taking it over, to remove a diagnostic that stops claiming anything anyway.
+The address — the part everything downstream routes on — *is* cleared.
 
 ## A refused value says so on the object
 

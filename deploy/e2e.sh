@@ -41,6 +41,14 @@ HOST="${HOST:-demo.ramjet.test}"
 GRPC_HOST="${GRPC_HOST:-grpc.ramjet.test}"
 KEEP="${KEEP:-0}"
 
+# The replica's `RUST_LOG`. Worth a knob rather than a hard-coded string: the
+# decisions this suite asserts on are logged at `info`, but the *reasons* a
+# decision did not happen are at `debug` — a promotion that holds says which
+# side of the window came up short, and at the default level a run that fails
+# assertion 10 tells you nothing about why. `LOG_LEVEL=info,kube=warn,\
+# ramjet_ingressd::promotion=debug KEEP=1 deploy/e2e.sh` is the way in.
+LOG_LEVEL="${LOG_LEVEL:-info,kube=warn}"
+
 # Chosen high and fixed so a stale forward from a previous run is visible as a
 # bind failure rather than as mysteriously wrong assertions.
 HTTP_PORT="${HTTP_PORT:-18080}"
@@ -64,9 +72,15 @@ step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 note() { printf '     %s\n' "$1"; }
 
 PF_PIDS=()
+# A background traffic generator, live only while assertion 10 is polling.
+TRAFFIC_PID=""
 
 cleanup() {
   local status=$?
+  if [[ -n "$TRAFFIC_PID" ]]; then
+    kill "$TRAFFIC_PID" 2>/dev/null || true
+    wait "$TRAFFIC_PID" 2>/dev/null || true
+  fi
   for pid in "${PF_PIDS[@]:-}"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" 2>/dev/null || true
@@ -196,7 +210,7 @@ H upgrade --install "$RELEASE" "$CHART" \
   --set image.repository="${IMAGE%:*}" \
   --set image.tag="${IMAGE##*:}" \
   --set image.pullPolicy="$PULL_POLICY" \
-  --set controller.logLevel="info,kube=warn" \
+  --set controller.logLevel="$LOG_LEVEL" \
   --set engine="$ENGINE" \
   --set-string controller.publishAddress="127.0.0.1" \
   --wait --timeout 3m
@@ -735,32 +749,90 @@ K -n "$APP_NS" annotate ingress demo-canary --overwrite \
   ramjet.dev/auto-promote-min-requests=5 \
   ramjet.dev/auto-promote-steps=30,60,100 >/dev/null
 
-PROMOTED=""
-START_WEIGHT="$(K -n "$APP_NS" get ingress demo-canary \
-  -o jsonpath='{.metadata.annotations.nginx\.ingress\.kubernetes\.io/canary-weight}')"
-# Two windows' worth of chances. Each pass needs traffic on both sides within
-# one interval, so traffic is driven *inside* the loop rather than up front.
-for _ in $(seq 1 12); do
-  for _ in $(seq 1 30); do
+# Prints the weight, or nothing at all if the annotation is gone — and *fails*
+# if the object could not be read, which the caller treats as "ask again" rather
+# than as an answer. An empty string means the annotation was deleted, and that
+# is a finding; conflating it with a kubectl that had a bad second would trade
+# one misreported failure for another.
+canary_weight() {
+  K -n "$APP_NS" get ingress demo-canary \
+    -o jsonpath='{.metadata.annotations.nginx\.ingress\.kubernetes\.io/canary-weight}' 2>/dev/null
+}
+promote_status() {
+  K -n "$APP_NS" get ingress demo-canary \
+    -o jsonpath='{.metadata.annotations.ramjet\.dev/auto-promote-status}' 2>/dev/null || true
+}
+
+# Traffic runs *continuously* for as long as the poll does, rather than in a
+# burst between polls. A pass judges one `auto-promote-interval` of deltas and
+# needs `min-requests` on the canary side *and* the stable side within that one
+# window; a burst fired between polls can straddle a window boundary and split
+# the canary's share below the floor, which the controller correctly reads as
+# "too little traffic to judge". That is a hold, it looks exactly like a broken
+# promotion loop from out here, and it would make this assertion a coin flip.
+# A steady stream makes every window evidential.
+canary_traffic() {
+  while :; do
     curl -s -o /dev/null -m 5 -H "Host: $HOST" "http://127.0.0.1:$HTTP_PORT/" || true
   done
-  W="$(K -n "$APP_NS" get ingress demo-canary \
-    -o jsonpath='{.metadata.annotations.nginx\.ingress\.kubernetes\.io/canary-weight}')"
-  if [[ -n "$W" ]] && [[ "$W" != "$START_WEIGHT" ]]; then
-    PROMOTED="$W"
+}
+
+PROMOTED=""
+STATUS_ANN=""
+# `|| true` so a transient does not abort the whole suite under `set -e`; an
+# empty result is a verdict below rather than something to route around.
+START_WEIGHT="$(canary_weight || true)"
+WEIGHT_NOW="$START_WEIGHT"
+WEIGHT_READ=0
+
+canary_traffic &
+TRAFFIC_PID=$!
+
+DEADLINE=$((SECONDS + 60))
+while (( SECONDS < DEADLINE )); do
+  sleep 2
+  # A read that did not happen is not evidence. Only a successful get updates
+  # what this loop believes, so a momentary API hiccup costs one poll instead of
+  # being reported as a deleted annotation.
+  if ! WEIGHT_NOW="$(canary_weight)"; then
+    continue
+  fi
+  WEIGHT_READ=1
+  STATUS_ANN="$(promote_status)"
+  # An *absent* weight is not "not yet". The annotation was there a moment ago,
+  # so something removed it, and that is a failure to report rather than a state
+  # to keep waiting through. The previous form tested `-n "$W"` and treated a
+  # deleted weight as "no change so far", which is precisely how a controller
+  # that was deleting the weight it had just written survived two release phases
+  # looking like a flaky test.
+  if [[ -z "$WEIGHT_NOW" ]]; then
     break
   fi
-  sleep 3
+  if [[ "$WEIGHT_NOW" != "$START_WEIGHT" ]]; then
+    PROMOTED="$WEIGHT_NOW"
+    break
+  fi
+  if [[ "$STATUS_ANN" == promoted ]]; then
+    break
+  fi
 done
 
-STATUS_ANN="$(K -n "$APP_NS" get ingress demo-canary \
-  -o jsonpath='{.metadata.annotations.ramjet\.dev/auto-promote-status}' 2>/dev/null || true)"
-if [[ -n "$PROMOTED" ]] && (( PROMOTED > START_WEIGHT )); then
+kill "$TRAFFIC_PID" 2>/dev/null || true
+wait "$TRAFFIC_PID" 2>/dev/null || true
+TRAFFIC_PID=""
+
+if [[ -z "$START_WEIGHT" ]]; then
+  fail "auto-promotion: demo-canary carried no canary-weight to start from"
+elif [[ -n "$PROMOTED" ]] && (( PROMOTED > START_WEIGHT )); then
   pass "auto-promotion: canary-weight advanced ${START_WEIGHT} -> ${PROMOTED} on healthy traffic"
 elif [[ "$STATUS_ANN" == promoted ]]; then
   pass "auto-promotion: canary reached its last step (status: promoted)"
+elif (( WEIGHT_READ == 0 )); then
+  fail "auto-promotion: could not read demo-canary's annotations at any point in 60s"
+elif [[ -z "$WEIGHT_NOW" ]]; then
+  fail "auto-promotion: the canary-weight annotation was deleted — it read ${START_WEIGHT} before the loop was armed, and the canary is now inert; status '${STATUS_ANN:-<none>}'"
 else
-  fail "auto-promotion: weight stayed at ${START_WEIGHT}, status '${STATUS_ANN:-<none>}'"
+  fail "auto-promotion: weight stayed at ${WEIGHT_NOW}, status '${STATUS_ANN:-<none>}'"
 fi
 
 # 11. The audit trail for that decision. A promotion that happened but that

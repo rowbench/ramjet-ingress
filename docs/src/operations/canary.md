@@ -180,9 +180,20 @@ Spec-level, because an annotation is metadata and `ingresses/status` cannot
 carry it. The chart's ClusterRole has it. **Without the rule, promotion logs a
 permission error every interval and changes nothing.**
 
-The patches are server-side applies under the `ramjet-ingress` field manager,
-**forced** — because `canary-weight` is normally owned by whoever created the
-Ingress, and taking ownership is precisely what opting in means.
+The patches are JSON merge patches sent under the `ramjet-ingress` field
+manager, so `managedFields` still answers "who set this weight" and taking the
+field from whoever created the Ingress — a person, a Helm release, a GitOps
+reconciler — needs no override, because a merge patch is never refused as a
+conflict.
+
+> Deliberately **not** a server-side apply. An apply states everything the field
+> manager owns, so the API server deletes whatever that manager's entry claims
+> and the body omits — and this controller writes two disjoint annotation sets
+> under one manager. As applies, promotion's `canary-weight` write erased
+> `ramjet.dev/observed-generation`, and the status writer's next write erased
+> `canary-weight`, leaving a canary with no weight seconds after the controller
+> announced it had stepped it up. Nothing here ever needs to remove an
+> annotation, which is the only thing an apply buys.
 
 > In a GitOps cluster, a reconciler that also claims `canary-weight` will fight
 > this loop and win on its own schedule. Either exclude `canary-weight` from its

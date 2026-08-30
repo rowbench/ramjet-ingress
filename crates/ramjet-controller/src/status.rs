@@ -15,10 +15,14 @@
 //! answers are a log line naming a generation number and no object, or
 //! `/admin/routes`, which needs the admin port.
 //!
-//! Writes go through server-side apply under the field manager
-//! [`FIELD_MANAGER`], so we own exactly these fields: another controller's
-//! entries are not clobbered, and clearing ours is a real removal rather than
-//! an overwrite with an empty list from someone else's perspective.
+//! The status write is a server-side apply under the field manager
+//! [`FIELD_MANAGER`], so we own exactly `.status.loadBalancer.ingress`: another
+//! controller's entries are not clobbered, and clearing ours is a real removal
+//! rather than an overwrite with an empty list from someone else's perspective.
+//!
+//! The annotation write is **not** an apply — see
+//! [`patch_ingress_annotations`], which explains at length why an apply there
+//! deleted the canary weight that automatic promotion had just written.
 //!
 //! # Why the generation is an annotation and not a condition
 //!
@@ -38,12 +42,13 @@
 //! # Why a stale annotation is left behind
 //!
 //! An Ingress that moves to another controller keeps whatever generation we
-//! last wrote. Removing it would mean an apply under [`FIELD_MANAGER`] that
-//! omits the key — and that field manager also owns the `canary-weight` and
-//! `auto-promote-status` annotations automatic promotion writes, so a clear
-//! would take those with it and silently zero somebody's canary. A stale
-//! diagnostic on an object we no longer manage is much the smaller problem, and
-//! the address — the actively misleading part — *is* cleared.
+//! last wrote. Removing it would cost a second write, on an object we have just
+//! decided is not ours, at the exact moment another controller is taking it
+//! over — and the value is a diagnostic that says what *we* last compiled,
+//! which stops being a claim about anything the moment we stop managing it. A
+//! stale diagnostic is much the smaller problem than a write race with whoever
+//! now owns the object, and the address — the actively misleading part, because
+//! everything downstream routes on it — *is* cleared.
 
 use std::collections::{HashMap, HashSet};
 
